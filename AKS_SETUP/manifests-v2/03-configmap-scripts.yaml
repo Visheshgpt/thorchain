@@ -129,13 +129,14 @@ data:
     TARBALL="/data/snapshot.tar.$EXT"
     echo "[snapshot] format=$EXT"
 
-    # -- keep node identity, discard everything else -----------
+    # -- clear anything from a previous attempt ----------------
+    # This container is root but with capabilities dropped, so it has
+    # NO CAP_DAC_OVERRIDE and cannot read files it does not own. It
+    # therefore never touches node_key.json / priv_validator_key.json
+    # -- init-keys runs AFTER this and owns node identity entirely.
     mkdir -p "$CFG"
-    for f in node_key.json priv_validator_key.json; do
-      if [ -f "$CFG/$f" ]; then cp -f "$CFG/$f" "/tmp/$f"; fi
-    done
     rm -rf "$HOME_DIR/data"
-    rm -f "$CFG/genesis.json" "$CFG/config.toml" "$CFG/app.toml" "$CFG/addrbook.json"
+    rm -f "$CFG/genesis.json" "$CFG/config.toml" "$CFG/app.toml" "$CFG/addrbook.json" || true
 
     # -- download (resume / reuse across pod restarts) ---------
     # stat -c %s is a syscall. Never use `wc -c` on a 40 GB file.
@@ -210,14 +211,16 @@ data:
     # genesis.json IS kept: render-config only fetches genesis
     # when the file is absent, so a snapshot genesis short-
     # circuits the outbound :27147 genesis_chunked fetch.
-    rm -f "$CFG/config.toml" "$CFG/app.toml" "$CFG/addrbook.json"
+    rm -f "$CFG/config.toml" "$CFG/app.toml" "$CFG/addrbook.json" || true
     if [ ! -f "$CFG/genesis.json" ]; then
       echo "[snapshot] WARN: snapshot had no genesis.json;"
       echo "[snapshot]       render-config will fetch it from seeds over :27147"
     fi
-    for f in node_key.json priv_validator_key.json; do
-      if [ -f "/tmp/$f" ]; then cp -f "/tmp/$f" "$CFG/$f"; fi
-    done
+
+    # If the tarball shipped the producer's node identity, drop it --
+    # two nodes sharing a p2p ID get rejected by peers. init-keys
+    # generates a fresh one right after this container exits.
+    rm -f "$CFG/node_key.json" "$CFG/priv_validator_key.json" || true
 
     mkdir -p "$HOME_DIR/data"
     if [ ! -f "$HOME_DIR/data/priv_validator_state.json" ]; then

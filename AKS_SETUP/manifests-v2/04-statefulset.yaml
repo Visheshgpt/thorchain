@@ -113,57 +113,25 @@ spec:
             - { name: passwd-vol, mountPath: /passwd-vol }
             - { name: scripts,    mountPath: /scripts }
 
-        # -- 2. node identity ----------------------------------
-        # Snapshots ship state + genesis but never node_key.json /
-        # priv_validator_key.json -- those are per-node. Generate
-        # them once, before the snapshot lands, and let
-        # init-snapshot carry them across any future re-restore.
-        #
-        # `thornode init` also writes a placeholder genesis.json;
-        # init-snapshot deletes it before extracting, so the real
-        # genesis always comes from the snapshot.
-        - name: init-keys
-          image: registry.gitlab.com/thorchain/thornode:mainnet-3.19.3
-          command: ["/bin/bash", "-c"]
-          args:
-            - |
-              set -euo pipefail
-              if [ -f "$HOME/.thornode/config/node_key.json" ]; then
-                echo "[keys] node_key.json present -- skipping init"
-                exit 0
-              fi
-              echo "[keys] thornode init local --chain-id $CHAIN_ID"
-              # --overwrite so a half-initialised dir cannot wedge us;
-              # any pre-existing genesis.json is preserved around it.
-              if [ -f "$HOME/.thornode/config/genesis.json" ]; then
-                cp "$HOME/.thornode/config/genesis.json" /tmp/genesis.json
-              fi
-              thornode init local --chain-id "$CHAIN_ID" --overwrite
-              if [ -f /tmp/genesis.json ]; then
-                mv /tmp/genesis.json "$HOME/.thornode/config/genesis.json"
-              fi
-              ls -la "$HOME/.thornode/config/"
-          securityContext:
-            runAsUser: 1025
-            runAsGroup: 1025
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
-            capabilities: { drop: ["ALL"] }
-          env:
-            - { name: HOME,     value: "/data" }
-            - { name: NET,      value: "mainnet" }
-            - { name: CHAIN_ID, value: "thorchain-1" }
-          resources:
-            requests: { cpu: "100m", memory: "256Mi" }
-            limits:   { memory: "1Gi" }
-          volumeMounts:
-            - { name: thornode-data, mountPath: /data }
-            - { name: passwd-vol,    mountPath: /etc/passwd, subPath: passwd }
-
-        # -- 3. snapshot restore -------------------------------
+        # -- 2. snapshot restore -------------------------------
         # Runs as root only because it must `apk add` aria2/tar.
         # It exits before the main container starts; nothing that
         # touches the network long-term runs privileged.
+        #
+        # ORDER MATTERS -- this MUST run before init-keys.
+        #
+        # This container is root but with capabilities dropped, which
+        # means no CAP_DAC_OVERRIDE: root here canNOT bypass file
+        # permissions. `thornode init` writes node_key.json as mode
+        # 0600 owned by 1025, so if init-keys ran first this container
+        # could not even read it:
+        #   cp: can't open '/data/.thornode/config/node_key.json':
+        #       Permission denied
+        # Running the snapshot first means every file under
+        # /data/.thornode is created and owned by root, and the
+        # closing `chmod -R a+rwX` then hands write access to 1025 for
+        # init-keys and the main container. Root never has to read a
+        # file it does not own.
         #
         # Skip this container entirely if you want to sync from
         # genesis instead -- but be aware that is a multi-week
@@ -190,6 +158,60 @@ spec:
           volumeMounts:
             - { name: thornode-data, mountPath: /data }
             - { name: scripts,       mountPath: /scripts }
+
+        # -- 3. node identity ----------------------------------
+        # Runs AFTER the snapshot, as UID 1025 -- the same identity
+        # the main container uses, so the keys it writes are readable
+        # by it without any chown.
+        #
+        # Snapshots ship state + genesis but not a usable per-node
+        # identity, so generate one here if it is missing. On every
+        # later boot node_key.json exists and this exits immediately.
+        #
+        # `thornode init --overwrite` would clobber the snapshot's
+        # genesis.json, so it is saved to /tmp and put back after.
+        - name: init-keys
+          image: registry.gitlab.com/thorchain/thornode:mainnet-3.19.3
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              CFG="$HOME/.thornode/config"
+              if [ -f "$CFG/node_key.json" ]; then
+                echo "[keys] node_key.json present -- skipping init"
+                exit 0
+              fi
+              echo "[keys] thornode init local --chain-id $CHAIN_ID"
+              if [ -f "$CFG/genesis.json" ]; then
+                cp "$CFG/genesis.json" /tmp/genesis.json
+                echo "[keys] preserved snapshot genesis.json"
+              fi
+              thornode init local --chain-id "$CHAIN_ID" --overwrite
+              if [ -f /tmp/genesis.json ]; then
+                mv /tmp/genesis.json "$CFG/genesis.json"
+                echo "[keys] restored snapshot genesis.json"
+              fi
+              # render-config rewrites both TOMLs at container start;
+              # drop the cosmos defaults init just wrote so nothing
+              # stale can survive.
+              rm -f "$CFG/config.toml" "$CFG/app.toml"
+              ls -la "$CFG/"
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - { name: HOME,     value: "/data" }
+            - { name: NET,      value: "mainnet" }
+            - { name: CHAIN_ID, value: "thorchain-1" }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "1Gi" }
+          volumeMounts:
+            - { name: thornode-data, mountPath: /data }
+            - { name: passwd-vol,    mountPath: /etc/passwd, subPath: passwd }
 
       containers:
         - name: thornode
