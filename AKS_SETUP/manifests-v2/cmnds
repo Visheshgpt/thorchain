@@ -1,0 +1,89 @@
+PHASE 0 — Connect
+
+az login
+az aks get-credentials --resource-group azrg-cus-coinia-aks-dev --name cuscoiniadevaks --overwrite-existing
+kubelogin convert-kubeconfig -l azurecli
+kubectl get nodes
+kubectl config current-context
+PHASE 1 — Capture v1 state before destroying it
+
+kubectl get all -n $NS
+kubectl get pvc -n $NS
+kubectl get cm -n $NS
+kubectl get svc -n $NS -o wide
+kubectl get sc thorchain-storage -o yaml
+kubectl exec -n $NS thornode-0 -c thornode -- curl -s http://localhost:27147/status > "$HOME\thornode-v1-final-status.json"
+kubectl logs -n $NS thornode-0 -c thornode --tail=2000 > "$HOME\thornode-v1-final-logs.txt"
+kubectl get pv -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,CAPACITY:.spec.capacity.storage,RECLAIM:.spec.persistentVolumeReclaimPolicy,CLAIM:.spec.claimRef.name,DISK:.spec.csi.volumeHandle
+Save that last output — PHASE 7 needs the DISK value.
+
+PHASE 2 — Tear down v1
+
+kubectl delete namespace $NS --wait=true
+kubectl delete storageclass thorchain-storage
+kubectl get ns $NS
+kubectl get sc
+kubectl get pv | Select-String thornode
+Takes 1–3 min. Expect NotFound, no thorchain-storage, PV Released.
+
+PHASE 3 — Files
+
+Rename-Item -Path "C:\Users\usa-vishesgupta\thorchain\manifest-agent\manifests" -NewName "manifests-v1-BROKEN"
+cd $V2
+Get-ChildItem
+Select-String -Path 04-statefulset.yaml -Pattern "image:"
+Select-String -Path 04-statefulset.yaml -Pattern "PERSISTENT_PEERS"
+image: must read mainnet-3.19.3 on both containers.
+
+PHASE 4 — Deploy v2
+
+cd $V2
+kubectl apply -f 00-namespace.yaml
+kubectl apply -f 01-storageclass.yaml
+kubectl apply -f 02-pvc.yaml
+kubectl apply -f 03-configmap-scripts.yaml
+kubectl apply -f 04-statefulset.yaml
+kubectl apply -f 05-service.yaml
+kubectl get all -n $NS
+kubectl get pvc -n $NS
+PVC Pending here is correct — WaitForFirstConsumer.
+
+PHASE 5 — Watch it come up
+
+kubectl get pods -n $NS -w
+kubectl describe pod thornode-0 -n $NS
+kubectl logs -n $NS thornode-0 -c init-passwd
+kubectl logs -n $NS thornode-0 -c init-keys
+kubectl logs -n $NS thornode-0 -c init-snapshot -f
+kubectl exec -n $NS thornode-0 -c init-snapshot -- df -h /data
+kubectl logs -n $NS thornode-0 -c thornode -f
+init-snapshot runs 30–60 min. Then look for found N p2p seeds.
+
+PHASE 6 — Verify (all four)
+
+kubectl exec -n $NS thornode-0 -c thornode -- curl -s http://localhost:27147/net_info | ConvertFrom-Json | ForEach-Object result | Select-Object n_peers
+
+$a = (kubectl exec -n $NS thornode-0 -c thornode -- curl -s http://localhost:27147/status | ConvertFrom-Json).result.sync_info.latest_block_height
+Start-Sleep -Seconds 60
+$b = (kubectl exec -n $NS thornode-0 -c thornode -- curl -s http://localhost:27147/status | ConvertFrom-Json).result.sync_info.latest_block_height
+"start=$a  end=$b  blocks_in_60s=$([int]$b - [int]$a)"
+
+$local  = (kubectl exec -n $NS thornode-0 -c thornode -- curl -s http://localhost:27147/status | ConvertFrom-Json).result.sync_info.latest_block_height
+$remote = (curl.exe -s "https://gateway.liquify.com/chain/thorchain_rpc/status" | ConvertFrom-Json).result.sync_info.latest_block_height
+"local=$local  network=$remote  behind=$([int]$remote - [int]$local)"
+
+kubectl logs -n $NS thornode-0 -c thornode --tail=4000 | Select-String -Pattern "wrong Block.Header.AppHash|Consensus Failure|panic|OOM|found 0 p2p seeds"
+kubectl exec -n $NS thornode-0 -c thornode -- sh -c "grep -E '^(seeds|persistent_peers|external_address|pex|addr_book_strict|laddr) ' /data/.thornode/config/config.toml"
+kubectl exec -n $NS thornode-0 -c thornode -- sh -c "grep -E '^(pruning|min-retain-blocks|halt-height)' /data/.thornode/config/app.toml"
+kubectl exec -n $NS thornode-0 -c thornode -- cat /data/.thornode/.snapshot-restored
+kubectl exec -n $NS thornode-0 -c thornode -- df -h /data
+kubectl top pod thornode-0 -n $NS --containers
+Pass = n_peers > 0, blocks_in_60s well above 10, no fatal-pattern matches, seeds non-empty, external_address empty.
+
+PHASE 7 — Reclaim the stranded v1 disk (only after PHASE 6 passes)
+
+kubectl get pv -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,CAPACITY:.spec.capacity.storage,CLAIM:.spec.claimRef.name,DISK:.spec.csi.volumeHandle
+kubectl delete pv <released-pv-name>
+az disk delete --ids "<volumeHandle>" --yes
+az aks show -g azrg-cus-coinia-aks-dev -n cuscoiniadevaks --query nodeResourceGroup -o tsv
+kubectl get pv
