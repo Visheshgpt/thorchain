@@ -1,0 +1,40 @@
+# ============================================================
+# PVC for /data  (THORNode home is $HOME/.thornode = /data/.thornode)
+#
+# SIZING -- this is the single most-often-wrong value.
+#
+#   Liquify mainnet-pruned tarball .......  ~40 GB compressed
+#   Extracted pruned state ...............  ~150-200 GB
+#   Peak during restore (tarball+extract).  ~240 GB
+#   Growth on pruning="default" ..........  ~15-25 GB / month
+#
+#   => 600Gi for a PRUNED full node.  (v1 used 300Gi, which
+#      leaves almost no headroom over the restore peak and
+#      fills within a few months.)
+#
+#   => An ARCHIVE node (THOR_COSMOS_PRUNING=nothing, which is
+#      THORChain's own default) is multi-terabyte. Use 4Ti+
+#      and expect it to keep growing.
+#
+# Premium_LRS provisions in fixed tiers -- 600Gi bills as P30
+# (1 TiB) anyway, so there is no cost saving in asking for less.
+#
+# Online expansion (allowVolumeExpansion: true on the SC) --
+# see README section 6 for the PowerShell-quoted form.
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: thornode-data
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/part-of: thornode-fullnode
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: thorchain-storage
+  resources:
+    requests:
+      storage: 600Gi

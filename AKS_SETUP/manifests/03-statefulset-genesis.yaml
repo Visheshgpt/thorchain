@@ -1,0 +1,304 @@
+# ============================================================
+# FILE: 03-statefulset-genesis.yaml
+#
+# THORChain FULL NODE — GENESIS SYNC on AKS
+#
+# WHAT THIS DOES
+# --------------
+# Runs one thornode replica that syncs the ACTIVE mainnet chain
+# (chain-id `thorchain-1`) from its genesis at block 17,562,001
+# all the way to the current tip (~27M+).  There is no snapshot;
+# every block is replayed from p2p peers.  Expect ~5–10 days of
+# wall-clock sync on the recommended node pool.
+#
+# HOW IT WORKS  (verified against the official image)
+# ---------------------------------------------------
+# The upstream image (`registry.gitlab.com/thorchain/thornode:mainnet`)
+# ships /scripts/fullnode.sh as its default CMD:
+#
+#     if [ ! -f ~/.thornode/config/genesis.json ]; then
+#       init_chain                     # thornode init local --chain-id $CHAIN_ID
+#       rm -rf ~/.thornode/config/genesis.json
+#     fi
+#     thornode render-config           # renders config.toml + app.toml,
+#                                       # downloads genesis IF it is missing
+#     exec thornode start
+#
+# `thornode render-config` normally fetches genesis from live
+# THORChain seeds on TCP/27147.  AKS pods CANNOT reach random
+# public IPs on 27147 (Azure blocks non-standard outbound ports
+# by default) — this is why previous attempts hung with
+# "context deadline exceeded" and "failed to fetch genesis chunk".
+#
+# Our fix: the `init-genesis` init container pre-populates a
+# valid, patched genesis.json (fetched via Liquify's HTTPS
+# gateway on port 443).  When the main container runs
+# fullnode.sh, genesis.json already exists, so:
+#   • the `if [ ! -f … ]` block is skipped   (no re-init)
+#   • `render-config` skips the genesis download and only
+#     writes config.toml + app.toml
+#   • `thornode start` boots and connects to p2p peers on 27146
+#
+# INIT CONTAINER ORDER  (idempotent, safe to restart)
+# ---------------------------------------------------
+#   1. init-passwd    — writes /etc/passwd with UID 1025 entry
+#   2. init-thornode  — thornode init local --chain-id thorchain-1
+#   3. init-genesis   — downloads genesis via Liquify HTTPS
+#
+# MAIN CONTAINER
+# --------------
+# Runs the image's default CMD (fullnode.sh) verbatim.  No
+# command override — this is the same code path validators use.
+#
+# CRITICAL ENV VARS (main + thornode-image init containers)
+# ---------------------------------------------------------
+#   HOME       = /data              → thornode uses /data/.thornode
+#   NET        = mainnet            → selects 27146/27147 ports in core.sh
+#   CHAIN_ID   = thorchain-1        → passed to `thornode init`
+#
+# CONFIRMED MAINNET PORTS (config_mainnet.go)
+# -------------------------------------------
+#   27146  p2p          27147  rpc           9090   grpc
+#    1317  rest        26660  prometheus
+#
+# GATEKEEPER
+# ----------
+# Cluster enforces non-root.  Every container: runAsUser 1025,
+# runAsGroup 1025, runAsNonRoot true.  Pod-level fsGroup 1025.
+# ============================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: thornode
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/name: thornode
+    app.kubernetes.io/part-of: thornode-node
+    app.kubernetes.io/managed-by: kubectl
+    sync-method: genesis
+spec:
+  serviceName: thornode-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: thornode
+  template:
+    metadata:
+      labels:
+        app: thornode
+        app.kubernetes.io/name: thornode
+        sync-method: genesis
+    spec:
+      # Disable Kubernetes service-link env var injection.
+      # Our services are named `thornode-p2p` and `thornode-rpc`,
+      # which cause kubelet to inject THORNODE_P2P_*, THORNODE_RPC_*
+      # env vars into the pod.  thornode uses `THORNODE_` as its Viper
+      # config prefix, so these auto-injected vars are misparsed as
+      # config overrides (visible as ~30 "could overwrite config" warns
+      # at boot).  Setting enableServiceLinks: false prevents kubelet
+      # from injecting them.  In-cluster DNS still works.
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1025
+      terminationGracePeriodSeconds: 120
+
+
+      # =====================================================
+      # INIT CONTAINERS
+      # =====================================================
+      initContainers:
+
+
+        # ── 1. Patch /etc/passwd ────────────────────────────
+        # Writes a minimal passwd file into a shared emptyDir.
+        # Every subsequent thornode container mounts it over
+        # /etc/passwd (subPath) so os/user.Current() can
+        # resolve UID 1025.  Busybox runs happily as any UID.
+        - name: init-passwd
+          image: busybox:1.36
+          command: ["/bin/sh", "/scripts/init-passwd.sh"]
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: passwd-vol
+              mountPath: /passwd-vol
+            - name: scripts
+              mountPath: /scripts
+
+
+        # ── 2. thornode init ────────────────────────────────
+        # Creates /data/.thornode/config/{node_key.json,
+        # priv_validator_key.json, priv_validator_state.json,
+        # config.toml, app.toml} plus a DUMMY genesis.json that
+        # init-genesis will overwrite with the real one.
+        # Idempotent: skips if node_key.json already exists.
+        #
+        # Uses the same PINNED image as the main container so
+        # the config templates match.
+        - name: init-thornode
+          image: registry.gitlab.com/thorchain/thornode:mainnet-3.6.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ -f /data/.thornode/config/node_key.json ]; then
+                echo "==> [init] already initialised — skipping"
+                exit 0
+              fi
+              echo "==> [init] thornode init local --chain-id $CHAIN_ID"
+              thornode init local --chain-id "$CHAIN_ID"
+              echo "==> [init] done. Files created:"
+              ls -la /data/.thornode/config/
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - name: HOME
+              value: "/data"
+            - name: NET
+              value: "mainnet"
+            - name: CHAIN_ID
+              value: "thorchain-1"
+          volumeMounts:
+            - name: thornode-data
+              mountPath: /data
+            - name: passwd-vol
+              mountPath: /etc/passwd
+              subPath: passwd
+
+
+        # ── 3. Download real genesis (Liquify HTTPS) ────────
+        # Fetches chunked genesis from Liquify's HTTPS gateway
+        # on port 443 (AKS-friendly), base64-decodes with jq,
+        # and applies the YggdrasilVault → AsgardVault fix.
+        #
+        # RUNS AS ROOT — required because:
+        #   * `apk add jq` needs root
+        #   * busybox sed/awk truncate 14-MB single-line JSON,
+        #     so we MUST use jq for reliable extraction
+        # The script chowns /data back to 1025:1025 before exit,
+        # so the main thornode container (UID 1025) can read it.
+        - name: init-genesis
+          image: alpine:3.19
+          command: ["/bin/sh", "/scripts/init-genesis.sh"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits:   { cpu: "2",    memory: "2Gi"   }
+          volumeMounts:
+            - name: thornode-data
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+
+
+      # =====================================================
+      # MAIN CONTAINER
+      # =====================================================
+      containers:
+        - name: thornode
+          # Pinned to the exact version the wiki.md team confirmed
+          # working. The floating `:mainnet` tag pulls the latest
+          # release, which enforces strict genesis validation that
+          # rejects historical vault records — causing bank.InitGenesis
+          # to panic with "invalid address". mainnet-3.6.1 is the
+          # version aligned with the thorchain-1 genesis file.
+          image: registry.gitlab.com/thorchain/thornode:mainnet-3.6.1
+          imagePullPolicy: IfNotPresent
+          # Skip the image's default CMD (/scripts/fullnode.sh).
+          # fullnode.sh calls `thornode render-config`, which tries
+          # to fetch genesis from live peers on TCP/27147 — a port
+          # AKS blocks outbound. The init-genesis container has
+          # already prepared genesis + config.toml + app.toml, so
+          # we can go straight to `thornode start`.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ulimit -n 65535
+              echo "==> starting thornode (archive mode)"
+              exec thornode start --home /data/.thornode
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - name: HOME
+              value: "/data"
+            - name: NET
+              value: "mainnet"
+            - name: CHAIN_ID
+              value: "thorchain-1"
+            # After the ILB is provisioned (see 04-service.yaml)
+            # patch this to the private IP so peers can dial back:
+            #   kubectl set env sts/thornode -n thorchain \
+            #     EXTERNAL_IP=<thornode-p2p-lb-ip>
+            - name: EXTERNAL_IP
+              value: ""
+          ports:
+            - { name: p2p,     containerPort: 27146, protocol: TCP }
+            - { name: rpc,     containerPort: 27147, protocol: TCP }
+            - { name: rest,    containerPort: 1317,  protocol: TCP }
+            - { name: grpc,    containerPort: 9090,  protocol: TCP }
+            - { name: metrics, containerPort: 26660, protocol: TCP }
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          # Readiness: p2p listening = process alive & accepting
+          # peer dials.  Give it 3 minutes to boot.
+          readinessProbe:
+            tcpSocket:
+              port: p2p
+            initialDelaySeconds: 180
+            periodSeconds: 15
+            failureThreshold: 6
+          # Liveness: very lenient — genesis replay from block
+          # 17.5M can pause the p2p listener during heavy state
+          # commits.  Delay 4 h to avoid restart loops.
+          livenessProbe:
+            tcpSocket:
+              port: p2p
+            initialDelaySeconds: 14400
+            periodSeconds: 60
+            failureThreshold: 5
+          volumeMounts:
+            - name: thornode-data
+              mountPath: /data
+            - name: passwd-vol
+              mountPath: /etc/passwd
+              subPath: passwd
+
+
+      # =====================================================
+      # VOLUMES
+      # =====================================================
+      volumes:
+        - name: thornode-data
+          persistentVolumeClaim:
+            claimName: thornode-data
+        - name: passwd-vol
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: thornode-scripts
+            defaultMode: 0755
+
+

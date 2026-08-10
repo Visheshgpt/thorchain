@@ -1,0 +1,30 @@
+# ============================================================
+# Azure Disk StorageClass for THORNode chain data.
+#
+# CHANGED vs v1: cachingMode is None, not ReadWrite.
+#   THORChain's store is LevelDB/IAVL -- a write-heavy random
+#   IO workload with its own fsync discipline. Azure host
+#   ReadWrite caching in front of that adds latency spikes and
+#   is explicitly not recommended for write-heavy DB disks.
+#   Read-heavy DB disks want ReadOnly; write-heavy want None.
+#
+# Premium_LRS P30 (1 TiB) = 5000 IOPS / 200 MB/s, which is the
+# practical floor for keeping up with mainnet. If sync is IO
+# bound, switch skuName to PremiumV2_LRS and set the IOPS /
+# throughput parameters explicitly (PremiumV2 needs
+# cachingMode: None -- it does not support host caching).
+# ============================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: thorchain-storage
+  labels:
+    app.kubernetes.io/part-of: thornode-fullnode
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+  cachingMode: None
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

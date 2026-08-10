@@ -1,0 +1,345 @@
+# ============================================================
+# FILE: 03-statefulset.yaml
+#
+# THORChain FULL NODE — SNAPSHOT SYNC on AKS
+#
+# WHAT THIS DOES
+# --------------
+# Runs one thornode replica that boots from a pre-synced
+# pruned snapshot (~40 GB compressed, ~150 GB extracted) hosted
+# by Liquify. After extraction the node only has to catch up
+# the last few thousand blocks (minutes — not weeks).
+#
+# HOW IT WORKS
+# ------------
+# 1. init-passwd     — writes /etc/passwd with UID 1025 entry.
+# 2. init-thornode   — `thornode init` to generate node keys
+#                      (node_key.json + priv_validator_key.json).
+#                      Snapshots do NOT ship with keys.
+# 3. init-snapshot   — streams the tarball from Liquify HTTPS
+#                      (port 443) directly into /data/.thornode.
+#                      Overwrites genesis.json + populates data/.
+# 4. Main container overrides fullnode.sh and runs
+#    `thornode start --home /data/.thornode` directly.
+#
+# WHY WE SKIP fullnode.sh
+# -----------------------
+# The image's default CMD (fullnode.sh) calls
+# `thornode render-config` on every start, which OVERWRITES
+# config.toml AND genesis.json — dangerous after a snapshot
+# restore. Going direct to `thornode start` boots against the
+# restored state as-is.
+#
+# SNAPSHOT_URL
+# ------------
+# The `SNAPSHOT_URL` env var below is a signed URL that expires
+# (exp=<unix-epoch>). When it expires, get a fresh one from:
+#
+#     https://www.liquify.com/snapshots/thorchain
+#
+# Then patch:
+#     kubectl set env -n thorchain sts/thornode \
+#       -c init-snapshot SNAPSHOT_URL='<new-url>'
+#
+# GATEKEEPER
+# ----------
+# Main + init-passwd + init-thornode run as UID 1025.
+# init-snapshot needs `apk add tar lz4 curl ca-certificates`,
+# so it runs as root (UID 0). This is the ONLY container in
+# the pod that runs as root — its scope is limited to unpacking
+# a tarball, then it exits.
+# ============================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: thornode
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/name: thornode
+    app.kubernetes.io/part-of: thornode-node
+    app.kubernetes.io/managed-by: kubectl
+    sync-method: snapshot
+spec:
+  serviceName: thornode-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: thornode
+  template:
+    metadata:
+      labels:
+        app: thornode
+        app.kubernetes.io/name: thornode
+        sync-method: snapshot
+    spec:
+      # Same rationale as the genesis variant — see comment there.
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1025
+      terminationGracePeriodSeconds: 120
+
+
+      initContainers:
+
+
+        # ── 1. Patch /etc/passwd ────────────────────────────
+        - name: init-passwd
+          image: busybox:1.36
+          command: ["/bin/sh", "/scripts/init-passwd.sh"]
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: passwd-vol
+              mountPath: /passwd-vol
+            - name: scripts
+              mountPath: /scripts
+
+
+        # ── 2. thornode init  (create node keys) ────────────
+        # Snapshots ship with genesis.json + data/ but NOT with
+        # node_key.json or priv_validator_key.json (those are
+        # per-node). fullnode.sh only creates keys via init_chain,
+        # which it SKIPS when genesis exists — so `thornode start`
+        # would fail on a snapshot restore.
+        #
+        # We run `thornode init` FIRST to generate the keys +
+        # default config.toml/app.toml. The next init container
+        # then overwrites genesis.json (and possibly config/*.toml)
+        # from the snapshot, but LEAVES the keys alone.
+        - name: init-thornode
+          image: registry.gitlab.com/thorchain/thornode:mainnet-3.18.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ -f /data/.thornode/config/node_key.json ]; then
+                echo "==> [init] already initialised -- skipping"
+                exit 0
+              fi
+              echo "==> [init] thornode init local --chain-id $CHAIN_ID"
+              thornode init local --chain-id "$CHAIN_ID"
+              echo "==> [init] done. Files created:"
+              ls -la /data/.thornode/config/
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - name: HOME
+              value: "/data"
+            - name: NET
+              value: "mainnet"
+            - name: CHAIN_ID
+              value: "thorchain-1"
+          resources:
+            # Runs briefly (~5s) then exits.
+            requests: { cpu: "50m", memory: "96Mi" }
+            limits:   { cpu: "500m", memory: "384Mi" }
+          volumeMounts:
+            - name: thornode-data
+              mountPath: /data
+            - name: passwd-vol
+              mountPath: /etc/passwd
+              subPath: passwd
+
+
+        # ── 3. Patch config.toml + resolve live peers ───────
+        # Runs EVERY pod start (no sentinel).
+        #
+        # This container does two things:
+        #   A) Fixes ports and K8s settings in config.toml.
+        #   B) Queries Liquify API for active THORChain nodes,
+        #      then queries each node's RPC (:27147/status) to
+        #      get its CometBFT node ID, and writes real
+        #      persistent_peers = "nodeid@ip:27146" entries.
+        #      This is exactly what the official thornode binary
+        #      does internally when SEEDS env var is set.
+        #      Nine Realms is decommissioned — Liquify is the
+        #      canonical community seed provider.
+        - name: init-config
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache curl jq ca-certificates >/dev/null 2>&1
+
+
+              CFG=/data/.thornode/config/config.toml
+              if [ ! -f "$CFG" ]; then
+                echo "==> [config] config.toml not found -- skipping"
+                exit 0
+              fi
+
+
+              echo "==> [config] fixing ports and K8s settings..."
+              sed -i 's|^laddr = "tcp://[^"]*:26656"|laddr = "tcp://0.0.0.0:27146"|' "$CFG"
+              sed -i 's|^laddr = "tcp://[^"]*:27146"|laddr = "tcp://0.0.0.0:27146"|' "$CFG"
+              sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:27147"|' "$CFG"
+              sed -i 's|^laddr = "tcp://[^"]*:26657"|laddr = "tcp://0.0.0.0:27147"|' "$CFG"
+              sed -i 's|^addr_book_strict = .*|addr_book_strict = false|' "$CFG"
+              sed -i 's|^allow_duplicate_ip = .*|allow_duplicate_ip = true|' "$CFG"
+              sed -i 's|^pex = .*|pex = true|' "$CFG"
+              sed -i 's|^seeds = .*|seeds = ""|' "$CFG"
+
+
+              # Query Liquify RPC gateway over HTTPS (port 443 -- always open in AKS).
+              # net_info returns peers already in "nodeid@ip:port" format.
+              # Port 27147 direct to validator IPs is blocked by AKS NSG -- do NOT use.
+              echo "==> [config] querying Liquify RPC gateway for live peers (HTTPS)..."
+              NET_INFO=$(curl -sf --max-time 30 \
+                "https://gateway.liquify.com/chain/thorchain_rpc/net_info") || {
+                echo "==> [config] WARN: Liquify RPC gateway unreachable -- keeping existing peers"
+                exit 0
+              }
+
+
+              # Extract up to 15 peers: url field is "mconn://nodeid@ip:27146"
+              PEERS=$(echo "$NET_INFO" \
+                | jq -r '[.result.peers[:15] | .[] | .url | ltrimstr("mconn://")] | join(",")' 2>/dev/null) || true
+
+
+              if [ -z "$PEERS" ] || [ "$PEERS" = "null" ]; then
+                echo "==> [config] WARN: no peers from net_info -- pex=true will discover peers"
+              else
+                PEER_COUNT=$(echo "$PEERS" | tr ',' '\n' | wc -l)
+                echo "==> [config] got ${PEER_COUNT} peers from Liquify gateway"
+                echo "==> [config] writing persistent_peers..."
+                sed -i "s|^persistent_peers = .*|persistent_peers = \"${PEERS}\"|" "$CFG"
+              fi
+
+
+              # Delete stale addrbook so old bad entries don't interfere
+              rm -f /data/.thornode/config/addrbook.json
+
+
+              echo "==> [config] done."
+              grep -E '^(pex|seeds|persistent_peers|laddr) ' "$CFG" || true
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "10m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+          volumeMounts:
+            - name: thornode-data
+              mountPath: /data
+
+
+        # ── 4. Download + extract snapshot ──────────────────
+        # Runs as root because it must apk-add aria2/tar/lz4/curl.
+        # No capability additions needed — the script uses
+        # `chmod -R a+rwX` at the end (root can chmod its own
+        # files without any CAP), avoiding all Gatekeeper hassle.
+        # Container exits after extract — main container is UID 1025.
+        - name: init-snapshot
+          image: alpine:3.19
+          command: ["/bin/sh", "/scripts/init-snapshot.sh"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            # Liquify snapshot type: "mainnet-pruned" or "mainnet-archive"
+            # Fresh signed URL is fetched automatically from the Liquify API
+            # at pod start -- no expiring URLs to manage.
+            - name: SNAP_TYPE
+              value: "mainnet-pruned"
+          resources:
+            # Low request — only requests affect scheduling, not limits.
+            # Cluster is at capacity; keep requests minimal to fit.
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "1500m", memory: "2Gi"  }
+          volumeMounts:
+            - name: thornode-data
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+
+
+      containers:
+        - name: thornode
+          image: registry.gitlab.com/thorchain/thornode:mainnet-3.18.1
+          imagePullPolicy: IfNotPresent
+          # Skip the image's default CMD (/scripts/fullnode.sh).
+          # fullnode.sh runs `thornode render-config`, which
+          # OVERWRITES config.toml + genesis.json every start —
+          # unsafe after a snapshot restore. Going direct to
+          # `thornode start` boots against the restored state
+          # using the configs already on disk.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ulimit -n 65535
+              echo "==> starting thornode (snapshot-restored fullnode)"
+              exec thornode start --home /data/.thornode
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - name: HOME
+              value: "/data"
+            - name: NET
+              value: "mainnet"
+            - name: CHAIN_ID
+              value: "thorchain-1"
+            - name: EXTERNAL_IP
+              value: ""
+          ports:
+            - { name: p2p,     containerPort: 27146, protocol: TCP }
+            - { name: rpc,     containerPort: 27147, protocol: TCP }
+            - { name: rest,    containerPort: 1317,  protocol: TCP }
+            - { name: grpc,    containerPort: 9090,  protocol: TCP }
+            - { name: metrics, containerPort: 26660, protocol: TCP }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "512Mi"
+            limits:
+              cpu: "1500m"
+              memory: "3Gi"
+          readinessProbe:
+            tcpSocket:
+              port: p2p
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: p2p
+            initialDelaySeconds: 3600
+            periodSeconds: 60
+            failureThreshold: 5
+          volumeMounts:
+            - name: thornode-data
+              mountPath: /data
+            - name: passwd-vol
+              mountPath: /etc/passwd
+              subPath: passwd
+
+
+      volumes:
+        - name: thornode-data
+          persistentVolumeClaim:
+            claimName: thornode-data
+        - name: passwd-vol
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: thornode-scripts
+            defaultMode: 0755

@@ -1,0 +1,26 @@
+# ============================================================
+# FILE: 01-storageclass.yaml
+# PURPOSE: Defines the Azure Disk storage class used by the
+#          thornode PVC. Premium_LRS is mandatory for THORChain —
+#          the chain state (~1.5–2 TB, growing) performs constant
+#          random reads/writes to LevelDB; StandardSSD_LRS
+#          throttles under this load.
+#          reclaimPolicy: Retain — blockchain data is irreplaceable;
+#          the underlying Azure Disk is preserved even if the PVC
+#          is deleted, allowing manual re-attach for recovery.
+# ============================================================
+apiVersion: storage.k8s.io/v1       # Stable StorageClass API
+kind: StorageClass
+metadata:
+  name: thorchain-storage           # Referenced by PVC storageClassName
+  labels:
+    app.kubernetes.io/part-of: thornode-node
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com     # Azure Disk CSI driver — built into AKS 1.21+
+parameters:
+  skuName: Premium_LRS              # Premium SSD — required for THORChain LevelDB IOPS
+  kind: Managed                     # Managed disk — no storage account required
+  cachingMode: ReadWrite            # OS-disk-style caching; safe for single-writer workloads
+reclaimPolicy: Retain               # USER OVERRIDE: Retain (do NOT change to Delete — chain data is irreplaceable)
+volumeBindingMode: WaitForFirstConsumer   # Provisions disk in the same AZ as the scheduled pod
+allowVolumeExpansion: true          # Allows online PVC resize without pod restart (AKS 1.24+)

@@ -1,0 +1,313 @@
+# ============================================================
+# THORChain mainnet FULL NODE on AKS -- corrected StatefulSet.
+#
+# The three changes that actually matter, in order:
+#
+#  1. IMAGE = mainnet-3.19.3, not mainnet-3.18.1.
+#     THORChain's live consensus version is 3.19.3 and has been
+#     since block 26,897,608 (check it yourself:
+#     https://gateway.liquify.com/chain/thorchain_api/thorchain/version).
+#     A 3.18.1 binary does not contain 3.19.x consensus logic,
+#     so the moment a 3.19-gated code path executes it computes
+#     a different app hash than the network and CometBFT
+#     refuses every subsequent block. The node parks on one
+#     height forever with catching_up: true. That is the
+#     failure you are looking at.
+#
+#  2. We run the image's OWN entrypoint (/scripts/fullnode.sh).
+#     v1 overrode it with `thornode start` to avoid
+#     render-config. That was based on a wrong assumption:
+#     render-config does NOT overwrite an existing genesis.json
+#     (config.go: thornodeFetchGenesis returns early if the
+#     file exists), and it is the ONLY thing that populates
+#     `seeds` in config.toml. Skipping it is why the node had
+#     no usable peers. If you ever do need to pin the TOMLs,
+#     the supported way is THORNODE_PRESERVE_CONFIG_TOML /
+#     THORNODE_PRESERVE_APP_TOML -- not deleting the entrypoint.
+#
+#  3. RESOURCES. v1 gave the node cpu limit 1500m / memory
+#     limit 3Gi. Upstream's own Helm chart requests 4 CPU and
+#     4Gi with NO limits at all. A CPU limit throttles block
+#     execution via CFS and wrecks consensus timing; a 3Gi
+#     memory cap OOMKills a mainnet thornode. Requests here are
+#     4 CPU / 8Gi, with a memory limit only.
+#
+# Init flow (each step is idempotent):
+#   init-passwd    -> /etc/passwd entry for UID 1025
+#   init-keys      -> node_key.json + priv_validator_key.json
+#   init-snapshot  -> Liquify pruned snapshot into /data/.thornode
+#   thornode       -> fullnode.sh: render-config + thornode start
+#
+# Deliberately NOT set: EXTERNAL_IP. See the note on it below.
+# ============================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: thornode
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/name: thornode
+    app.kubernetes.io/part-of: thornode-fullnode
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  serviceName: thornode-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: thornode
+  template:
+    metadata:
+      labels:
+        app: thornode
+        app.kubernetes.io/name: thornode
+    spec:
+      # The image reads NET/CHAIN_ID from the environment. Kubernetes'
+      # auto-injected <SVC>_PORT vars have collided with cosmos/viper
+      # lookups before; turn them off.
+      enableServiceLinks: false
+
+      # A THORChain node must flush LevelDB cleanly. SIGKILL mid-write
+      # corrupts the store and costs a full snapshot re-restore.
+      terminationGracePeriodSeconds: 600
+
+      securityContext:
+        fsGroup: 1025
+        # Only relabel the volume when the top-level owner is wrong.
+        # On a 600 GB / ~1M-file chain dir the default "Always"
+        # policy re-chowns everything on every start (10+ minutes).
+        fsGroupChangePolicy: OnRootMismatch
+
+      initContainers:
+
+        # -- 1. /etc/passwd shim for UID 1025 -------------------
+        - name: init-passwd
+          image: busybox:1.36
+          command: ["/bin/sh", "/scripts/init-passwd.sh"]
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits:   { memory: "64Mi" }
+          volumeMounts:
+            - { name: passwd-vol, mountPath: /passwd-vol }
+            - { name: scripts,    mountPath: /scripts }
+
+        # -- 2. node identity ----------------------------------
+        # Snapshots ship state + genesis but never node_key.json /
+        # priv_validator_key.json -- those are per-node. Generate
+        # them once, before the snapshot lands, and let
+        # init-snapshot carry them across any future re-restore.
+        #
+        # `thornode init` also writes a placeholder genesis.json;
+        # init-snapshot deletes it before extracting, so the real
+        # genesis always comes from the snapshot.
+        - name: init-keys
+          image: registry.gitlab.com/thorchain/thornode:mainnet-3.19.3
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              if [ -f "$HOME/.thornode/config/node_key.json" ]; then
+                echo "[keys] node_key.json present -- skipping init"
+                exit 0
+              fi
+              echo "[keys] thornode init local --chain-id $CHAIN_ID"
+              # --overwrite so a half-initialised dir cannot wedge us;
+              # any pre-existing genesis.json is preserved around it.
+              if [ -f "$HOME/.thornode/config/genesis.json" ]; then
+                cp "$HOME/.thornode/config/genesis.json" /tmp/genesis.json
+              fi
+              thornode init local --chain-id "$CHAIN_ID" --overwrite
+              if [ -f /tmp/genesis.json ]; then
+                mv /tmp/genesis.json "$HOME/.thornode/config/genesis.json"
+              fi
+              ls -la "$HOME/.thornode/config/"
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - { name: HOME,     value: "/data" }
+            - { name: NET,      value: "mainnet" }
+            - { name: CHAIN_ID, value: "thorchain-1" }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "1Gi" }
+          volumeMounts:
+            - { name: thornode-data, mountPath: /data }
+            - { name: passwd-vol,    mountPath: /etc/passwd, subPath: passwd }
+
+        # -- 3. snapshot restore -------------------------------
+        # Runs as root only because it must `apk add` aria2/tar.
+        # It exits before the main container starts; nothing that
+        # touches the network long-term runs privileged.
+        #
+        # Skip this container entirely if you want to sync from
+        # genesis instead -- but be aware that is a multi-week
+        # replay of 27M+ blocks.
+        - name: init-snapshot
+          image: alpine:3.19
+          command: ["/bin/sh", "/scripts/init-snapshot.sh"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            # "mainnet-pruned" (~40 GB) or "mainnet-archive" (multi-TB).
+            - { name: SNAP_TYPE, value: "mainnet-pruned" }
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { memory: "2Gi" }
+          volumeMounts:
+            - { name: thornode-data, mountPath: /data }
+            - { name: scripts,       mountPath: /scripts }
+
+      containers:
+        - name: thornode
+          image: registry.gitlab.com/thorchain/thornode:mainnet-3.19.3
+          imagePullPolicy: IfNotPresent
+
+          # NO command / args. The image's CMD is
+          # ["/scripts/fullnode.sh"], which does:
+          #   ulimit -n 65535
+          #   init_chain            (only if genesis.json missing)
+          #   thornode render-config
+          #   exec thornode start
+          # render-config is what resolves live seeds and writes
+          # a correct config.toml. Do not bypass it.
+
+          env:
+            # THORNode home is always $HOME/.thornode, so HOME=/data
+            # puts the whole chain dir on the PVC.
+            - { name: HOME,          value: "/data" }
+            - { name: NET,           value: "mainnet" }
+            - { name: CHAIN_ID,      value: "thorchain-1" }
+
+            # core.sh hard-fails if these are empty. A full node never
+            # signs anything, so the values are inert -- but they must
+            # exist. (fullnode.sh defaults them; set explicitly so a
+            # future entrypoint change cannot surprise us.)
+            - { name: SIGNER_NAME,   value: "thorchain" }
+            - { name: SIGNER_PASSWD, value: "password" }
+
+            # ---- config overrides -----------------------------
+            # Every key in
+            #   https://gitlab.com/thorchain/thornode/-/blob/develop/config/default.yaml
+            # is settable as an env var: dots become underscores and
+            # the whole key is upper-cased. thor.cosmos.pruning ->
+            # THOR_COSMOS_PRUNING. This is the supported way to
+            # configure THORNode; sed-ing the rendered TOML is not,
+            # because render-config rewrites it every boot.
+
+            # "default" = keep last 100 + every 500th state. Matches a
+            # mainnet-pruned snapshot and the 600Gi PVC.
+            # THORChain's own default is "nothing" (full archive) --
+            # that needs 4Ti+ and will fill this disk.
+            - { name: THOR_COSMOS_PRUNING, value: "default" }
+
+            # REST/LCD on 1317 and gRPC on 9090.
+            - { name: THOR_COSMOS_API_ENABLE,   value: "true" }
+            - { name: THOR_COSMOS_GRPC_ENABLE,  value: "true" }
+            - { name: THOR_COSMOS_GRPC_ADDRESS, value: "0.0.0.0:9090" }
+
+            # Prometheus on :26660.
+            - { name: THOR_TENDERMINT_INSTRUMENTATION_PROMETHEUS, value: "true" }
+
+            # Default is 10. More outbound dials gives catch-up more
+            # parallel block sources and survives peers churning out.
+            - { name: THOR_TENDERMINT_P2P_MAX_NUM_OUTBOUND_PEERS, value: "40" }
+
+            # ---- EXTERNAL_IP: intentionally absent -------------
+            # Setting EXTERNAL_IP makes render-config advertise
+            #   external_address = "<ip>:27146"
+            # to the entire network. v1's runbook told you to set it
+            # to the internal Azure LB address -- an RFC1918 address
+            # that no THORChain peer on the internet can dial. Peers
+            # that fail to dial back deprioritise and eventually drop
+            # you, which makes peering worse, not better.
+            # A full node needs only OUTBOUND connectivity. Leave this
+            # unset unless the pod has a real public IP.
+
+            # ---- peer fallback: see README section 4 -----------
+            # render-config discovers seeds by calling
+            #   http://<validator-ip>:27147/status
+            # for each active validator. If your AKS egress firewall
+            # only permits 443, that discovery returns nothing and
+            # config.toml ends up with seeds = "" -- a node with no
+            # peers, which looks exactly like the bug you had.
+            #
+            # In that case uncomment this: persistent_peers already
+            # carries the node IDs, so no :27147 probe is needed.
+            # (NOTE: THOR_TENDERMINT_P2P_SEEDS would NOT work --
+            # InitThornode overwrites .P2P.Seeds unconditionally
+            # after config load. PersistentPeers is not overwritten.)
+            #
+            # - name: THOR_TENDERMINT_P2P_PERSISTENT_PEERS
+            #   value: "542476b9e0c42326616854d7be0b445dd68a9f2f@70.34.247.166:27146,f18693601ed7ef210cef3f3d9d0ea32445abc4ca@167.235.109.114:27146,64bf8cce2bfccfd00ea313906e13b0c56f9d3ce0@167.235.195.244:27146,0557f43679990f8139502508a8b635c108af9521@173.234.136.17:27146,b466028dc9f8adaf5b91acd17754575d5797c15a@80.91.65.181:27146,3d221ed238859628fc3710ba34ace804ceebf9d8@195.3.223.168:27146,a860e06d1e8b46d9aa30551f69992c91a3f7cc90@45.63.27.5:27146,d1fd0a64df3aa93e363f3a152e44aef8ba025ed1@139.84.141.122:27146,90cf7ef98504ae451b9ae7ac223f68cf8191b826@209.38.8.20:27146,b9d772ed35b15e7cdbfdaff5bafae7655f0ea47b@139.84.196.2:27146,5bf7165cc7a057939e41185fed3f9f070aaf2e13@159.65.195.202:27146,aa9f43f896fd83e8afd14f0b9ae14e0b0c6d0df5@134.209.83.182:27146"
+
+          ports:
+            - { name: p2p,     containerPort: 27146, protocol: TCP }
+            - { name: rpc,     containerPort: 27147, protocol: TCP }
+            - { name: rest,    containerPort: 1317,  protocol: TCP }
+            - { name: grpc,    containerPort: 9090,  protocol: TCP }
+            - { name: metrics, containerPort: 26660, protocol: TCP }
+
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+
+          resources:
+            requests:
+              cpu: "4"          # upstream chart requests exactly this
+              memory: "8Gi"
+            limits:
+              memory: "16Gi"
+              # NO cpu limit, on purpose. CFS throttling on a CometBFT
+              # node delays block execution past consensus timeouts and
+              # is a classic cause of a node that "runs but falls
+              # behind". Requests already guarantee the 4 cores.
+
+          # Probes hit CometBFT's own /health. v1 probed the TCP p2p
+          # port, which stays open on a node that is completely stuck
+          # -- so the probes reported healthy the entire time the
+          # chain was frozen.
+          startupProbe:
+            httpGet: { path: /health, port: rpc }
+            periodSeconds: 15
+            failureThreshold: 240      # up to 60 min for replay/handshake
+          readinessProbe:
+            httpGet: { path: /health, port: rpc }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          # No livenessProbe. Restarting a node that is behind does not
+          # help it catch up, and killing it mid-compaction risks
+          # LevelDB corruption. Watch height with the README commands
+          # and restart deliberately.
+
+          volumeMounts:
+            - { name: thornode-data, mountPath: /data }
+            - { name: passwd-vol,    mountPath: /etc/passwd, subPath: passwd }
+
+      volumes:
+        - name: thornode-data
+          persistentVolumeClaim:
+            claimName: thornode-data
+        - name: passwd-vol
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: thornode-scripts
+            defaultMode: 0755

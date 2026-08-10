@@ -1,0 +1,81 @@
+# ============================================================
+# Services.
+#
+# CHANGED vs v1: the internal-LoadBalancer for p2p (27146) is
+# gone. It served no purpose. An internal Azure LB hands out an
+# RFC1918 VNet address; THORChain peers live on the public
+# internet and cannot dial it. A full node only needs OUTBOUND
+# p2p, which works from the pod IP via the cluster's egress
+# path -- no Service involved.
+#
+# If you later want inbound peering (better peer quality, not
+# required to sync) you need a PUBLIC LoadBalancer on 27146
+# plus EXTERNAL_IP set to that public IP in the StatefulSet.
+# Do both or neither -- advertising an address you cannot be
+# reached on is worse than advertising nothing.
+# ============================================================
+---
+# Stable DNS identity for the StatefulSet.
+# publishNotReadyAddresses keeps the pod resolvable while it is
+# still catching up (readiness will be failing for a while).
+apiVersion: v1
+kind: Service
+metadata:
+  name: thornode-headless
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/part-of: thornode-fullnode
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: thornode
+  ports:
+    - { name: p2p,     port: 27146, targetPort: 27146, protocol: TCP }
+    - { name: rpc,     port: 27147, targetPort: 27147, protocol: TCP }
+    - { name: rest,    port: 1317,  targetPort: 1317,  protocol: TCP }
+    - { name: grpc,    port: 9090,  targetPort: 9090,  protocol: TCP }
+    - { name: metrics, port: 26660, targetPort: 26660, protocol: TCP }
+---
+# In-cluster ClusterIP for apps that consume the node.
+# Use this rather than the headless service so traffic only
+# reaches the pod once readiness passes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: thornode
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/part-of: thornode-fullnode
+spec:
+  type: ClusterIP
+  selector:
+    app: thornode
+  ports:
+    - { name: rpc,     port: 27147, targetPort: 27147, protocol: TCP }
+    - { name: rest,    port: 1317,  targetPort: 1317,  protocol: TCP }
+    - { name: grpc,    port: 9090,  targetPort: 9090,  protocol: TCP }
+    - { name: metrics, port: 26660, targetPort: 26660, protocol: TCP }
+---
+# Private VNet IP for consumers outside the cluster.
+# Delete this file section if nothing off-cluster needs the node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: thornode-rpc
+  namespace: thorchain
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  labels:
+    app: thornode
+    app.kubernetes.io/part-of: thornode-fullnode
+spec:
+  type: LoadBalancer
+  selector:
+    app: thornode
+  ports:
+    - { name: rpc,  port: 27147, targetPort: 27147, protocol: TCP }
+    - { name: rest, port: 1317,  targetPort: 1317,  protocol: TCP }
+    - { name: grpc, port: 9090,  targetPort: 9090,  protocol: TCP }

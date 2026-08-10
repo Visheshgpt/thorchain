@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: thorchain
+  labels:
+    app.kubernetes.io/part-of: thornode-fullnode
+    app.kubernetes.io/managed-by: kubectl

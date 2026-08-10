@@ -1,0 +1,134 @@
+# ============================================================
+# FILE: 04-service.yaml
+# PURPOSE: Exposes the thornode pod via THREE services:
+#
+#   1. thornode-headless  — ClusterIP: None
+#      Provides stable DNS (thornode-0.thornode-headless.thorchain.svc.cluster.local)
+#      required by the StatefulSet. Exposes all 5 ports for
+#      in-cluster pod-to-pod communication.
+#
+#   2. thornode-p2p       — Internal Azure LoadBalancer
+#      Dedicated service for CometBFT P2P port 27146.
+#      Assigned a private VNet IP — external peers within the
+#      same VNet/peered network can reach the node for gossip.
+#
+#   3. thornode-rpc       — Internal Azure LoadBalancer
+#      Groups all API/RPC/metrics ports (27147, 1317, 9090,
+#      26660) under a single private VNet IP. Restricted to
+#      VNet — no public internet exposure.
+#
+# ALL LoadBalancer services carry:
+#   service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+# This forces Azure to allocate a private IP from the AKS
+# subnet rather than a public IP.
+# ============================================================
+---
+# ── Service 1: Headless ──────────────────────────────────────
+# Required by StatefulSet for stable pod DNS identity.
+# ClusterIP: None means kube-dns returns the pod IP directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: thornode-headless
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/part-of: thornode-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  clusterIP: None                   # Headless — no virtual IP; DNS resolves to pod IPs directly
+  selector:
+    app: thornode
+  publishNotReadyAddresses: true    # Include pod in DNS even before readiness probe passes (needed during sync)
+  ports:
+    - name: p2p
+      port: 27146                   # CometBFT P2P
+      targetPort: 27146
+      protocol: TCP
+    - name: rpc
+      port: 27147                   # CometBFT RPC
+      targetPort: 27147
+      protocol: TCP
+    - name: rest
+      port: 1317                    # Cosmos SDK REST
+      targetPort: 1317
+      protocol: TCP
+    - name: grpc
+      port: 9090                    # Cosmos SDK gRPC
+      targetPort: 9090
+      protocol: TCP
+    - name: metrics
+      port: 26660                   # Prometheus metrics
+      targetPort: 26660
+      protocol: TCP
+---
+# ── Service 2: P2P — Internal LoadBalancer ───────────────────
+# Dedicated Internal LB for CometBFT P2P (port 27146).
+# Peers within the VNet use the private IP for block/tx gossip.
+apiVersion: v1
+kind: Service
+metadata:
+  name: thornode-p2p
+  namespace: thorchain
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"   # Private VNet IP only — no public IP
+  labels:
+    app: thornode
+    role: p2p
+    app.kubernetes.io/part-of: thornode-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: LoadBalancer
+  selector:
+    app: thornode
+  ports:
+    - name: p2p
+      port: 27146                   # CometBFT P2P peer gossip
+      targetPort: 27146
+      protocol: TCP
+  sessionAffinity: None
+---
+# ── Service 3: RPC — Internal LoadBalancer ───────────────────
+# Groups all API / RPC / metrics ports under one Internal LB IP.
+# Private VNet IP only — applications inside the VNet reach
+# thornode through this service.
+#
+# Ports:
+#   27147 — CometBFT JSON-RPC (block queries, tx broadcast)
+#    1317 — Cosmos SDK REST API / LCD
+#    9090 — Cosmos SDK gRPC
+#   26660 — Prometheus /metrics
+apiVersion: v1
+kind: Service
+metadata:
+  name: thornode-rpc
+  namespace: thorchain
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"   # Private VNet IP only — no public IP
+  labels:
+    app: thornode
+    role: rpc
+    app.kubernetes.io/part-of: thornode-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: LoadBalancer
+  selector:
+    app: thornode
+  ports:
+    - name: rpc
+      port: 27147                   # CometBFT RPC
+      targetPort: 27147
+      protocol: TCP
+    - name: rest
+      port: 1317                    # Cosmos SDK REST / LCD API
+      targetPort: 1317
+      protocol: TCP
+    - name: grpc
+      port: 9090                    # Cosmos SDK gRPC
+      targetPort: 9090
+      protocol: TCP
+    - name: metrics
+      port: 26660                   # Prometheus metrics
+      targetPort: 26660
+      protocol: TCP
+  sessionAffinity: None

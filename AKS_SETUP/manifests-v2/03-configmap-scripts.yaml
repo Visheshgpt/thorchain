@@ -1,0 +1,238 @@
+# ============================================================
+# Init-container shell scripts.
+#
+# Only TWO scripts remain in v2:
+#
+#   init-passwd.sh    - /etc/passwd entry for UID 1025 so
+#                       os/user.Current() does not panic.
+#
+#   init-snapshot.sh  - restore a Liquify pruned snapshot.
+#
+# DELETED from v1: init-genesis.sh and the whole init-config
+# sed-the-toml step. Both are handled correctly and
+# automatically by `thornode render-config`, which the image's
+# own entrypoint (/scripts/fullnode.sh) runs on every boot.
+# Hand-editing config.toml is what broke peering in v1.
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thornode-scripts
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/part-of: thornode-fullnode
+    app.kubernetes.io/managed-by: kubectl
+data:
+
+  # ----------------------------------------------------------
+  # The upstream image is debian-bookworm-slim with no USER
+  # directive, so it expects to run as root. Gatekeeper forbids
+  # that here, so we run as UID 1025 -- but THORChain's Go code
+  # calls os/user.Current(), which panics with
+  # "user: unknown userid 1025" unless /etc/passwd has a
+  # matching entry. We write one into a shared emptyDir and
+  # mount it over /etc/passwd via subPath.
+  # ----------------------------------------------------------
+  init-passwd.sh: |
+    #!/bin/sh
+    set -eu
+    cat > /passwd-vol/passwd <<'PASSWD'
+    root:x:0:0:root:/root:/bin/bash
+    daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+    nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+    thornode:x:1025:1025:thornode:/data:/bin/sh
+    PASSWD
+    echo "[passwd] wrote /etc/passwd:"
+    grep 1025 /passwd-vol/passwd
+
+  # ----------------------------------------------------------
+  # Snapshot restore from the Liquify snapshot API.
+  #
+  # Fixes vs the v1 script:
+  #
+  #  1. Runs BEFORE nothing else touches config/. In v1 the
+  #     config-patching container ran BEFORE this one, so the
+  #     tarball's own config.toml silently overwrote every
+  #     patch on first boot -- config state depended on how
+  #     many times the pod had restarted.
+  #
+  #  2. Explicitly DELETES the snapshot's config.toml and
+  #     app.toml after extraction. Those files belong to the
+  #     machine that produced the snapshot; keeping them means
+  #     inheriting a stranger's peers, external_address and
+  #     pruning settings. render-config writes correct ones.
+  #
+  #  3. PRESERVES node_key.json / priv_validator_key.json
+  #     across a re-restore, so the node keeps its p2p identity.
+  #
+  #  4. Records the restored height in the sentinel file, so
+  #     you can see what the node was seeded from:
+  #       kubectl exec ... -- cat /data/.thornode/.snapshot-restored
+  #
+  #  5. No `[ x ] && { ...; }` guards. Under `set -e` a false
+  #     test there makes the whole line return non-zero and
+  #     kills the script. Everything is if/fi.
+  #
+  # Liquify currently serves .tar.gz; .tar.lz4 / .tar.zst are
+  # handled too in case that changes.
+  # ----------------------------------------------------------
+  init-snapshot.sh: |
+    #!/bin/sh
+    set -eu
+
+    SNAP_TYPE="${SNAP_TYPE:-mainnet-pruned}"
+    API="https://snapshot-api.liquify.com"
+    NETWORK="thorchain"
+    HOME_DIR=/data/.thornode
+    CFG="$HOME_DIR/config"
+    SENTINEL="$HOME_DIR/.snapshot-restored"
+
+    if [ -f "$SENTINEL" ]; then
+      echo "[snapshot] already restored from height $(cat "$SENTINEL" 2>/dev/null) -- skipping"
+      exit 0
+    fi
+
+    echo "[snapshot] installing tools..."
+    apk add --no-cache aria2 curl ca-certificates jq tar gzip lz4 zstd >/dev/null
+
+    # -- pick the newest snapshot of the requested type --------
+    echo "[snapshot] querying $API for latest $SNAP_TYPE ..."
+    LIST=$(curl -sf --max-time 60 "$API/files/by-network/$NETWORK?type=$SNAP_TYPE")
+    FILE_ID=$(echo "$LIST"   | jq -r '.files | sort_by(-.block_height) | .[0].id')
+    HEIGHT=$(echo "$LIST"    | jq -r '.files | sort_by(-.block_height) | .[0].block_height')
+    if [ -z "$FILE_ID" ] || [ "$FILE_ID" = "null" ]; then
+      echo "[snapshot] ERROR: no $SNAP_TYPE snapshot for $NETWORK"
+      exit 1
+    fi
+    echo "[snapshot] selected height=$HEIGHT id=$FILE_ID"
+
+    # Mint a signed URL. NOTE: these expire in ~600 s -- far less
+    # than a 40 GB transfer takes. So the download below re-mints a
+    # fresh URL on every attempt and lets aria2c resume the partial
+    # file. Never paste a signed URL into the manifest.
+    mint_url() {
+      DL=$(curl -sf --max-time 60 -X POST "$API/files/$FILE_ID/download-url")
+      REGION=$(echo "$DL" | jq -r '.urls | keys | .[0]')
+      URL=$(echo "$DL"    | jq -r --arg r "$REGION" '.urls[$r]')
+    }
+    mint_url
+    echo "[snapshot] region=$REGION"
+
+    case "${URL%%\?*}" in
+      *.tar.gz|*.tgz)   EXT=gz  ;;
+      *.tar.lz4|*.tlz4) EXT=lz4 ;;
+      *.tar.zst|*.tzst) EXT=zst ;;
+      *.tar)            EXT=tar ;;
+      *) echo "[snapshot] ERROR: unknown archive format: ${URL%%\?*}"; exit 1 ;;
+    esac
+    TARBALL="/data/snapshot.tar.$EXT"
+    echo "[snapshot] format=$EXT"
+
+    # -- keep node identity, discard everything else -----------
+    mkdir -p "$CFG"
+    for f in node_key.json priv_validator_key.json; do
+      if [ -f "$CFG/$f" ]; then cp -f "$CFG/$f" "/tmp/$f"; fi
+    done
+    rm -rf "$HOME_DIR/data"
+    rm -f "$CFG/genesis.json" "$CFG/config.toml" "$CFG/app.toml" "$CFG/addrbook.json"
+
+    # -- download (resume / reuse across pod restarts) ---------
+    # stat -c %s is a syscall. Never use `wc -c` on a 40 GB file.
+    NEED=1
+    if [ -f "$TARBALL" ] && [ ! -f "$TARBALL.aria2" ]; then
+      SZ=$(stat -c %s "$TARBALL" 2>/dev/null || echo 0)
+      if [ "$SZ" -gt 1073741824 ]; then
+        echo "[snapshot] reusing complete tarball on disk ($SZ bytes)"
+        NEED=0
+      else
+        rm -f "$TARBALL"
+      fi
+    fi
+    if [ "$NEED" = "1" ]; then
+      echo "[snapshot] downloading (~40 GB, 10-40 min)..."
+      ATTEMPT=0
+      while : ; do
+        ATTEMPT=$((ATTEMPT + 1))
+        if [ "$ATTEMPT" -gt 25 ]; then
+          echo "[snapshot] ERROR: download failed after 25 attempts"
+          exit 1
+        fi
+        # Fresh signature every attempt; aria2c resumes the partial
+        # file, so an expired-URL 403 costs one retry, not 40 GB.
+        if [ "$ATTEMPT" -gt 1 ]; then
+          echo "[snapshot] attempt $ATTEMPT -- re-minting signed URL"
+          mint_url || { sleep 15; continue; }
+        fi
+        if aria2c --dir=/data --out="$(basename "$TARBALL")" \
+             --split=16 --max-connection-per-server=16 --min-split-size=100M \
+             --continue=true --file-allocation=none \
+             --max-tries=2 --retry-wait=10 --timeout=60 \
+             --console-log-level=warn --summary-interval=30 \
+             --show-console-readout=false "$URL"; then
+          break
+        fi
+        echo "[snapshot] aria2c exited non-zero -- resuming shortly"
+        sleep 10
+      done
+      SZ=$(stat -c %s "$TARBALL")
+      echo "[snapshot] downloaded $SZ bytes"
+      if [ "$SZ" -lt 1073741824 ]; then
+        echo "[snapshot] ERROR: tarball too small"
+        exit 1
+      fi
+    fi
+
+    # -- extract ----------------------------------------------
+    echo "[snapshot] extracting into $HOME_DIR (15-25 min)..."
+    case "$EXT" in
+      gz)  gzip -dc "$TARBALL" | tar -xf - -C "$HOME_DIR" ;;
+      lz4) lz4  -dc "$TARBALL" | tar -xf - -C "$HOME_DIR" ;;
+      zst) zstd -dc "$TARBALL" | tar -xf - -C "$HOME_DIR" ;;
+      tar) tar   -xf "$TARBALL"        -C "$HOME_DIR" ;;
+    esac
+    sync
+
+    # Some producers pack with a leading .thornode/ prefix.
+    if [ -d "$HOME_DIR/.thornode" ] && [ ! -f "$CFG/genesis.json" ]; then
+      echo "[snapshot] flattening nested .thornode/"
+      mv "$HOME_DIR/.thornode/"* "$HOME_DIR/" 2>/dev/null || true
+      rmdir "$HOME_DIR/.thornode" 2>/dev/null || true
+    fi
+
+    if [ ! -d "$HOME_DIR/data" ]; then
+      echo "[snapshot] ERROR: no data/ after extraction"
+      ls -la "$HOME_DIR"
+      exit 1
+    fi
+
+    # -- drop the producer's config, keep ours -----------------
+    # genesis.json IS kept: render-config only fetches genesis
+    # when the file is absent, so a snapshot genesis short-
+    # circuits the outbound :27147 genesis_chunked fetch.
+    rm -f "$CFG/config.toml" "$CFG/app.toml" "$CFG/addrbook.json"
+    if [ ! -f "$CFG/genesis.json" ]; then
+      echo "[snapshot] WARN: snapshot had no genesis.json;"
+      echo "[snapshot]       render-config will fetch it from seeds over :27147"
+    fi
+    for f in node_key.json priv_validator_key.json; do
+      if [ -f "/tmp/$f" ]; then cp -f "/tmp/$f" "$CFG/$f"; fi
+    done
+
+    mkdir -p "$HOME_DIR/data"
+    if [ ! -f "$HOME_DIR/data/priv_validator_state.json" ]; then
+      echo '{"height":"0","round":0,"step":0}' > "$HOME_DIR/data/priv_validator_state.json"
+    fi
+
+    rm -f "$TARBALL" "$TARBALL.aria2"
+
+    # Extracted as root; the main container is UID 1025.
+    # CAP_CHOWN is dropped so `chown -R` fails, but root can
+    # always chmod its own files. a+rwX = rw for all, +x only
+    # on directories. ~3-5 min for ~1M LevelDB files.
+    echo "[snapshot] chmod -R a+rwX (3-5 min, silent)..."
+    chmod -R a+rwX "$HOME_DIR"
+
+    echo "$HEIGHT" > "$SENTINEL"
+    echo "[snapshot] DONE -- restored at block $HEIGHT"
+    df -h /data

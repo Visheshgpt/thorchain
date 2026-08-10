@@ -1,0 +1,38 @@
+# ============================================================
+# FILE: 02-pvc.yaml
+# PURPOSE: PersistentVolumeClaim for the thornode chain data
+#          directory (/data/.thornode). Backed by thorchain-storage
+#          (Premium_LRS Azure Disk). THORChain state grows at
+#          ~20-40 GB/month — start at 2Ti with room to expand.
+# NOTE:    reclaimPolicy: Retain on the StorageClass means the
+#          underlying Azure Disk survives PVC deletion.
+# RESIZE:  kubectl patch pvc thornode-data -n thorchain \
+#            -p '{"spec":{"resources":{"requests":{"storage":"3Ti"}}}}'
+# ============================================================
+apiVersion: v1                      # Stable Kubernetes core API
+kind: PersistentVolumeClaim
+metadata:
+  name: thornode-data               # Referenced by StatefulSet volumes section
+  namespace: thorchain              # --namespace thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/part-of: thornode-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  accessModes:
+    - ReadWriteOnce                 # Azure Disk supports single-node read/write (RWO only)
+  storageClassName: thorchain-storage  # Must match StorageClass name in 01-storageclass.yaml
+  resources:
+    requests:
+      storage: 300Gi                   # PRUNED snapshot test size
+                                       # Peak usage: ~40 GB tarball on disk
+                                       # + ~150 GB extracted state = ~190 GB.
+                                       # After extract the tarball is deleted
+                                       # so steady-state is ~150-180 GB.
+                                       # Managed-CSI-Premium supports online expansion:
+                                       #   kubectl patch pvc thornode-data -n thorchain \
+                                       #     -p '{"spec":{"resources":{"requests":{"storage":"500Gi"}}}}'
+                                       # For an ARCHIVE node (full history) use 4Ti+.
+
+
+

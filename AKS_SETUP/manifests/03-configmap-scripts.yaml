@@ -1,0 +1,431 @@
+
+# ============================================================
+# FILE: 03-configmap-scripts.yaml
+# PURPOSE: Holds the shell scripts used by the thornode init
+#          containers. Kept in a ConfigMap so we never have to
+#          embed multi-line shell inside YAML `|` blocks (which
+#          was the source of every previous heredoc/indent bug).
+#
+# CONTENTS:
+#   init-passwd.sh    - Writes a minimal /etc/passwd with a
+#                       UID 1025 entry (THORChain code calls
+#                       os/user.Current() â†’ panic without this).
+#
+#   init-genesis.sh   - Downloads the thorchain-1 genesis
+#                       (~42 MB, 3 chunks) via Liquify HTTPS
+#                       gateway on port 443 (AKS pods CANNOT
+#                       reach random THORChain peers on 27147).
+#                       Applies the YggdrasilVault â†’ AsgardVault
+#                       fix required by the current binary.
+#
+#   init-snapshot.sh  - Downloads a pruned snapshot (~40 GB LZ4
+#                       tarball) via Liquify HTTPS. Streams +
+#                       extracts in one pass. Skips genesis
+#                       download because the snapshot already
+#                       contains a valid patched genesis.json.
+#                       Requires SNAPSHOT_URL env var â€” see the
+#                       README for how to fetch the latest URL.
+#
+# ALL SCRIPTS ARE POSIX SH (busybox-compatible). They work in
+# alpine:3.19, busybox:1.36 and the debian-slim thornode image.
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thornode-scripts
+  namespace: thorchain
+  labels:
+    app: thornode
+    app.kubernetes.io/part-of: thornode-node
+    app.kubernetes.io/managed-by: kubectl
+data:
+
+
+  # ── /etc/passwd patch ────────────────────────────────────────
+  # The upstream thornode image (debian-bookworm-slim) has no
+    # USER directive → the container normally runs as root (UID 0).
+  # Gatekeeper on this AKS cluster forbids root, so we run as
+  # UID 1025. THORChain's Go code calls os/user.Current() during
+  # startup; without a matching /etc/passwd entry it panics with
+  # "user: unknown userid 1025". This script writes a minimal
+  # /etc/passwd (including root + a thornode entry) into the
+  # shared emptyDir, which is then mounted read-only over the
+  # real /etc/passwd of every thornode container via subPath.
+  init-passwd.sh: |
+    #!/bin/sh
+    set -e
+    cat > /passwd-vol/passwd <<'PASSWD'
+    root:x:0:0:root:/root:/bin/bash
+    daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+    nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+    thornode:x:1025:1025:thornode:/data:/bin/sh
+    PASSWD
+    echo "==> [passwd] wrote /etc/passwd with UID 1025 entry:"
+    grep 1025 /passwd-vol/passwd
+
+
+  # â”€â”€ Genesis download (Liquify HTTPS, single-shot) â”€â”€
+  # This mirrors EXACTLY what the wiki.md team used to bring up a
+  # working node on-prem. Key insights from the wiki analysis:
+  #
+  #   1. Endpoint: /chain/thorchain_v1_rpc/genesis (single response,
+  #      NOT /genesis_chunked). Despite the misleading name, this
+  #      URL returns the ACTIVE thorchain-1 genesis (block 17,562,001)
+  #      â€” confirmed by the wiki team's working deployment.
+  #
+  #   2. `jq -r .result.genesis` pretty-prints the JSON on multiple
+  #      lines, so busybox `sed -i` works on it. (The chunked API
+  #      returns minified single-line JSON â€” busybox sed can't
+  #      process that, which is why every earlier attempt failed.)
+  #
+  #   3. YggdrasilVault â†’ AsgardVault sed fix is required.
+  #
+  #   4. STOPFUNDYGGDRASIL constants must be removed.
+  #
+  #   5. app.toml patched for ARCHIVE mode (pruning=nothing).
+  #      config.toml patched with mainnet seeds + K8s settings.
+  #
+  # The `thornode init` step ran before this (init-thornode)
+  # already created config.toml, app.toml, node_key.json and
+  # priv_validator_key.json with valid ed25519 keys.  We just
+  # replace the dummy genesis and edit the two toml files.
+  init-genesis.sh: |
+    #!/bin/sh
+    # Runs as root (needs apk add). chown at the end is best-effort
+    # (CAP_CHOWN dropped by securityContext but pod-level fsGroup:1025
+    # already handles group ownership on the PVC).
+    set -eu
+
+
+    HOME_DIR=/data/.thornode
+    CONFIG_DIR="$HOME_DIR/config"
+    GENESIS="$CONFIG_DIR/genesis.json"
+    CFG="$CONFIG_DIR/config.toml"
+    APP="$CONFIG_DIR/app.toml"
+    SENTINEL="$HOME_DIR/.aks-initialized"
+
+
+    if [ -f "$SENTINEL" ]; then
+      echo "==> [genesis] .aks-initialized present â€” skipping"
+      exit 0
+    fi
+
+
+    echo "==> [genesis] installing curl + jq + ca-certificates..."
+    apk add --no-cache curl jq ca-certificates >/dev/null
+
+
+    # â”€â”€ Download REAL genesis (single-shot, pretty-printed) â”€â”€â”€â”€â”€
+    # Overwrites the dummy genesis.json produced by `thornode init`.
+    echo "==> [genesis] downloading from Liquify (single-shot)..."
+    curl -fsSL --retry 5 --retry-delay 3 \
+      "https://gateway.liquify.com/chain/thorchain_v1_rpc/genesis" \
+      | jq -r .result.genesis > "$GENESIS"
+
+
+    SIZE=$(wc -c < "$GENESIS")
+    echo "==> [genesis] genesis.json size: $SIZE bytes"
+    if [ "$SIZE" -lt 1000000 ]; then
+      echo "==> ERROR: genesis download failed"
+      head -c 500 "$GENESIS"
+      exit 1
+    fi
+
+
+    CID=$(jq -r '.chain_id' "$GENESIS")
+    HEIGHT=$(jq -r '.initial_height' "$GENESIS")
+    echo "==> [genesis] chain_id=$CID initial_height=$HEIGHT"
+
+
+    # â”€â”€ YggdrasilVault â†’ AsgardVault (per wiki, sed works on
+    # â”€â”€ multi-line pretty JSON) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    echo "==> [genesis] applying YggdrasilVault â†’ AsgardVault fix..."
+    sed -i 's/YggdrasilVault/AsgardVault/g' "$GENESIS"
+    sed -i '/STOPFUNDYGGDRASIL/d' "$GENESIS"
+    YGG=$(grep -c YggdrasilVault "$GENESIS" || echo 0)
+    echo "==> [genesis] YggdrasilVault remaining: $YGG"
+
+
+    POST=$(wc -c < "$GENESIS")
+    echo "==> [genesis] post-patch size: $POST bytes"
+    if [ "$POST" -lt 1000000 ]; then
+      echo "==> ERROR: patches collapsed the genesis"
+      exit 1
+    fi
+
+
+    # â”€â”€ Patch config.toml for K8s + wiki seeds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if [ -f "$CFG" ]; then
+      echo "==> [config] patching config.toml..."
+      # P2P listen addr â†’ 0.0.0.0:27146
+      sed -i 's|^laddr = "tcp://[^"]*:26656"|laddr = "tcp://0.0.0.0:27146"|' "$CFG"
+      sed -i 's|^laddr = "tcp://[^"]*:27146"|laddr = "tcp://0.0.0.0:27146"|' "$CFG"
+      # RPC listen addr â†’ 0.0.0.0:27147
+      sed -i 's|^laddr = "tcp://[^"]*:26657"|laddr = "tcp://0.0.0.0:27147"|' "$CFG"
+      sed -i 's|^laddr = "tcp://[^"]*:27147"|laddr = "tcp://0.0.0.0:27147"|' "$CFG"
+      # K8s-friendly p2p
+      sed -i 's|^addr_book_strict = .*|addr_book_strict = false|' "$CFG"
+      sed -i 's|^allow_duplicate_ip = .*|allow_duplicate_ip = true|' "$CFG"
+      sed -i 's|^max_num_outbound_peers = .*|max_num_outbound_peers = 30|' "$CFG"
+      # Seeds from wiki (proven working)
+      sed -i 's|^seeds = .*|seeds = "15f9d663d23709473333f4d14d2a0a8a8b0cf1c9@54.37.217.220:27146,4c3c9ca8b04f675c7977c56f80ed8a5d97a56346@54.37.218.253:27146"|' "$CFG"
+      # Prometheus + kv indexer (archive)
+      sed -i 's|^prometheus = false|prometheus = true|' "$CFG"
+      sed -i 's|^prometheus_listen_addr = .*|prometheus_listen_addr = ":26660"|' "$CFG"
+      sed -i 's|^indexer = .*|indexer = "kv"|' "$CFG"
+      echo "==> [config] config.toml laddr values:"
+      grep 'laddr = ' "$CFG" || true
+    fi
+
+
+    # â”€â”€ Patch app.toml for ARCHIVE mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if [ -f "$APP" ]; then
+      echo "==> [config] patching app.toml for ARCHIVE mode..."
+      # pruning = "nothing" keeps every historical state (~5â€“10 TB)
+      sed -i 's|^pruning = .*|pruning = "nothing"|' "$APP"
+      sed -i 's|^pruning-keep-recent = .*|pruning-keep-recent = "0"|' "$APP"
+      sed -i 's|^pruning-interval = .*|pruning-interval = "0"|' "$APP"
+      sed -i 's|^min-retain-blocks = .*|min-retain-blocks = 0|' "$APP"
+      # Enable REST + gRPC on all interfaces
+      sed -i 's|^address = "tcp://localhost:1317"|address = "tcp://0.0.0.0:1317"|' "$APP"
+      sed -i 's|^address = "localhost:9090"|address = "0.0.0.0:9090"|' "$APP"
+      # Enable API + gRPC
+      awk '
+        /^\[api\]/           {print; in_api=1; next}
+        /^\[grpc\]/          {print; in_grpc=1; next}
+        /^\[/                {in_api=0; in_grpc=0; print; next}
+        in_api  && /^enable/ {print "enable = true"; next}
+        in_grpc && /^enable/ {print "enable = true"; next}
+                             {print}
+      ' "$APP" > "$APP.new" && mv "$APP.new" "$APP"
+      echo "==> [config] app.toml pruning:"
+      grep -E '^(pruning|min-retain-blocks)' "$APP" || true
+    fi
+
+
+    touch "$SENTINEL"
+
+
+    chown -R 1025:1025 /data 2>/dev/null || echo "==> [genesis] chown skipped (fsGroup handles perms)"
+    chmod -R g+rw /data 2>/dev/null || true
+
+
+    echo "==> [genesis] DONE â€” configs ready for thornode start"
+  # ── Snapshot restore via Liquify API ────────────────────────
+  # Queries the Liquify snapshot REST API at pod start to get a
+  # fresh signed URL automatically -- no hardcoded expiring URLs.
+  # Supports tar.gz, tar.lz4, tar.zst (whichever Liquify serves).
+  # Set SNAP_TYPE env to "mainnet-pruned" (default) or "mainnet-archive".
+  init-snapshot.sh: |
+    #!/bin/sh
+    # ────────────────────────────────────────────────────────────
+    # THORChain fullnode -- snapshot restore
+    # ────────────────────────────────────────────────────────────
+    # Strategy:
+    #   1. Query Liquify API for fresh signed URL (no URL expiry).
+    #   2. Reuse existing complete tarball if present (survives
+    #      pod restarts without re-downloading 36 GB).
+    #   3. Download to LOCAL DISK via aria2c (16 parallel conns,
+    #      ~80-100 MiB/s from Liquify).
+    #   4. Extract explicit gzip|lz4|tar case (NO shell vars
+    #      holding commands — those silently fail under set -eu).
+    #   5. Reclaim disk, write sentinel, done.
+    #
+    # Runs as ROOT. Idempotent via sentinel.
+    #
+    # CRITICAL SIZING NOTE:
+    #   Use `stat -c %s <file>` for file size (uses stat syscall,
+    #   instant). NEVER `wc -c < <file>` — it streams the whole
+    #   file. On a 36 GB file on Azure Premium SSD that took
+    #   5+ minutes and looked like the script was hung.
+    # ────────────────────────────────────────────────────────────
+    set -eux
+    SNAP_TYPE="${SNAP_TYPE:-mainnet-pruned}"
+    API_BASE="https://snapshot-api.liquify.com"
+    NETWORK="thorchain"
+    DATA_DIR=/data/.thornode
+    SENTINEL="$DATA_DIR/.snapshot-restored"
+
+
+    if [ -f "$SENTINEL" ]; then
+      echo "==> [snapshot] sentinel present -- already restored, skipping"
+      exit 0
+    fi
+
+
+    mkdir -p "$DATA_DIR"
+
+
+    echo "==> [snapshot] installing packages (aria2 curl jq lz4 zstd tar)..."
+    apk add --no-cache aria2 curl ca-certificates jq lz4 zstd tar >/dev/null
+
+
+    # ── FETCH FRESH SIGNED URL FROM LIQUIFY API ──────────────
+    # No hardcoded expiring URLs. API always returns a fresh signed URL.
+    echo "==> [snapshot] querying Liquify API for latest ${SNAP_TYPE} snapshot..."
+    SNAPSHOTS_JSON=$(curl -sf "${API_BASE}/files/by-network/${NETWORK}?type=${SNAP_TYPE}") || {
+      echo "==> [snapshot] ERROR: Liquify API query failed"
+      exit 1
+    }
+
+
+    FILE_ID=$(echo "$SNAPSHOTS_JSON" | jq -r '.files | sort_by(-.block_height) | .[0].id')
+    BLOCK_HEIGHT=$(echo "$SNAPSHOTS_JSON" | jq -r '.files | sort_by(-.block_height) | .[0].block_height')
+
+
+    if [ -z "$FILE_ID" ] || [ "$FILE_ID" = "null" ]; then
+      echo "==> [snapshot] ERROR: no snapshots found for ${NETWORK}/${SNAP_TYPE}"
+      exit 1
+    fi
+    echo "==> [snapshot] latest snapshot: block_height=${BLOCK_HEIGHT} file_id=${FILE_ID}"
+
+
+    echo "==> [snapshot] requesting signed download URL..."
+    DOWNLOAD_JSON=$(curl -sf -X POST "${API_BASE}/files/${FILE_ID}/download-url") || {
+      echo "==> [snapshot] ERROR: failed to get download URL"
+      exit 1
+    }
+
+
+    REGION=$(echo "$DOWNLOAD_JSON" | jq -r '.urls | keys | .[0]')
+    DOWNLOAD_URL=$(echo "$DOWNLOAD_JSON" | jq -r --arg r "$REGION" '.urls[$r]')
+    echo "==> [snapshot] got URL for region: ${REGION}"
+
+
+    # ── DETECT FORMAT ──────────────────────────────────────────
+    URL_PATH="${DOWNLOAD_URL%%[?]*}"
+    case "$URL_PATH" in
+      *.tar.gz|*.tgz)    EXT="tar.gz"  ; OUT="snapshot.tar.gz"  ;;
+      *.tar.zst|*.tzst)  EXT="tar.zst" ; OUT="snapshot.tar.zst" ;;
+      *.tar.lz4|*.tlz4)  EXT="tar.lz4" ; OUT="snapshot.tar.lz4" ;;
+      *.tar)             EXT="tar"     ; OUT="snapshot.tar"     ;;
+      *) echo "==> [snapshot] ERROR: unsupported archive format: $URL_PATH"; exit 1 ;;
+    esac
+    TARBALL="/data/$OUT"
+    echo "==> [snapshot] format: ${EXT}"
+
+
+    # ── CLEAN PARTIAL EXTRACT STATE (preserve tarball) ────────
+    # Wipe only data/ -- never touch config/ (node keys live there).
+    if [ -d "$DATA_DIR/data" ]; then
+      echo "==> [snapshot] wiping partial data/ from prior attempt..."
+      rm -rf "$DATA_DIR/data"
+    fi
+    rm -rf "$DATA_DIR/.thornode"
+
+
+    # ── DOWNLOAD (skip if complete tarball already on disk) ────
+    # stat -c %s = instant syscall. NEVER use wc -c (reads entire file).
+    NEED_DOWNLOAD=1
+    if [ -f "$TARBALL" ] && [ ! -f "$TARBALL.aria2" ]; then
+      EXISTING_SIZE=$(stat -c %s "$TARBALL" 2>/dev/null || echo 0)
+      if [ "$EXISTING_SIZE" -gt 1073741824 ]; then
+        echo "==> [snapshot] complete tarball on disk (${EXISTING_SIZE} bytes) -- skipping download"
+        NEED_DOWNLOAD=0
+      else
+        echo "==> [snapshot] stale tarball (${EXISTING_SIZE} bytes) -- re-downloading"
+        rm -f "$TARBALL"
+      fi
+    fi
+
+
+    if [ "$NEED_DOWNLOAD" = "1" ]; then
+      echo "==> [snapshot] downloading ${OUT} via aria2c (16 connections)..."
+      aria2c \
+        --dir=/data \
+        --out="$OUT" \
+        --split=16 \
+        --max-concurrent-downloads=16 \
+        --max-connection-per-server=16 \
+        --continue=true \
+        --min-split-size=100M \
+        --file-allocation=none \
+        --check-certificate=true \
+        --console-log-level=warn \
+        --summary-interval=15 \
+        --show-console-readout=false \
+        --max-tries=5 \
+        --retry-wait=10 \
+        "$DOWNLOAD_URL"
+
+
+      if [ ! -s "$TARBALL" ]; then
+        echo "==> [snapshot] ERROR: aria2c produced no file at $TARBALL"
+        exit 1
+      fi
+
+
+      DOWNLOADED_SIZE=$(stat -c %s "$TARBALL")
+      echo "==> [snapshot] downloaded: ${DOWNLOADED_SIZE} bytes"
+      if [ "$DOWNLOADED_SIZE" -lt 1073741824 ]; then
+        echo "==> [snapshot] ERROR: file too small (${DOWNLOADED_SIZE} bytes)"
+        exit 1
+      fi
+    fi
+
+
+    ls -lh "$TARBALL"
+
+
+    # ── EXTRACT ───────────────────────────────────────────────
+    # EXPLICIT case per format -- NO shell variables holding commands.
+    # Variables with multi-word commands silently no-op under set -eu.
+    echo "==> [snapshot] extracting ${TARBALL} into ${DATA_DIR}"
+    echo "==> [snapshot] (15-25 min -- monitor with: kubectl exec -n thorchain thornode-0 -c init-snapshot -- df -h /data)"
+    case "$EXT" in
+      tar.gz)  gzip -dc "$TARBALL" | tar -xf - -C "$DATA_DIR" ;;
+      tar.zst) zstd -dc "$TARBALL" | tar -xf - -C "$DATA_DIR" ;;
+      tar.lz4) lz4  -dc "$TARBALL" | tar -xf - -C "$DATA_DIR" ;;
+      tar)     tar  -xf "$TARBALL" -C "$DATA_DIR" ;;
+    esac
+    echo "==> [snapshot] extraction complete -- syncing to disk..."
+    sync
+
+
+    # Flatten nested .thornode/ prefix if tarball was packed with it.
+    if [ -d "$DATA_DIR/.thornode" ] && [ ! -f "$DATA_DIR/config/genesis.json" ]; then
+      echo "==> [snapshot] flattening nested .thornode/ prefix..."
+      mv "$DATA_DIR/.thornode"/* "$DATA_DIR/" 2>/dev/null || true
+      mv "$DATA_DIR/.thornode"/.* "$DATA_DIR/" 2>/dev/null || true
+      rmdir "$DATA_DIR/.thornode" 2>/dev/null || true
+    fi
+
+
+    if [ ! -f "$DATA_DIR/config/genesis.json" ]; then
+      echo "==> [snapshot] ERROR: no config/genesis.json after extraction"
+      ls -la "$DATA_DIR/"
+      exit 1
+    fi
+
+
+    # priv_validator_state.json is per-node -- not shipped in snapshots.
+    if [ ! -f "$DATA_DIR/data/priv_validator_state.json" ]; then
+      mkdir -p "$DATA_DIR/data"
+      echo '{"height":"0","round":0,"step":0}' > "$DATA_DIR/data/priv_validator_state.json"
+    fi
+
+
+    # Reclaim disk by deleting the tarball after successful extraction.
+    echo "==> [snapshot] deleting tarball to reclaim disk..."
+    rm -f "$TARBALL" "$TARBALL.aria2"
+
+
+    # ── PERMISSIONS FIX ───────────────────────────────────────
+    # Extracted files are owned by root (this init container runs as root).
+    # Main thornode container runs as UID 1025 -- needs rw on LevelDB files.
+    # CAP_CHOWN is dropped so chown -R fails silently.
+    # chmod -R a+rwX works: root can always chmod its own files.
+    # a+rwX = all users rw; capital X = dirs get +x, regular files don't.
+    # Duration: ~3-5 min for ~1M LevelDB files on Premium SSD.
+    echo "==> [snapshot] chmod -R a+rwX (3-5 min, no progress output)..."
+    chmod -R a+rwX "$DATA_DIR"
+    echo "==> [snapshot] chmod complete"
+
+
+    touch "$SENTINEL"
+
+
+    echo "==> [snapshot] final layout:"
+    ls -la "$DATA_DIR/"
+    df -h /data
+    echo "==> [snapshot] DONE -- ready for thornode start"

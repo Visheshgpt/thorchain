@@ -1,0 +1,15 @@
+# ============================================================
+# 00-namespace.yaml
+# Creates the dedicated Kubernetes namespace for thornode
+# Apply this first, before any other manifest
+# ============================================================
+
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: thorchain
+  labels:
+    app: thornode
+    managed-by: manifest-generator
+    environment: non-prod
