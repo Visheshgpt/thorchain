@@ -6,7 +6,26 @@ All commands are PowerShell (Azure jumpbox). No Helm.
 
 ## 1. Why your node is not syncing
 
-Your node reported:
+### Confirmed on the live pod
+
+```
+kubectl get pod thornode-0        ->  Running, RESTARTS 0, age 61m
+curl localhost:27147/net_info     ->  n_peers = 0
+logs | grep AppHash|panic|OOM     ->  (no matches)
+```
+
+**The proximate cause is peering: the node has zero peers, so it cannot fetch
+block 27301369.** It is not halted on a consensus/app-hash failure — 0 restarts and a
+clean log rule that out. Sections 1.2/1.3 below are still real defects that must be
+fixed (a 3.18.1 binary *will* halt on app hash once blocks start flowing again), but
+they are not what froze this node.
+
+The log silence is itself diagnostic: a node dialing and failing would be full of
+dial errors. Blank `seeds`, empty/garbage `persistent_peers` and an addrbook deleted
+on every boot leave CometBFT with nothing to dial, so it logs nothing. That is
+defects #4, #5 and #6 in section 2.
+
+### 1.1 The numbers
 
 ```
 latest_block_height : 27301368
@@ -17,7 +36,7 @@ catching_up         : true
 The live network at the time of this analysis was at **27,372,302** (2026-08-10T14:45Z).
 Your node is **~71,000 blocks / 5 days behind and not moving.**
 
-### The primary cause: wrong binary version
+### 1.2 Latent, must still be fixed: wrong binary version
 
 ```
 Network consensus version   : 3.19.3   (since block 26,897,608)
@@ -33,15 +52,15 @@ curl.exe -s "https://gateway.liquify.com/chain/thorchain_api/thorchain/version"
 
 The network switched to 3.19.3 at block 26,897,608 — **400,000 blocks before the
 snapshot you restored**. A 3.18.1 binary does not contain 3.19.x consensus logic at
-all. It restores the snapshot fine and can even commit a block or two, but as soon as
-a 3.19-gated code path executes it produces a **different app hash** than the rest of
-the network. CometBFT then rejects every following block, and the node parks on one
-height forever with `catching_up: true` — which is exactly what you are seeing.
+all. The node never got far enough to hit this (it had no peers), but the moment
+peering is fixed and blocks start flowing, the first 3.19-gated code path will produce
+a **different app hash** than the rest of the network and CometBFT will reject every
+following block. Fix it in the same change, not afterwards.
 
 `registry.gitlab.com/thorchain/thornode:mainnet-3.19.3` exists in the registry and is
 the tag that matches live consensus.
 
-### Second cause: you restored a snapshot and went nowhere
+### 1.3 You restored a snapshot and went nowhere
 
 Liquify's snapshot list shows the tarball you used:
 
@@ -50,10 +69,10 @@ Liquify's snapshot list shows the tarball you used:
 | mainnet-pruned | **27301367** | 2026-08-05T16:24Z |
 
 Your node sits at **27301368 = snapshot height + 1**. It has made essentially **zero**
-forward progress since restore. This is not "slow sync" — it never started. Two
-things independently prevent progress, and both are in your manifests (below).
+forward progress since restore. This is not "slow sync" — it never started, which is
+consistent with `n_peers = 0` from the moment it booted.
 
-### Not the cause
+### 1.4 Not the cause
 
 - **Not a port problem inside the cluster.** The node is listening on `0.0.0.0:27146`
   and `0.0.0.0:27147` correctly; `thornode status` answers.
@@ -65,9 +84,12 @@ things independently prevent progress, and both are in your manifests (below).
 
 ## 2. What is wrong in `manifests/` (v1), item by item
 
+Rows 4, 5 and 6 are the ones that produced `n_peers = 0`. The rest are real but were
+not what froze this node.
+
 | # | v1 does | Why it breaks | v2 |
 |---|---|---|---|
-| 1 | `image: mainnet-3.18.1` | Behind live consensus 3.19.3 → app-hash divergence → permanent halt | `mainnet-3.19.3` |
+| 1 | `image: mainnet-3.18.1` | Behind live consensus 3.19.3 → app-hash divergence → permanent halt as soon as blocks flow | `mainnet-3.19.3` |
 | 2 | Overrides the entrypoint with `thornode start` to skip `render-config` | `render-config` is the **only** thing that writes `seeds` into config.toml. Skipping it leaves the node with no seed discovery. | Run the image's own `CMD ["/scripts/fullnode.sh"]` |
 | 3 | Comment claims `render-config` overwrites `genesis.json` | **False.** `config.go: thornodeFetchGenesis()` returns early if `genesis.json` exists. The premise the whole v1 design rests on is wrong. | Uses `render-config` as intended |
 | 4 | `init-config` sets `seeds = ""` and deletes `addrbook.json` **on every pod start** | Blanks seed discovery and throws away every peer the node ever learned, every restart | Deleted — `render-config` handles it |
@@ -100,8 +122,9 @@ Read from THORChain source and live APIs, not from memory:
 
 ## 4. Egress your AKS pods actually need
 
-This is the one thing I cannot check from outside your VNet, and it decides whether
-you need the fallback peer list.
+With `n_peers = 0` already confirmed, this decides whether config alone was the
+problem or the firewall is also in the way — and therefore whether you need the
+fallback peer list. Run the check in section 5.1 before redeploying.
 
 | Destination | Port | Needed for |
 |---|---|---|
@@ -127,6 +150,37 @@ overwrites `.P2P.Seeds` after config load. Use `PERSISTENT_PEERS`.
 ## 5. Deploy
 
 ### 5.1 Check the egress question first (5 minutes, before anything else)
+
+While the current pod is still up, run this from inside it — it tests the real egress
+path *and* shows what the node was trying to dial. The thornode image is debian with
+bash, so `/dev/tcp` works and no `nc` is needed.
+
+```powershell
+kubectl exec -n thorchain thornode-0 -c thornode -- bash -c '
+echo "=== 1. what is it even trying to dial? ==="
+grep -nE "^(seeds|persistent_peers|external_address|pex|addr_book_strict|allow_duplicate_ip|max_num_outbound_peers|laddr) " /data/.thornode/config/config.toml
+
+echo
+echo "=== 2. addrbook ==="
+ls -la /data/.thornode/config/addrbook.json 2>/dev/null || echo "addrbook.json ABSENT"
+
+echo
+echo "=== 3. egress from this pod ==="
+for hp in 70.34.247.166:27146 70.34.247.166:27147 167.235.109.114:27146 167.235.109.114:27147; do
+  ip=${hp%:*}; port=${hp#*:}
+  if timeout 8 bash -c "exec 3<>/dev/tcp/$ip/$port" 2>/dev/null; then echo "  OPEN    $hp"; else echo "  BLOCKED $hp"; fi
+done
+curl -s -o /dev/null -w "  liquify-443 = %{http_code}\n" --max-time 15 https://gateway.liquify.com/chain/thorchain_api/thorchain/version
+'
+```
+
+| Result | Meaning | Action |
+|---|---|---|
+| `seeds = ""` and both ports OPEN | Pure config failure — v1 blanked seeds, nothing to dial | Deploy v2 as-is |
+| `seeds = ""`, 27147 BLOCKED, 27146 OPEN | Config failure **plus** `render-config` cannot resolve node IDs | Deploy v2 **and** uncomment `THOR_TENDERMINT_P2P_PERSISTENT_PEERS` |
+| 27146 BLOCKED | NSG/firewall. No manifest change fixes this. | Get egress opened first |
+
+Once the pod is gone, the equivalent standalone check is:
 
 ```powershell
 kubectl run netcheck -n thorchain --rm -it --restart=Never --image=alpine:3.19 -- sh -c "
