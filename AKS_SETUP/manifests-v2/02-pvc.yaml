@@ -37,4 +37,12 @@ spec:
   storageClassName: thorchain-storage
   resources:
     requests:
-      storage: 600Gi
+      storage: 400Gi
+      # 400Gi, not 600Gi: still clears the ~240 GB restore peak with
+      # headroom, and Azure bills Premium_LRS by tier -- 400Gi lands in
+      # P20 (512 GiB) where 600Gi would land in P30 (1 TiB). Roughly
+      # half the disk cost.
+      #
+      # NOTE: storage has NO effect on the pod being Pending. The PVC
+      # is an Azure disk; only requests.cpu / requests.memory are
+      # scheduled against node capacity.

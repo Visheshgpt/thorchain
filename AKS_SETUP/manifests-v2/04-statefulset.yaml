@@ -78,6 +78,22 @@ spec:
         # policy re-chowns everything on every start (10+ minutes).
         fsGroupChangePolicy: OnRootMismatch
 
+      # SHARED-CLUSTER MODE. No nodeSelector -- this cluster is shared
+      # with other teams, the pool is at max autoscaler size, and a
+      # dedicated pool is not available. See the resources block below
+      # for what that costs us.
+      #
+      # If a dedicated pool ever becomes possible, that is strongly
+      # preferred. Create it and re-add the two stanzas:
+      #   az aks nodepool add -g <rg> --cluster-name <cluster> \
+      #     --name thornode --node-count 1 \
+      #     --node-vm-size Standard_D8s_v3 --node-osdisk-size 128 \
+      #     --labels workload=thornode \
+      #     --node-taints workload=thornode:NoSchedule
+      #   nodeSelector: { workload: thornode }
+      #   tolerations: [{key: workload, operator: Equal,
+      #                  value: thornode, effect: NoSchedule}]
+
       initContainers:
 
         # -- 1. /etc/passwd shim for UID 1025 -------------------
@@ -164,8 +180,12 @@ spec:
           env:
             # "mainnet-pruned" (~40 GB) or "mainnet-archive" (multi-TB).
             - { name: SNAP_TYPE, value: "mainnet-pruned" }
+          # MUST NOT exceed the main container's requests. A pod's
+          # effective request is max(init requests, sum of app
+          # containers) -- an init container asking 500m would set the
+          # whole pod's CPU request to 500m and it would stop fitting.
           resources:
-            requests: { cpu: "500m", memory: "512Mi" }
+            requests: { cpu: "250m", memory: "512Mi" }
             limits:   { memory: "2Gi" }
           volumeMounts:
             - { name: thornode-data, mountPath: /data }
@@ -222,9 +242,13 @@ spec:
             # Prometheus on :26660.
             - { name: THOR_TENDERMINT_INSTRUMENTATION_PROMETHEUS, value: "true" }
 
-            # Default is 10. More outbound dials gives catch-up more
-            # parallel block sources and survives peers churning out.
-            - { name: THOR_TENDERMINT_P2P_MAX_NUM_OUTBOUND_PEERS, value: "40" }
+            # Every peer costs memory (send/recv buffers per connection).
+            # On a 3Gi cap we trade catch-up parallelism for headroom:
+            # 8 outbound is enough to blocksync from, 4 inbound keeps
+            # strangers from eating the budget. Raise both to 40/40 if
+            # this ever lands on a dedicated node.
+            - { name: THOR_TENDERMINT_P2P_MAX_NUM_OUTBOUND_PEERS, value: "8" }
+            - { name: THOR_TENDERMINT_P2P_MAX_NUM_INBOUND_PEERS,  value: "4" }
 
             # ---- EXTERNAL_IP: intentionally absent -------------
             # Setting EXTERNAL_IP makes render-config advertise
@@ -292,16 +316,40 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
 
+          # SHARED-CLUSTER RESOURCE PROFILE.
+          #
+          # Upstream's chart requests 4 CPU / 4Gi. We cannot: measured
+          # free capacity across the five nodes is
+          #   node1 266m/2166Mi  node2 365m/1221Mi  node3 342m/1046Mi
+          #   node4 555m/1932Mi  node5 361m/1564Mi
+          # so a 4-CPU request cannot schedule anywhere, and even the
+          # whole node is under 2 CPU.
+          #
+          # Requests below are sized to fit on ALL FIVE nodes, so the
+          # pod can still be rescheduled if one drains. They are
+          # scheduling reservations, not a cap.
+          #
+          # The real work happens through the limits: no CPU limit at
+          # all, so thornode bursts into whatever the node has idle
+          # (those 71-86% figures are *requests*, not usage -- actual
+          # idle CPU is usually much higher). Memory is capped at 3Gi,
+          # which v1 demonstrably survived for 61 minutes with zero
+          # OOMKills.
+          #
+          # Honest expectation: this may sync slowly, or OOM once block
+          # execution gets heavy. Watch for OOMKilled restarts and a
+          # height that climbs. If it OOMs, there is no manifest fix --
+          # it needs a bigger node.
           resources:
             requests:
-              cpu: "4"          # upstream chart requests exactly this
-              memory: "8Gi"
+              cpu: "250m"
+              memory: "1Gi"
             limits:
-              memory: "16Gi"
+              memory: "3Gi"
               # NO cpu limit, on purpose. CFS throttling on a CometBFT
               # node delays block execution past consensus timeouts and
               # is a classic cause of a node that "runs but falls
-              # behind". Requests already guarantee the 4 cores.
+              # behind". Without a limit it uses whatever is spare.
 
           # Probes hit CometBFT's own /health. v1 probed the TCP p2p
           # port, which stays open on a node that is completely stuck
