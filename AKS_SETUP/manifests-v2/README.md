@@ -174,10 +174,27 @@ curl -s -o /dev/null -w "  liquify-443 = %{http_code}\n" --max-time 15 https://g
 '
 ```
 
+**Measured result on this cluster:**
+
+```
+https://gateway.liquify.com:443     -> 200
+http://70.34.247.166:27147/status   -> 503
+raw TCP 70.34.247.166:27146         -> open
+```
+
+**The 503 is not an egress proxy.** Probing all 95 active validators from outside the
+VNet returns `200` on 93 and `503` on 2 — `70.34.247.166` is one of the two whose own
+RPC reverse-proxy is unhealthy. Do not conclude anything about your firewall from a
+single IP; always probe several.
+
+Conclusion: **egress is fine, and `n_peers = 0` is purely v1's config** (defects #4,
+#5, #6). v2 fixes it by letting `render-config` do its job, and additionally ships a
+verified `persistent_peers` list so peering does not depend on seed discovery at all.
+
 | Result | Meaning | Action |
 |---|---|---|
-| `seeds = ""` and both ports OPEN | Pure config failure — v1 blanked seeds, nothing to dial | Deploy v2 as-is |
-| `seeds = ""`, 27147 BLOCKED, 27146 OPEN | Config failure **plus** `render-config` cannot resolve node IDs | Deploy v2 **and** uncomment `THOR_TENDERMINT_P2P_PERSISTENT_PEERS` |
+| 443 = 200, 27146 open, most 27147 = 200 | **← this cluster.** Config failure only | Deploy v2 as-is |
+| 27147 blocked/timing out on *every* IP | `render-config` cannot resolve node IDs | Deploy v2 — the shipped `persistent_peers` already covers it |
 | 27146 BLOCKED | NSG/firewall. No manifest change fixes this. | Get egress opened first |
 
 Once the pod is gone, the equivalent standalone check is:

@@ -237,22 +237,46 @@ spec:
             # A full node needs only OUTBOUND connectivity. Leave this
             # unset unless the pod has a real public IP.
 
-            # ---- peer fallback: see README section 4 -----------
-            # render-config discovers seeds by calling
-            #   http://<validator-ip>:27147/status
-            # for each active validator. If your AKS egress firewall
-            # only permits 443, that discovery returns nothing and
-            # config.toml ends up with seeds = "" -- a node with no
-            # peers, which looks exactly like the bug you had.
+            # ---- peer bootstrap: ENABLED, see README section 4 ----
+            # Belt and braces. render-config's own seed discovery
+            # should work here, but this removes any dependence on it.
             #
-            # In that case uncomment this: persistent_peers already
-            # carries the node IDs, so no :27147 probe is needed.
-            # (NOTE: THOR_TENDERMINT_P2P_SEEDS would NOT work --
-            # InitThornode overwrites .P2P.Seeds unconditionally
-            # after config load. PersistentPeers is not overwritten.)
+            # Measured from this cluster's pods:
+            #   raw TCP to <validator-ip>:27146   -> open
+            #   https://gateway.liquify.com:443   -> 200
+            #   http://70.34.247.166:27147/status -> 503
             #
-            # - name: THOR_TENDERMINT_P2P_PERSISTENT_PEERS
-            #   value: "542476b9e0c42326616854d7be0b445dd68a9f2f@70.34.247.166:27146,f18693601ed7ef210cef3f3d9d0ea32445abc4ca@167.235.109.114:27146,64bf8cce2bfccfd00ea313906e13b0c56f9d3ce0@167.235.195.244:27146,0557f43679990f8139502508a8b635c108af9521@173.234.136.17:27146,b466028dc9f8adaf5b91acd17754575d5797c15a@80.91.65.181:27146,3d221ed238859628fc3710ba34ace804ceebf9d8@195.3.223.168:27146,a860e06d1e8b46d9aa30551f69992c91a3f7cc90@45.63.27.5:27146,d1fd0a64df3aa93e363f3a152e44aef8ba025ed1@139.84.141.122:27146,90cf7ef98504ae451b9ae7ac223f68cf8191b826@209.38.8.20:27146,b9d772ed35b15e7cdbfdaff5bafae7655f0ea47b@139.84.196.2:27146,5bf7165cc7a057939e41185fed3f9f070aaf2e13@159.65.195.202:27146,aa9f43f896fd83e8afd14f0b9ae14e0b0c6d0df5@134.209.83.182:27146"
+            # That 503 is NOT an egress proxy. Probing all 95 active
+            # validators from outside the VNet returns 200 on 93 and
+            # 503 on 2 -- 70.34.247.166 is simply one of the two whose
+            # own RPC reverse-proxy is unhealthy. Egress is fine.
+            #
+            # Seeds are still worth not depending on: render-config
+            # learns each seed's node ID by GETting :27147/status, so
+            # a validator that 503s or times out silently drops out of
+            # the seed list. persistent_peers carries the node IDs
+            # inline, needs no :27147 probe at all, and coexists with
+            # discovered seeds.
+            #
+            # All 20 entries were verified against the live network at
+            # the time of writing (node ID matched /status).
+            #
+            # NOTE: THOR_TENDERMINT_P2P_SEEDS would NOT work here --
+            # InitThornode() overwrites .P2P.Seeds unconditionally
+            # after config load. PersistentPeers is left alone.
+            #
+            # Refresh the list if these validators churn out of the
+            # active set (see README section 8).
+            - name: THOR_TENDERMINT_P2P_PERSISTENT_PEERS
+              value: "89865c89d72d6875a8c3b9fd7d0f5de1926e6b2b@68.183.244.113:27146,f18693601ed7ef210cef3f3d9d0ea32445abc4ca@167.235.109.114:27146,64bf8cce2bfccfd00ea313906e13b0c56f9d3ce0@167.235.195.244:27146,0557f43679990f8139502508a8b635c108af9521@173.234.136.17:27146,b466028dc9f8adaf5b91acd17754575d5797c15a@80.91.65.181:27146,3d221ed238859628fc3710ba34ace804ceebf9d8@195.3.223.168:27146,a860e06d1e8b46d9aa30551f69992c91a3f7cc90@45.63.27.5:27146,d1fd0a64df3aa93e363f3a152e44aef8ba025ed1@139.84.141.122:27146,b9d772ed35b15e7cdbfdaff5bafae7655f0ea47b@139.84.196.2:27146,5bf7165cc7a057939e41185fed3f9f070aaf2e13@159.65.195.202:27146,aa9f43f896fd83e8afd14f0b9ae14e0b0c6d0df5@134.209.83.182:27146,110b6fa5a679ef7ab42b4de83a0c738386ded6ac@128.199.7.130:27146,2a5dff3717ec3d747237ffe174e3023f1d2f79b5@164.132.247.225:27146,bbc0b2e34ffbdb3f5ae250072342955766ae3cf0@95.214.55.157:27146,9aa118b30449cc7b77c1a7622d8ea42dc5e92e62@173.234.17.198:27146,3c929fb34a0d28a131d8cb037aa371aa939c4e0d@80.91.65.183:27146,75a5caebbd084e7c416fb4904232158ff90df6dc@144.6.50.251:27146,68580f6ef24fb0d6d620632d61cebc5b8b89c45e@57.129.73.114:27146,8bbcdb36798c57fec6804303693280dd3f18f3d4@46.225.37.189:27146,63ec978880fb2b53ca2a533c866b1fb8ee92a858@167.99.28.69:27146"
+
+            # render-config probes ~95 validator IPs on :27147 at boot.
+            # A couple of them 503 or time out; those are log.Error()
+            # only, not fatal, so expect some noise in the first
+            # minutes of the log. Only getSeedAddrs()' HTTPS call to
+            # gateway.liquify.com is log.Fatal() on failure -- if that
+            # 443 egress ever breaks, the container crashloops rather
+            # than starting peerless.
 
           ports:
             - { name: p2p,     containerPort: 27146, protocol: TCP }
