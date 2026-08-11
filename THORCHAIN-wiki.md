@@ -22,6 +22,7 @@
 8. [pvc-watcher Configuration](#8-pvc-watcher-configuration)
 9. [Upgrade Procedure](#9-upgrade-procedure)
 10. [Monitoring & Ops Commands](#10-monitoring--ops-commands)
+11. [Archive Node — Full History](#11-archive-node--full-history) ← **different build, read before deploying**
 
 
 ---
@@ -182,6 +183,28 @@ deployment runs far below that and what it costs.
 
 
 ## 4. Step-by-Step Deployment
+
+
+### Step 0 — Decide PRUNED or ARCHIVE before you apply anything
+
+
+This changes the disk tier, the node pool and the image tag. Getting it wrong means
+re-downloading terabytes, so decide first.
+
+
+| | **PRUNED** (sections 1-10) | **ARCHIVE** (section 11) |
+|---|---|---|
+| Answers "balance at height N"? | only recent heights | **any height ≥ 17,562,001** |
+| Snapshot | `mainnet-pruned`, 39.6 GB | `mainnet-archive`, 2,519 GB |
+| Disk | 400Gi (P20) | **16Ti (P70)** |
+| Image at deploy | `mainnet-3.19.3` | **`mainnet-3.16.4`** |
+| CPU / memory | 250m / 1Gi (constrained) | 4 CPU / 8-16Gi |
+| Time to usable | ~45 min | ~5 h download + multi-day replay |
+| Image swaps during catch-up | none | **3, at fixed heights** |
+
+
+**Everything in sections 1-10 describes the PRUNED build.** If you need archive, read
+section 11 first — the two differ from the very first `kubectl apply`.
 
 
 ### Step 1 — Copy manifests to jumpbox
@@ -807,6 +830,267 @@ kubectl describe node <node-name> | Select-String -Pattern "Allocated resources"
 kubectl rollout restart statefulset thornode -n thorchain
 kubectl rollout status statefulset thornode -n thorchain
 ```
+
+
+---
+
+
+## 11. Archive Node — Full History
+
+
+> **This is a different build, not a toggle.** Do not follow sections 1-10 and then
+> "switch on archive". The disk tier, node pool and image tag all differ from the first
+> apply. Deploy it in its own namespace, on its own node pool, with its own PVC.
+
+
+### 11.1 When you need it
+
+
+Only when you must answer **"what was this wallet's balance at block N"** — crypto
+auditing, reconciliation, historical reporting. Nothing else justifies the cost.
+
+
+The query is a standard Cosmos header, not a special API:
+
+
+```bash
+curl -H "x-cosmos-block-height: 27300000" \
+  http://<node>:1317/cosmos/bank/v1beta1/balances/thor1dheycdevq39qlkxs2a6wuuzyn4aqxhve4qxtxt
+```
+
+
+On a **pruned** node that returns:
+
+
+```json
+{"code":2, "message":"failed to load state at height 26000000; no commit info found (latest height: 27374319): not found"}
+```
+
+
+That error is the whole reason this section exists. An archive node
+(`pruning = "nothing"`) keeps every height's commit info, so the same query succeeds.
+
+
+> Balances come back in base units (1e8) with THORChain denoms — `rune`, `btc/btc`,
+> `avax/usdc-0xb97ef9...`. Native RUNE and synths are **separate denoms**. Agree the
+> denom handling with the audit team before building tooling on the output.
+
+
+### 11.2 What one archive node can and cannot cover
+
+
+THORChain has restarted twice via state-export hard forks. **Each era is a separate
+network with its own chain-id — no single node can serve all history.**
+
+
+| Era | `chain_id` | Blocks | Status |
+|---|---|---|---|
+| v0 | not publicly exposed | 1 → 4,786,560 | dead |
+| v1 | `thorchain-mainnet-v1` | 4,786,560 → 17,562,001 | dead |
+| current | `thorchain-1` | 17,562,001 → live | ✅ live |
+
+
+An archive node built here covers **`thorchain-1` only — heights ≥ 17,562,001
+(from 2024-09-04)**. Audits reaching further back need separate read-only nodes:
+
+
+| Range | Snapshot | Image | Note |
+|---|---|---|---|
+| 4,786,560 → 17,562,001 | `mainnet-archive-v1` (4,421 GB) | `mainnet-1.134.1` | dead chain, never advances |
+| 1 → 4,786,560 | `mainnet-archive-v0` (700 GB) | 0.x era | dead chain, never advances |
+
+
+A 3.x binary **cannot** read a `thorchain-mainnet-v1` database.
+
+
+### 11.3 Do NOT sync from genesis
+
+
+The archive snapshot **is** the history — replaying is a slow way to rebuild what the
+download already contains. Two hard facts:
+
+
+- Only **1 of 92** responding active validators still serves blocks from 17,562,001
+  (`173.234.17.198`). The next-deepest starts at 20,140,001. Genesis sync therefore
+  depends on one node staying reachable for 9.8M blocks.
+- It needs **14** height-gated image switches starting at `mainnet-3.6.1`
+  (`node-launcher/thornode-stack/mainnet.yaml`).
+
+
+Verify the retention claim yourself any time:
+
+
+```powershell
+curl.exe -s http://173.234.17.198:27147/status | ConvertFrom-Json | ForEach-Object result | ForEach-Object sync_info | Select-Object earliest_block_height
+```
+
+
+### 11.4 Coverage and sizing
+
+
+| | Value |
+|---|---|
+| Snapshot height | 25,390,400 |
+| History in the snapshot | **7,828,399 blocks** (17,562,001 → 25,390,400) |
+| Replay to reach tip | ~1.98M blocks |
+| Total coverage once caught up | **9,812,365 blocks** — all of `thorchain-1` |
+| Tarball | 2,519 GB |
+| Extracted (est. 2.08× — measured on the pruned snapshot) | ~5,240 GB |
+| **Peak during extraction** | **~7,759 GB** — tarball and extract coexist |
+| Steady state after catch-up | ~6,500 GB |
+| Growth | ~290 GB/month |
+
+
+**PVC must be 16Ti (P70).** An 8 TiB P60 is 8,796 GB — the extraction peak hits 88% of
+it, and overflowing wastes a 5-hour download. Azure has no tier between P60 and P70.
+
+
+### 11.5 YAML changes
+
+
+Five lines. Copy `manifests-v2/` to a separate folder and edit there — do not modify the
+pruned manifests in place.
+
+
+```yaml
+# 02-pvc.yaml
+  storage: 400Gi                                   →  storage: 16Ti
+
+# 04-statefulset.yaml — init-snapshot env
+  - { name: SNAP_TYPE, value: "mainnet-pruned" }   →  value: "mainnet-archive"
+
+# 04-statefulset.yaml — BOTH init-keys and thornode containers
+  image: ...thornode:mainnet-3.19.3                →  ...thornode:mainnet-3.16.4
+
+# 04-statefulset.yaml — thornode env
+  - { name: THOR_COSMOS_PRUNING, value: "default" } →  value: "nothing"
+```
+
+
+`mainnet-3.16.4`, **not** `3.19.3` — the snapshot sits at 25,390,400, and 3.16.4 owned
+heights 25,215,740 → 25,959,000. Deploying 3.19.3 here produces the app-hash halt from
+Issue 1.
+
+
+Also raise the resources (the constrained profile in section 5, Issue 5 exists only
+because the shared cluster had nothing spare — archive needs the real thing):
+
+
+```yaml
+  resources:
+    requests: { cpu: "4", memory: "8Gi" }
+    limits:   { memory: "16Gi" }        # no CPU limit
+  startupProbe:
+    failureThreshold: 960               # opening a multi-TB LevelDB store far exceeds 60 min
+```
+
+
+### 11.6 One required script change
+
+
+`chmod -R a+rwX` took 3-5 minutes on 82 GB. Archive is ~63× that data, so the same pass
+runs for **hours**. Set the modes during extraction instead.
+
+
+In `03-configmap-scripts.yaml`, `init-snapshot.sh`, replace the extract line:
+
+
+```sh
+# before
+gzip -dc "$TARBALL" | tar -xf - -C "$HOME_DIR"
+
+# after — files land 0666 / dirs 0777 directly
+umask 000
+gzip -dc "$TARBALL" | tar --no-same-owner --no-same-permissions -xf - -C "$HOME_DIR"
+```
+
+
+Then delete the `chmod -R a+rwX "$HOME_DIR"` line further down.
+
+
+### 11.7 Image switches during replay
+
+
+The node restores at 25,390,400 and must change binary at three exact heights. **Miss one
+and it halts on app-hash divergence.**
+
+
+| At height | Switch to |
+|---|---|
+| 25,959,000 | `mainnet-3.17.0` |
+| 26,143,000 | `mainnet-3.18.2` |
+| 26,518,000 | `mainnet-3.19.3` |
+
+
+Watch the height, then swap **both** containers:
+
+
+```powershell
+kubectl logs -n thorchain-archive thornode-0 -c thornode --tail=300 | Select-String "committed state" | Select-Object -Last 1
+
+kubectl set image sts/thornode -n thorchain-archive `
+  thornode=registry.gitlab.com/thorchain/thornode:mainnet-3.17.0 `
+  init-keys=registry.gitlab.com/thorchain/thornode:mainnet-3.17.0
+kubectl rollout status sts/thornode -n thorchain-archive
+```
+
+
+After 26,518,000 it stays on `3.19.3` and follows the normal upgrade procedure
+(section 9).
+
+
+### 11.8 Verify BEFORE trusting any audit output
+
+
+The moment the node starts, spot-check an early height. If this fails, the snapshot is
+not full-history and the entire plan changes:
+
+
+```powershell
+kubectl exec -n thorchain-archive thornode-0 -c thornode -- `
+  curl -s --max-time 30 -H "x-cosmos-block-height: 17600000" `
+  http://localhost:1317/cosmos/bank/v1beta1/balances/thor1dheycdevq39qlkxs2a6wuuzyn4aqxhve4qxtxt
+```
+
+
+- Balance list returned → archive history is intact, proceed.
+- `no commit info found` → **stop**. It is not a full archive. Do not run audits against it.
+
+
+Confirm pruning actually took effect:
+
+
+```powershell
+kubectl exec -n thorchain-archive thornode-0 -c thornode -- sh -c "grep -E '^(pruning|min-retain-blocks)' /data/.thornode/config/app.toml"
+# expect: pruning = "nothing"
+```
+
+
+### 11.9 Expected timeline
+
+
+| Phase | Duration |
+|---|---|
+| Snapshot download (2.5 TB @ ~147 MiB/s measured) | ~5 hours |
+| Extract (~5.2 TB) | 2-4 hours |
+| Replay 1.98M blocks + 3 image swaps | days — depends entirely on CPU and disk IOPS |
+
+
+Archive replay writes every IAVL version rather than discarding old ones, so it is
+materially heavier than the pruned sync. Do not size it from pruned experience.
+
+
+### 11.10 Prerequisites checklist
+
+
+Confirm all five **before** starting — three of them cannot be fixed once you have begun:
+
+
+- [ ] 16Ti Premium_LRS quota available in the subscription
+- [ ] Node pool with ≥4 dedicated vCPU and ≥16 GiB (a shared, fully-committed pool will not converge)
+- [ ] Free IPs in the AKS subnet (the `/27` here is exhausted — see Issue 9)
+- [ ] Audit height range confirmed: does it reach before 2024-09-04? If yes you need `mainnet-archive-v1` too
+- [ ] Owner assigned for the three image switches — they are manual and time-sensitive
 
 
 ---
