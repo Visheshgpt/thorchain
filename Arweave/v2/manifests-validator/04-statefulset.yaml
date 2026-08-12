@@ -1,5 +1,5 @@
 # =============================================================================
-# Arweave VALIDATOR on AKS -- parity with Arweave/v1/docker-setupmd.
+# Arweave VALIDATOR on AKS -- parity with Arweave/v1/docker-setup.md.
 #
 # This reproduces their `docker run` as a StatefulSet:
 #

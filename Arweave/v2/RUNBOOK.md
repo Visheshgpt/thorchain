@@ -14,13 +14,15 @@ Same image, same namespace, same binary. They differ **only in configuration**.
 
 | | `manifests-validator/` | `manifests-archive/` |
 |---|---|---|
-| Matches | **`Arweave/v1/docker-setupmd` exactly** | What you originally asked for |
+| Matches | **`Arweave/v1/docker-setup.md` exactly** | What you originally asked for |
 | `storage_modules` | none | `0,unpacked`, `1,unpacked` |
 | Weave data stored | **none** | 2 partitions (~4 TB actual) |
 | Disks | 1 × 500Gi | 1 × 1Ti + 2 × 4Ti |
-| Requests | 1 CPU / 8Gi | 2 CPU / 8Gi |
+| Requests | **500m / 2Gi** (sized to node4) | 2 CPU / 8Gi (needs a new pool) |
+| Memory limit | 4Gi | 24Gi |
 | Time to useful | 5–15 min | days–weeks per partition |
 | Est. disk cost | ~$70/mo | ~$800/mo, ×55 for a full archive |
+| Fits current cluster | yes, **on node4 only** | no |
 
 **Start with `manifests-validator/`.** It's a straight port of the node your team already proved out, so if it misbehaves the problem is the AKS wrapper, not Arweave. Switching to the archive profile later is `kubectl apply -f ../manifests-archive/` over the top — the data PVC only grows (500Gi → 1Ti, expandable in place).
 
@@ -44,7 +46,7 @@ There is also **no snapshot service** — official or community. Your Thorchain 
 
 ## 1b. Reconciliation with the team's existing Docker node
 
-`Arweave/v1/docker-setupmd` documents a node a team member already has running on bare metal. It is a genuinely useful artifact and it **corroborates the findings above** — they built their own image from the release tarball on `ubuntu:22.04` (because there was nothing to pull), the tarball extracted flat, `ENTRYPOINT` is `bin/arweave` + `foreground`, ERTS is 14.2.5.11, and their "Issue 3" is a live demonstration that an unknown config key is fatal (`Failed to parse config: unknown: {<<"mining">>,false}`).
+`Arweave/v1/docker-setup.md` documents a node a team member already has running on bare metal. It is a genuinely useful artifact and it **corroborates the findings above** — they built their own image from the release tarball on `ubuntu:22.04` (because there was nothing to pull), the tarball extracted flat, `ENTRYPOINT` is `bin/arweave` + `foreground`, ERTS is 14.2.5.11, and their "Issue 3" is a live demonstration that an unknown config key is fatal (`Failed to parse config: unknown: {<<"mining">>,false}`).
 
 **But that node is not an archive node, despite the title.** Its `config.json` has **no `storage_modules` key** — in the whole document `storage_modules` appears only as an API endpoint to *query*. With no storage modules configured, Arweave downloads no weave data at all. Their own sample output shows it:
 
@@ -61,7 +63,7 @@ So: **their setup works and is worth trusting on operational detail — it just 
 | Their finding | Change made |
 |---|---|
 | `--shm-size=4g` | K8s defaults `/dev/shm` to 64 MB. Added a `medium: Memory` emptyDir (`dshm`) |
-| `--memory=24g` | Raised the memory **limit** 16Gi → 24Gi (limits don't affect scheduling, so it's free) |
+| `--memory=24g` | Archive profile: limit raised 16Gi → 24Gi. Validator profile: **cut to 4Gi** — 24Gi on a 5810Mi node is fiction and would evict other teams (section 4.1) |
 | `--dns 8.8.8.8 --dns 1.1.1.1` (Issue 2) | Added a commented `dnsConfig` block + §9 troubleshooting row |
 | Prometheus/ets crashes (Issues 4, 11) | §9 note + 2.9.4.1 downgrade path |
 | Hugepages for RandomX (Issue 1) | Documented why `enable randomx_large_pages` must **not** be copied on AKS |
