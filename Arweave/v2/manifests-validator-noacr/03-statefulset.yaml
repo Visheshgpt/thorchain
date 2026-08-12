@@ -211,22 +211,58 @@ spec:
               fi
 
               # -- container tuning -------------------------------
-              # Upstream ships +sbwt very_long, which makes the Erlang
-              # schedulers busy-wait: ~100% CPU at idle inside a
-              # cgroup and CFS throttling during real work. Upstream's
-              # own vm.args.src carries the fix, commented out:
-              #   "## Uncomment the following line if running in a
-              #    ## container.  +sbwt none"
-              # Idempotent — the grep guards re-runs.
+              # Upstream's vm.args is tuned for a MINER on bare metal.
+              # Two families of setting are actively harmful here.
+              #
+              # 1. BUSY-WAIT. +sbwt very_long makes the Erlang
+              #    schedulers spin while waiting for work: ~100% CPU
+              #    at idle inside a cgroup, CFS throttling during real
+              #    work. Upstream's own vm.args.src carries the fix,
+              #    commented out: "## Uncomment the following line if
+              #    running in a container.  ## +sbwt none"
+              #
+              # 2. MEMORY. This is what OOMKills the pod at 4Gi:
+              #      +A1024 +SDio1024  -> ~2048 OS threads, each with
+              #                           its own stack, on a 2-core pod
+              #      +MBlmbcs 410629   -> ~401 MiB largest binary carrier
+              #      +MBsbct  103424   -> ~101 MiB singleblock threshold
+              #    Those sizes exist to hold 100 MiB recall-range
+              #    binaries while mining. A validator with NO
+              #    storage_modules never allocates one, so they are
+              #    pure overhead against the memory limit.
+              #
+              #    Values below are sized for this pod, not invented:
+              #    16 async / 16 dirty-IO threads comfortably serve
+              #    sync_jobs 20, and 5 MiB / 512 KiB carriers are the
+              #    ERTS defaults the miner tuning overrode.
+              #
+              # IF YOU MOVE TO A DEDICATED NODE with >= 8Gi, delete
+              # this whole block and let upstream's values stand --
+              # they are faster when the memory is actually there.
+              #
+              # Idempotent via a marker line, NOT by matching the old
+              # values -- an existing PVC may already have +sbwt
+              # patched from a previous run, and guarding on that
+              # would skip the memory fixes entirely.
               VMARGS="${DEST}/releases/${VERSION}/vm.args.src"
-              if grep -q '^+sbwt very_long' "${VMARGS}"; then
+              if ! grep -q '^## k8s-container-tuned' "${VMARGS}"; then
                 sed -i \
                   -e 's/^+sbwt very_long/+sbwt none/' \
                   -e 's/^+sbwtdcpu very_long/+sbwtdcpu none/' \
                   -e 's/^+sbwtdio very_long/+sbwtdio none/' \
+                  -e 's/^+A1024/+A16/' \
+                  -e 's/^+SDio1024/+SDio16/' \
+                  -e 's/^+MBsbct 103424/+MBsbct 512/' \
+                  -e 's/^+MBsmbcs 10240/+MBsmbcs 1024/' \
+                  -e 's/^+MBlmbcs 410629/+MBlmbcs 5120/' \
                   "${VMARGS}"
-                echo "[init] patched vm.args.src -> +sbwt none"
+                echo '## k8s-container-tuned' >> "${VMARGS}"
+                echo "[init] patched vm.args.src for container limits"
+              else
+                echo "[init] vm.args.src already tuned"
               fi
+              echo "[init] effective emulator flags:"
+              grep -E '^\+' "${VMARGS}" | sed 's/^/         /'
 
               # -- stable path for the main container -------------
               # The StatefulSet execs /opt/arweave/current/bin/arweave,
@@ -237,7 +273,11 @@ spec:
 
               echo "[init] ready:"
               ls -la "${ROOT}/"
-              "${ROOT}/current/bin/arweave" version || true
+              # Version check WITHOUT invoking bin/arweave: its shebang is
+              # "#!/usr/bin/env bash" and alpine has no bash, so calling it
+              # here prints "env: can't execute 'bash'". start_erl.data holds
+              # "<erts-vsn> <release-vsn>" and needs no interpreter.
+              echo "[init] release: $(cat "${ROOT}/current/releases/start_erl.data")"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
