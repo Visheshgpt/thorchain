@@ -1,0 +1,267 @@
+# =============================================================================
+# Arweave node config.
+#
+# READ THIS BEFORE EDITING -- the failure mode is unusually harsh:
+#
+#   An UNKNOWN JSON KEY IS FATAL. ar_config.erl ends its option parser with
+#       parse_options([Opt | _], _) -> {error, unknown, Opt}.
+#   so one typo means the node refuses to start, and you get a
+#   CrashLoopBackOff with a terse `{error, unknown, <<"...">>}` in the log.
+#   Treat this schema as CLOSED. Every key below was verified against
+#   ar_config.erl at tag N.2.9.5.1. Do not add keys from blog posts.
+#
+#   The CLI form and the JSON form of the same option often differ:
+#       CLI  peer               ->  JSON  "peers"                  (array)
+#       CLI  storage_module     ->  JSON  "storage_modules"        (array)
+#       CLI  vdf_server_trusted_peer -> JSON "vdf_server_trusted_peers"
+#   Do not copy CLI examples from the docs straight into this file.
+#
+# WHY A CONFIGMAP AND NOT AN INIT CONTAINER:
+#   The v1 manifests wrote this file with a busybox init container onto a
+#   dedicated 32 Gi PVC, guarded by a `.arweave-initialized` sentinel. That
+#   is a 32 Gi Azure Disk and an extra container to hold ~600 bytes of JSON,
+#   and the sentinel means edits to the manifest silently DON'T take effect
+#   on restart -- the worst property a config file can have. A ConfigMap
+#   mounted read-only is declarative, diffable, and free.
+#
+#   Trade-off, be aware of it: editing a ConfigMap does NOT restart the pod,
+#   and Arweave reads config only at boot. After any change here you must
+#   `kubectl rollout restart statefulset/arweave -n arweave`.
+#   RUNBOOK section 8.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arweave-config
+  namespace: arweave
+  labels:
+    app: arweave
+    app.kubernetes.io/part-of: arweave-node
+data:
+  config.json: |
+    {
+      "data_dir": "/data",
+      "log_dir": "/var/log/arweave",
+      "port": 1984,
+
+      "peers": [
+        "peers.arweave.xyz",
+        "india.peers.arweave.xyz",
+        "asia.peers.arweave.xyz",
+        "europe.peers.arweave.xyz"
+      ],
+
+      "vdf_server_trusted_peers": [
+        "vdf-server-3.arweave.xyz",
+        "vdf-server-4.arweave.xyz"
+      ],
+
+      "transaction_blacklist_urls": [
+        "https://public_shepherd.arweave.net"
+      ],
+
+      "sync_jobs": 100,
+      "header_sync_jobs": 10,
+
+      "max_disk_pool_buffer_mb": 8000,
+      "max_disk_pool_data_root_buffer_mb": 500,
+
+      "storage_modules": [
+        "0,unpacked",
+        "1,unpacked"
+      ]
+    }
+
+# =============================================================================
+# KEY-BY-KEY RATIONALE
+# =============================================================================
+#
+# data_dir "/data"
+#   MANDATORY IN PRACTICE. The built-in default is "." -- the node would
+#   write RocksDB into /opt/arweave (the read-only install dir). Always set.
+#
+# log_dir "/var/log/arweave"
+#   The default is the RELATIVE path "logs", resolved against the release
+#   directory after bin/arweave does `cd $ROOTDIR`. With a read-only root
+#   filesystem that fails at startup. Absolute path -> emptyDir.
+#
+# port 1984
+#   Arweave uses ONE TCP port for everything: HTTP REST API, peer gossip,
+#   chunk sync, VDF push/pull, and Prometheus /metrics. There is no separate
+#   P2P port and no UDP. Do not change without changing 05-service.yaml.
+#
+# peers  (CLI equivalent: repeated `peer`)
+#   The trusted peers used to join the network. Docs:
+#     "Your node queries its trusted peers for the recent blockchain data.
+#      It's important to only specify nodes you trust, but since your node
+#      will validate the data it receives from these peers the potential
+#      for abuse is minimal."
+#   These are DNS pools operated by the Digital History Association -- the
+#   hostname resolves to several A records and Arweave expands EVERY record
+#   into a separate peer, so `peers.arweave.xyz` alone yields ~9 peers.
+#   All five hostnames above were confirmed live (2026-08-12).
+#   Live status: https://status.arweave.xyz/
+#
+#   india.* is listed first after the global pool purely for RTT. Reorder to
+#   suit the region your AKS cluster is in.
+#
+#   DO NOT put an ar.io gateway (arweave.net) here. It is a different
+#   product -- an indexing gateway, not an Arweave protocol peer. It appears
+#   in the docs only as an HTTP API example, never as a `peer` value.
+#
+# vdf_server_trusted_peers
+#   OPTIONAL for a non-mining node, included deliberately. With this unset,
+#   the node runs a VDF benchmark at startup (boot latency) and then burns a
+#   core computing its own VDF chain forever. Pointing at the team's public
+#   VDF servers skips both. It still validates VDF in blocks either way.
+#   Two are listed because the docs say "we recommend you specify at least
+#   two trusted peers to aim for shorter mining downtime."
+#
+#   NOTE: the VDF docs page tells you to also add `enable vdf_server_pull`.
+#   That is a DOC BUG for this version -- in 2.9.5.1 pulling is on by
+#   default and `vdf_server_pull` is only meaningful in the `disable` list.
+#   Putting it in `enable` is a silent no-op. Omitted on purpose.
+#
+# transaction_blacklist_urls
+#   The public Shepherd NSFW/illegal-content filter. Every official sample
+#   config includes it. Content matched here is NOT stored or served.
+#   The underscore in the hostname is correct -- it is reproduced verbatim
+#   from all six official sample configs.
+#
+#   >>> If you remove this key you are choosing to archive UNFILTERED
+#   >>> content. That is a legal/compliance decision, not a technical one.
+#   >>> Removing it also lets you drop ca-certificates from the image.
+#
+# sync_jobs 100
+#   Concurrent chunk-download jobs. 100 is the real default (ar_config.hrl).
+#   Docs: "Setting sync_jobs to 200 or even 400 is unlikely to cause any
+#   issues", but also warns that too high gets you rate-limited by peers and
+#   grows RAM through backed-up jobs until OOM. Left at the default because
+#   this pod is memory-constrained; raise it once it has a dedicated node.
+#   (v1 set 20, which throttles sync for no benefit.)
+#
+# header_sync_jobs 10
+#   *** DELIBERATE DEVIATION -- the default is 1. ***
+#   This is the knob that actually makes this an "archive" node in the sense
+#   you want: it backfills historical BLOCK HEADERS, newest -> oldest. At
+#   the default of 1 a node stores only a small fraction of headers (most
+#   live peers sit at 30-45%, many at under 3%). 10 backfills meaningfully
+#   faster without hammering peers. Not a documented recommendation --
+#   raise or lower it based on what /info reports for `blocks` vs `height`.
+#
+# max_disk_pool_buffer_mb 8000 / max_disk_pool_data_root_buffer_mb 500
+#   *** DELIBERATE DEVIATION -- the real defaults are 100000 and 10000. ***
+#   (The --help text claiming 2000 / 50 is stale; the record values in
+#   ar_config.hrl are 100000 / 10000.) The disk pool is where freshly
+#   posted, not-yet-confirmed chunks buffer INSIDE data_dir. Left at
+#   default, it can claim 100 GB of the data_dir PVC. This node does not
+#   accept public uploads, so capping it at 8 GB protects the disk.
+#
+# storage_modules -- THE MOST IMPORTANT KEY IN THIS FILE. See below.
+#
+# -----------------------------------------------------------------------------
+# KEYS DELIBERATELY *NOT* SET -- each one is a trap someone will walk into
+# -----------------------------------------------------------------------------
+#
+# "enable": ["randomx_large_pages"]
+#   EVERY official sample config contains this. Do NOT copy it here.
+#   It requires hugepages on the host (vm.nr_hugepages=3500). The team's
+#   bare-metal node sets that with sysctl; on AKS you cannot, short of a
+#   privileged DaemonSet retuning every node in the pool. Without the flag
+#   RandomX falls back to normal pages and works fine -- slower, but correct.
+#   If you see "randomx_alloc_cache failed" in the log, the fix on AKS is to
+#   RAISE THE MEMORY LIMIT, not to chase hugepages. (Their own runbook lists
+#   both causes for that error and the memory one is the one that applies
+#   here.)
+#
+#   Unrecognised atoms in `enable` are silently ignored, so a typo here fails
+#   quietly rather than loudly -- unlike every other key in this file.
+#
+# "start_from_latest_state": true
+#   The team's runbook recommends this as the fix for its "Issue 4: Node Crash
+#   During Sync". Do NOT put it in this ConfigMap. On an EMPTY data_dir the
+#   node exits 1 with "The local state is empty, consider joining the network
+#   via the trusted peers" -- i.e. a permanent CrashLoopBackOff on any fresh
+#   PVC. It is a one-off manual recovery step for an already-populated disk,
+#   not a config setting. Normal restarts do not need it.
+#
+# "mining_addr"
+#   Omitted. With mine=false no key is needed, and the node auto-creates a
+#   throwaway RSA wallet in /data/wallets on first boot. Set it only if you
+#   intend to mine -- and note the address must be EXACTLY 43 characters
+#   (base64url of a 32-byte address); anything else is a fatal parse error.
+#   (This is what would have broken v1, which shipped the literal
+#   "REPLACE_WITH_WALLET_ADDRESS".)
+#
+# "mine"
+#   Omitted; the default is already false. Harmless to state explicitly.
+#
+# "packing_rate"
+#   A no-op in 2.9.5.1 and REMOVED upstream -- it would be a fatal unknown
+#   key on any future build. Use packing_workers if you ever need it.
+#
+# =============================================================================
+# storage_modules: WHAT "ARCHIVE" AND "SYNC FROM THE START" ACTUALLY MEAN
+# =============================================================================
+#
+# Arweave does not work like a Cosmos chain. There is no genesis replay.
+# Joining the network = downloading the block index from a trusted peer
+# (~170 MB, ~198 paged requests) and verifying the head block against it.
+# That takes 5-15 MINUTES, from scratch, always. Nothing to snapshot,
+# nothing to fast-sync, no `--x-crisis-skip-assert-invariants`.
+#
+# The 389 TB is not chain state -- it is the "weave", the bulk transaction
+# data. You download exactly the parts you ask for, and you ask via
+# storage_modules. Configure none and you download essentially nothing.
+#
+# So "sync the archive from the start" is precisely: claim partitions in
+# ascending order starting at 0. Partition 0 IS the start of the weave.
+#
+# SYNTAX (verified against ar_config:parse_storage_module/1). Four forms:
+#     {partition},{packing}
+#     {partition},{size_in_bytes},{packing}
+#     {partition},{packing},repack_in_place,{target_packing}
+#     {partition},{size_in_bytes},{packing},repack_in_place,{target_packing}
+#   Default partition size = 3,600,000,000,000 bytes (3.6 TB).
+#   `unpacked` = raw weave data, readable by anything, not mineable.
+#   The alternative is `<43-char-address>.replica.2.9`, which encrypts the
+#   partition to ONE mining address and is only useful if you mine.
+#   An archive/validator node wants `unpacked`.
+#
+#   Careful: "1,<address>" parses, but as LEGACY spora_2_6 packing, not 2.9.
+#   Almost never what you want.
+#
+# >>> THE DIRECTORY NAME IS DERIVED FROM THIS STRING. <<<
+#   "0,unpacked" -> /data/storage_modules/storage_module_0_unpacked
+#   "1,unpacked" -> /data/storage_modules/storage_module_1_unpacked
+#   Adding an explicit size CHANGES the name:
+#   "0,3600000000000,unpacked" -> storage_module_3600000000000_0_unpacked
+#   The volumeMounts in 04-statefulset.yaml MUST match these paths byte for
+#   byte. If they drift, the node quietly syncs into the data_dir PVC
+#   instead of the weave PVC and fills it. Change one, change both.
+#
+# SCALING UP -- the honest numbers, as of 2026-08-12 (live, not from docs):
+#   weave_size          389,567,299,756,278 bytes = 389.6 TB
+#   partitions          109  (0 through 108)
+#   reserve per part.   4 TB (docs: allow ~10% over 3.6 TB for proofs)
+#   FULL REPLICA        ~436 TB across 109 PVCs
+#   download time       "if your download bandwidth is 1 Gbps it will take
+#                        over 34 days to download the full data set"
+#   (The docs' own "373 TB / 103 partitions" is stamped November 2025 and
+#    is already stale. The weave only grows.)
+#
+#   At 4 TiB per PVC on StandardSSD_LRS that is roughly USD 30-35k/month in
+#   Azure disk alone, before egress and compute. On Standard_LRS HDD it is
+#   still roughly USD 18k/month. This is why this file ships with TWO
+#   partitions and not 109 -- see RUNBOOK section 2 for the full costing and
+#   section 10 for the procedure to add more.
+#
+# To add partition N: add "N,unpacked" here, add a PVC in 03-pvc.yaml, and
+# add the matching volume + volumeMount in 04-statefulset.yaml. All three.
+#
+# TO RUN AS A HEADERS-ONLY VALIDATOR INSTEAD (no weave data, ~1 TiB total,
+# joins in minutes, costs almost nothing): set "storage_modules": [] and
+# delete the weave PVCs and their mounts. Everything else stays identical.
+# That is a legitimate and fully supported node type -- the docs call it a
+# "Validator" -- and it is the right way to prove the stack works before
+# committing to terabytes.

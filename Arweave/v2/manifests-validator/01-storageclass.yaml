@@ -1,0 +1,37 @@
+# =============================================================================
+# ONE storage class. This profile has no weave partitions, so there is
+# nothing to put on a cheap bulk class -- the archive profile's
+# `arweave-weave` class is deliberately absent here.
+#
+# Premium SSD for data_dir. The team's hardware table says
+# "200 GB SSD minimum / 500+ GB NVMe SSD recommended", and the official docs
+# are explicit that this must not be an HDD:
+#   "Storing your data_dir on an HDD can negatively impact the peformance of
+#    all node operations."   [sic]
+#
+# cachingMode: None -- Azure host caching reorders writes in front of an
+# embedded DB that does its own fsync (RocksDB). Adds latency spikes, buys
+# nothing. Same call as thorchain-storage on this cluster.
+#
+# reclaimPolicy: Retain -- the Azure Disk survives PVC deletion. Cheap
+# insurance. The cost: deleting the PVC does NOT stop billing; delete the
+# disk by hand in the AKS node resource group.
+#
+# volumeBindingMode: WaitForFirstConsumer -- provisions the disk in the same
+# AZ as the scheduled pod. Expect the PVC to sit `Pending` until the pod
+# schedules; that is normal, not a storage fault.
+# =============================================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arweave-datadir
+  labels:
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+  cachingMode: None
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

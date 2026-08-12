@@ -1,0 +1,113 @@
+######################################################################
+## Arweave 2.9.5.1 vm.args.src -- CONTAINER-TUNED.
+##
+## This is upstream's releases/2.9.5.1/vm.args.src verbatim, with ONE
+## change: the three +sbwt* busy-wait thresholds are set to `none`.
+##
+## Upstream ships them as `very_long` and carries this hint, commented
+## out, at line 28 of its own file:
+##
+##     ## Uncomment the following line if running in a container.
+##     ## +sbwt none
+##
+## We are taking upstream's own advice. `very_long` makes the Erlang
+## schedulers spin on CPU while waiting for work, which on a cgroup-
+## limited container reads as ~100% CPU at idle, blows through the CPU
+## request, and gets the pod CFS-throttled during real work.
+##
+## NOTHING ELSE IS CHANGED. The +MB* binary allocator tuning is
+## load-bearing for Arweave's 100 MiB recall-range binaries -- do not
+## "simplify" it.
+##
+## WHY THIS FILE EXISTS AT ALL:
+##   bin/arweave regenerates releases/2.9.5.1/vm.args from this .src on
+##   EVERY invocation (including `stop`, `ping`, `status`). That is a
+##   write into the release directory. We redirect it with
+##   RELX_OUT_FILE_PATH=/run/arweave so the image can stay read-only and
+##   run as non-root. See the Dockerfile and 04-statefulset.yaml.
+##
+## Upstream source (tag N.2.9.5.1): config/vm.args.src
+######################################################################
+
+## Name of the node.
+## Erlang distribution is bound to loopback only -- sys.config pins
+## {kernel, [{inet_dist_use_interface, {127,0,0,1}}]} and epmd binds
+## 127.0.0.1/::1. Nothing here is reachable from outside the pod, which
+## is why the default cookie is acceptable for a single-pod StatefulSet.
+## Override with the ARNODE / ARCOOKIE env vars if you ever cluster.
+-name ${ARNODE:-arweave@127.0.0.1}
+
+## Cookie for distributed erlang
+-setcookie ${ARCOOKIE:-arweave}
+
+## Disable the emulator break handler. Note this also makes the VM
+## IGNORE SIGINT and SIGQUIT -- inside the pod only SIGTERM will stop
+## the node. SIGTERM is still handled gracefully by OTP's
+## erl_signal_handler -> init:stop() -> ar:prep_stop/1.
++Bi
+
+## Enables the kernel poll functionality.
++Ktrue
+
+## +A1024: emulator number of threads in the Async long thread pool for linked
+## in drivers, mostly unused
++A1024
+
+## +SDio1024: emulator Scheduler thread count for Dirty I/O, 200
+## threads for file access
+##
+## NOTE: +A1024 and +SDio1024 together create ~2048 OS threads. That is
+## sized for a many-partition miner. If the pod hits a pids limit, or
+## you are on a 2-vCPU node, drop both to 128. See RUNBOOK section 11.
++SDio1024
+
+## +MBsbct 103424: binary_alloc singleblock carrier threshold (in KiB)
+## (101MiB, default 512KiB). Blocks larger than the threshold are
+## placed in singleblock carriers. However multi-block carriers are
+## more efficient. Since we have so many 100MiB binary blocks due to
+## the recall range, set the threshold so that they are all placed in
+## multi-block carriers and not single-block carriers.
++MBsbct 103424
+
+## +MBsmbcs 10240: binary_alloc smallest multi-block carrier size (in
+## KiB) (10MiB, default 256KiB).
++MBsmbcs 10240
+
+## MBlmbcs 410629: binary_alloc largest multi-block carrier size (in
+## KiB) (~401MiB, default 5MiB). Set so that a single multi-block
+## carrier can hold roughly 4 full recall ranges.
+##
+## This is why the pod's memory limit must be generous -- a single
+## allocator carrier here is ~401 MiB.
++MBlmbcs 410629
+
+## +MBmmsbc 1024: binary_alloc maximum mseg_alloc singleblock carriers
+## (1024 carriers, default 256). Once exhausted, the emulator will start
+## using sys_alloc rather than mseg_alloc for singleblock carriers.
+## This can be slower.
++MBmmmbc 1024
+
+## +MBas aobf: emulator Memory Binary Allocation Strategy set to Address
+## Order Best Fit.
+## see: https://www.erlang.org/doc/man/erts_alloc.html#strategy
++MBas aobf
+
+## ---- CHANGED FOR CONTAINERS (upstream ships `very_long` on all 3) ----
+## Sets scheduler busy wait threshold.
++sbwt none
+
+## Sets dirty scheduler busy wait threshold.
++sbwtdcpu none
+
+## Sets dirty IO scheduler busy wait threshold
++sbwtdio none
+## ---------------------------------------------------------------------
+
+##  Sets scheduler wakeup threshold.
++swt very_low
+
+##  Sets dirty scheduler wakeup threshold.
++swtdcpu very_low
+
+## Sets dirty IO scheduler wakeup threshold.
++swtdio very_low

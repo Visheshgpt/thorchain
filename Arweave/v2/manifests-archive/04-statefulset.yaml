@@ -1,0 +1,357 @@
+# =============================================================================
+# Arweave mainnet archive/validator node on AKS.
+#
+# NO INIT CONTAINERS. Deliberate, and the biggest structural difference from
+# both the v1 Arweave manifests and the thornode/mantra nodes on this cluster:
+#
+#   - No snapshot-restore init container, because there is nothing to
+#     restore. Arweave has no official or community snapshot service, and
+#     does not need one: joining the network means pulling the block index
+#     (~170 MB) from a trusted peer and verifying the head block. 5-15
+#     minutes from an empty disk. There is no genesis replay to skip.
+#     (ArweaveTeam/arweave#292 asked for a snapshot service in 2021; a core
+#     dev answered "raise sync_jobs" and closed it. Never implemented.)
+#   - No config-writing init container, because the config is a ConfigMap.
+#   - No key-generation init container, because a non-mining node needs no
+#     key. The node auto-creates a throwaway RSA wallet in /data/wallets on
+#     first boot; it is harmless and it persists on the PVC.
+#
+# The pod is therefore just: one container, one config file, N disks.
+#
+# -----------------------------------------------------------------------------
+# CAPACITY WARNING -- READ BEFORE APPLYING
+# -----------------------------------------------------------------------------
+# This pod requests 2 CPU / 8 Gi. Per the notes in Mantra-AKS.md and
+# AKS_SETUP/manifests-v2, the existing pool is Standard_D2s_v3 with ~1.9 vCPU
+# and ~5.79 Gi ALLOCATABLE per node, mostly already committed.
+#
+#   ==> THIS POD WILL NOT SCHEDULE ON THE EXISTING NODE POOL. <==
+#
+# That is not a manifest bug to be tuned away. Arweave's documented minimum
+# is 8 GB RAM, and syncing is CPU-bound in a way that is easy to miss:
+#   "You will almost always have to unpack data when syncing it. Whichever
+#    peer you sync the data from will likely return it to you packed to its
+#    own address ... each chunk of data synced will usually need 1-2 packing
+#    operations."
+# Packing/unpacking is RandomX. A 2-vCPU node will sync at a crawl.
+#
+# Add a dedicated pool before applying (RUNBOOK section 4):
+#   az aks nodepool add -g <rg> --cluster-name <cluster> --name arweave \
+#     --node-count 1 --node-vm-size Standard_D8s_v3 --node-osdisk-size 128 \
+#     --labels workload=arweave --node-taints workload=arweave:NoSchedule
+# then uncomment the nodeSelector/tolerations block below.
+#
+# If you genuinely cannot get a dedicated pool, the supported fallback is to
+# run this as a headers-only Validator: set "storage_modules": [] in the
+# ConfigMap, drop the weave PVCs and their mounts, and cut requests to
+# 500m / 4Gi. It joins, validates, and serves the HTTP API. It just does not
+# hold weave data -- which is to say, it is not an archive.
+# =============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: arweave
+  namespace: arweave
+  labels:
+    app: arweave
+    app.kubernetes.io/name: arweave
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  serviceName: arweave-headless
+  # ALWAYS 1. Two nodes sharing one mining address is a slashable offence
+  # ("the network will slash your rewards and revoke the mining permission
+  # of the mining address"), and Azure Disk is ReadWriteOnce regardless.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arweave
+  template:
+    metadata:
+      labels:
+        app: arweave
+        app.kubernetes.io/name: arweave
+    spec:
+      # Kubernetes injects <SVC>_PORT-style env vars for every service in the
+      # namespace. Arweave expands ${ARNODE}/${ARCOOKIE} from the environment
+      # when it regenerates vm.args; keep that environment clean and
+      # predictable.
+      enableServiceLinks: false
+
+      # -- DNS ---------------------------------------------------------------
+      # Every entry in config.json `peers` is a HOSTNAME, not an IP, and
+      # Arweave expands each one into all of its A records at startup. If the
+      # pod cannot resolve *.arweave.xyz, the node never joins -- the symptom
+      # is "Peer [IP]:1984 is not available." repeating in the log.
+      #
+      # The team hit exactly this on the bare-metal Docker node and fixed it
+      # with `docker run --dns 8.8.8.8 --dns 1.1.1.1`. Default AKS CoreDNS
+      # forwards to Azure DNS and resolves public names fine, so this is left
+      # OFF -- but if the VNet uses locked-down custom DNS servers that only
+      # serve internal zones, uncomment this. dnsPolicy stays ClusterFirst so
+      # in-cluster names keep working; these are appended as fallbacks.
+      #
+      # dnsConfig:
+      #   nameservers: ["8.8.8.8", "1.1.1.1"]
+      #   options:
+      #     - { name: ndots, value: "2" }
+
+      # -- Shutdown ----------------------------------------------------------
+      # This is THE most important safety setting in this file.
+      #
+      # Docs, verbatim: "Avoid killing the arweave process if at all possible.
+      # I.e. don't do kill -9 arweave ... if you kill the node abruptly it can
+      # cause rocksdb corruption that can be difficult to recover from. In the
+      # worst case you may need to resync and repack a partition."
+      #
+      # "Resync a partition" = days of download. So we give the VM 10 minutes
+      # to close RocksDB across every storage module. Raise this as you add
+      # partitions -- shutdown work scales with module count.
+      #
+      # This works because bin/arweave foreground `exec`s erlexec, which
+      # execv()s beam.smp, so the Erlang VM is PID 1 and receives SIGTERM
+      # directly. OTP's erl_signal_handler maps SIGTERM -> init:stop() ->
+      # ar:prep_stop/1 (drains the HTTP listener) -> ar_sup teardown ->
+      # RocksDB closed cleanly. (v1 used bin/arweave + 60s, and 60s is not
+      # enough to close a multi-TB module set.)
+      terminationGracePeriodSeconds: 600
+
+      securityContext:
+        # Gatekeeper / Azure Policy on this cluster forbids root containers.
+        # v1 set runAsUser: 0 with the note "Arweave Erlang binary requires
+        # root" -- that is not true. Nothing in the release needs root once
+        # RELX_OUT_FILE_PATH moves the one startup write out of the install
+        # directory. UID 1025 matches thornode and mantra on this cluster.
+        runAsUser: 1025
+        runAsGroup: 1025
+        runAsNonRoot: true
+        fsGroup: 1025
+        # NOT the default "Always". With Always, kubelet recursively chowns
+        # every mounted volume on every pod start. On a multi-TB weave
+        # partition holding millions of chunk files that is hours of I/O
+        # before the container even starts. OnRootMismatch only relabels when
+        # the top-level owner is actually wrong.
+        fsGroupChangePolicy: OnRootMismatch
+
+      # -- Dedicated node pool (see CAPACITY WARNING above) -------------------
+      # Uncomment BOTH once the pool exists.
+      # nodeSelector:
+      #   workload: arweave
+      # tolerations:
+      #   - key: workload
+      #     operator: Equal
+      #     value: arweave
+      #     effect: NoSchedule
+
+      containers:
+        - name: arweave
+          # TODO: replace <ACR_NAME> with your registry.
+          # There is no upstream image to fall back on -- build it first,
+          # RUNBOOK section 3. Pin the tag; never use :latest for a chain node.
+          image: "<ACR_NAME>.azurecr.io/arweave:2.9.5.1"
+          imagePullPolicy: IfNotPresent
+
+          # ENTRYPOINT in the image is ["/opt/arweave/bin/arweave","foreground"].
+          # These args append to it. bin/arweave splits its argv on "--":
+          # anything before the first "--" is an Erlang emulator flag, anything
+          # after is an Arweave option. With no "--" present at all, everything
+          # is treated as an Arweave option -- which is what we want here.
+          args:
+            - config_file
+            - /etc/arweave/config.json
+
+          env:
+            # Redirects the vm.args that bin/arweave regenerates from
+            # vm.args.src on EVERY invocation (including `stop`, `ping`).
+            # Without this the write lands in /opt/arweave/releases/2.9.5.1/
+            # and fails on the read-only rootfs.
+            #
+            # FAILURE MODE IF THIS IS WRONG: the script does not abort -- the
+            # write failure happens inside a command substitution, so it
+            # continues with the shipped vm.args, which still contains the
+            # literal string "${ARNAME:-arweave@127.0.0.1}". ERTS does not
+            # expand variables inside -args_file, so the VM dies on an invalid
+            # node name. Silent and very confusing. The directory must also
+            # already EXIST -- bin/arweave tests [ -d "$RELX_OUT_FILE_PATH" ]
+            # and silently falls back if it does not. The emptyDir guarantees
+            # it does.
+            - { name: RELX_OUT_FILE_PATH, value: /run/arweave }
+
+            # ARNODE / ARCOOKIE are intentionally NOT set -- the defaults
+            # (arweave@127.0.0.1 / cookie "arweave") are fine here. Erlang
+            # distribution is bound to loopback only: sys.config pins
+            # {kernel,[{inet_dist_use_interface,{127,0,0,1}}]} and epmd binds
+            # 127.0.0.1/::1. Nothing outside the pod can reach it, and this is
+            # a single-pod StatefulSet with no clustering. Set them (cookie
+            # from a Secret) only if you ever run multiple coordinated nodes.
+
+          ports:
+            # ONE port. Arweave serves the REST API, peer gossip, chunk sync,
+            # VDF push/pull and Prometheus /metrics all on 1984. There is no
+            # separate P2P port -- this is the main structural difference from
+            # the Cosmos nodes on this cluster.
+            - { name: http, containerPort: 1984, protocol: TCP }
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            # The image writes nothing to its own filesystem at runtime: the
+            # single startup write (vm.args) is redirected by
+            # RELX_OUT_FILE_PATH, log_dir and data_dir are absolute paths onto
+            # mounted volumes, and sys.config is never regenerated (no
+            # sys.config.src ships). If the container fails to start with a
+            # read-only filesystem error, this is the first thing to flip --
+            # then find what wrote and fix it properly rather than leaving it
+            # off.
+            readOnlyRootFilesystem: true
+
+          # -- Resources ---------------------------------------------------
+          # See the CAPACITY WARNING at the top of this file.
+          #
+          # memory 8Gi request: the documented floor is "1GB of RAM per
+          # partition being mined - with a minimum of 8GB". Also note
+          # vm.args sets +MBlmbcs 410629, i.e. a single binary allocator
+          # carrier is ~401 MiB, so RSS is lumpy. 16Gi limit gives the
+          # allocator room without inviting the OOM killer.
+          #
+          # NO CPU LIMIT, on purpose. Two reasons that compound:
+          #   1. CFS throttling stalls chunk unpacking (RandomX) and block
+          #      validation, so the node falls behind while looking healthy.
+          #   2. Erlang's scheduler busy-wait makes throttling worse. We
+          #      already set +sbwt none in the image's vm.args.src to stop
+          #      the VM spinning at idle, but a hard cap on a NIF-heavy
+          #      workload still hurts.
+          # The request is the scheduling reservation; the node bursts into
+          # whatever the box has spare.
+          # 24Gi limit matches the value the team's working bare-metal Docker
+          # node was run with (`docker run --memory=24g --memory-swap=24g`).
+          # Limits do not affect scheduling -- only `requests` is matched
+          # against node capacity -- so raising this is free and gives the
+          # allocator headroom. Their runbook's "Issue 1: randomx_alloc_cache
+          # failed" was resolved partly by raising exactly this number.
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              memory: "24Gi"
+
+          # -- Probes ------------------------------------------------------
+          # NO livenessProbe, deliberately -- same call as thornode v2 on this
+          # cluster, and for a stronger reason here. Restarting an Arweave
+          # node that is merely behind does not help it catch up, and every
+          # restart is another chance to interrupt a RocksDB compaction on a
+          # multi-TB partition. A wedged node still shows up: readiness fails,
+          # the pod goes 0/1, and it leaves the Service endpoints. Restart it
+          # deliberately after looking at the logs, not automatically.
+          #
+          # startupProbe hits /info, which returns 200 as soon as the HTTP
+          # listener is up -- even before the node has joined (it reports
+          # "height": -1, "current": "not_joined"). 15 minutes of headroom
+          # covers the block-index download.
+          # Caveat handled by the generous threshold: ar_info:get_info/0 does
+          # a hard match on an ETS table that is not populated in the first
+          # moments, so /info can briefly 500 during boot.
+          startupProbe:
+            httpGet: { path: /info, port: http }
+            periodSeconds: 10
+            failureThreshold: 90
+            timeoutSeconds: 5
+
+          # readiness hits /recent, NOT /info. This is the important
+          # distinction: /info returns 200 unconditionally, so probing it
+          # would mark the pod Ready while it is still "not_joined" and
+          # serving nothing useful. /recent is gated on ar_node:is_joined()
+          # and returns 503 {"error":"not_joined"} until the node has actually
+          # joined the network, 200 after.
+          #
+          # (v1 probed tcpSocket:1984, which reports healthy for any process
+          # holding the port -- including one that never joined at all.)
+          readinessProbe:
+            httpGet: { path: /recent, port: http }
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+
+          # Belt-and-braces. `bin/arweave stop` issues init:stop() over Erlang
+          # RPC -- the exact same shutdown path SIGTERM triggers -- but it
+          # BLOCKS until the OS process is gone, whereas SIGTERM is
+          # fire-and-forget. Kubernetes runs preStop first, then SIGTERM.
+          # This is optional: plain SIGTERM is already fully graceful. The
+          # real corruption protection is terminationGracePeriodSeconds above.
+          # If it ever misbehaves, deleting this block is safe.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/opt/arweave/bin/arweave", "stop"]
+
+          # -- Volume mounts -----------------------------------------------
+          # The storage_module paths below are NOT free-form. Arweave derives
+          # the directory name from the storage_modules string in the
+          # ConfigMap:
+          #     "0,unpacked"  ->  storage_module_0_unpacked
+          #     "1,unpacked"  ->  storage_module_1_unpacked
+          # If these two ever disagree, the node does not error -- it just
+          # syncs into the data_dir PVC instead and fills it. Change one,
+          # change the other.
+          volumeMounts:
+            - { name: data,   mountPath: /data }
+            - { name: weave-p0, mountPath: /data/storage_modules/storage_module_0_unpacked }
+            - { name: weave-p1, mountPath: /data/storage_modules/storage_module_1_unpacked }
+            - { name: config, mountPath: /etc/arweave, readOnly: true }
+            - { name: runtime, mountPath: /run/arweave }
+            - { name: logs,   mountPath: /var/log/arweave }
+            - { name: tmp,    mountPath: /tmp }
+            - { name: dshm,   mountPath: /dev/shm }
+
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: arweave-data }
+        - name: weave-p0
+          persistentVolumeClaim: { claimName: arweave-weave-p0 }
+        - name: weave-p1
+          persistentVolumeClaim: { claimName: arweave-weave-p1 }
+        - name: config
+          configMap:
+            name: arweave-config
+        # Holds the vm.args regenerated at every bin/arweave invocation.
+        # Must exist and be writable -- see RELX_OUT_FILE_PATH above.
+        # Note the generated file contains the Erlang cookie in plaintext,
+        # mode 0644, pod-local.
+        - name: runtime
+          emptyDir: { sizeLimit: 8Mi }
+        # Logs are EPHEMERAL -- they die with the pod. Arweave logs are
+        # verbose during sync; a sizeLimit stops them evicting the pod by
+        # exhausting node ephemeral storage. Move this to a subPath on the
+        # data PVC if you need them to survive restarts.
+        - name: logs
+          emptyDir: { sizeLimit: 2Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 1Gi }
+        # /dev/shm. Kubernetes, like Docker, defaults this to 64 MB, which is
+        # tiny. The team's working bare-metal node runs with
+        # `docker run --shm-size=4g`, so the 64 MB default is a real
+        # difference between that tested setup and this one -- closing it.
+        # medium: Memory makes this a tmpfs; note it is charged against the
+        # container's memory limit, so shm + heap must fit inside the 24Gi
+        # above. Their ratio was 24g memory : 4g shm; 2Gi here keeps that
+        # proportion. Raise together, never shm alone.
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+
+# =============================================================================
+# TEMPLATE -- adding partition N (RUNBOOK section 10.1). THREE edits required:
+#   1. 02-configmap.yaml  -> add "N,unpacked" to storage_modules
+#   2. 03-pvc.yaml        -> add PVC arweave-weave-pN
+#   3. this file          -> add BOTH lines below
+#
+#   volumeMounts:
+#     - { name: weave-p2, mountPath: /data/storage_modules/storage_module_2_unpacked }
+#   volumes:
+#     - name: weave-p2
+#       persistentVolumeClaim: { claimName: arweave-weave-p2 }
+#
+# Then: kubectl apply -f . && kubectl rollout restart statefulset/arweave -n arweave
+# =============================================================================

@@ -1,0 +1,144 @@
+# =============================================================================
+# PVCs.
+#
+# WHY STANDALONE PVCs AND NOT volumeClaimTemplates:
+#   volumeClaimTemplates is the idiomatic StatefulSet choice, but it is
+#   IMMUTABLE. Adding one partition later would mean deleting the
+#   StatefulSet with --cascade=orphan and recreating it. Growing the weave
+#   partition by partition is the entire operating model of this node, so we
+#   optimise for that: standalone PVCs plus plain `volumes:` entries in the
+#   pod template. Pod-template volumes ARE mutable, so adding a partition is
+#   a normal `kubectl apply` + rolling restart. See RUNBOOK section 10.
+#
+# STRUCTURE:
+#   arweave-data       -> /data                       (Premium SSD, 1 Ti)
+#   arweave-weave-p0   -> /data/storage_modules/storage_module_0_unpacked
+#   arweave-weave-p1   -> /data/storage_modules/storage_module_1_unpacked
+#
+#   Yes, the weave PVCs mount INSIDE the data PVC's mount point. That is
+#   intentional and works -- kubelet mounts by ascending path length, so
+#   /data is mounted before /data/storage_modules/..., and the nested mounts
+#   shadow whatever the parent volume has at that path. It is also the only
+#   layout Arweave accepts, because it derives the directory name from the
+#   storage_modules config string and will not look anywhere else.
+#
+# ACCESS MODE: ReadWriteOnce on all of them. Azure Disk is single-node only,
+#   and Arweave is a single-writer process. Never scale this to 2 replicas.
+# =============================================================================
+---
+# -- data_dir ------------------------------------------------------------------
+# Block index, block + tx headers, wallet list, disk pool, RocksDB CFs.
+#
+# SIZING: docs say "The minimum recommended size for the data_dir is 256GB
+# ... Many miners opt for a 500GB or 1TB data_dir", and separately "even
+# more if you want to store the full blockchain".
+#
+# We take the 1 Ti option, on purpose: header_sync_jobs is raised in the
+# ConfigMap specifically so this node backfills ALL ~1.98 M block headers,
+# which is the "store the full blockchain" case. 1 Ti also absorbs the
+# 8 GB disk pool cap and leaves room for RocksDB compaction churn.
+#
+# This one WILL grow over time (headers accumulate forever). The storage
+# class has allowVolumeExpansion: true; expansion procedure is RUNBOOK
+# section 10.3. If you run pvc-watcher on this cluster, register this PVC
+# -- do NOT register the weave PVCs, they are fixed-size by design.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arweave-data
+  namespace: arweave
+  labels:
+    app: arweave
+    volume-role: data-dir
+    app.kubernetes.io/part-of: arweave-node
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arweave-datadir
+  resources:
+    requests:
+      storage: 1Ti
+
+---
+# -- weave partition 0 ---------------------------------------------------------
+# The FIRST 3.6 TB of data ever stored on Arweave. This is literally "the
+# start" of the archive.
+#
+# SIZING -- 4Ti, not 3.6Ti, and not less:
+#   Docs: "For any given storage_module_size, you should allow for an
+#   additional 10% metadata overhead (such as merkle proofs). This is why,
+#   for the default 3.6 TB storage_module_size, we recommend reserving 4 TB
+#   of space."
+#   Partitions 0 and 1 are called out specifically as the greediest:
+#   "some of the earlier partitions (notably partitions 0 and 1) sometimes
+#   need more than 400GB of space for their metadata."
+#
+#   Note 4Ti (4398 GB) > 4 TB (4000 GB), so this clears the recommendation.
+#
+# Expect it NOT to fill. Docs: "You will find as you sync data that you're
+# never able to download a full 3.6TB partition - and in fact some
+# partitions seem to stop syncing well short of the 3.6TB" -- content
+# policies and never-seeded data. Published estimate for partition 0 is
+# ~2.08 TB and partition 1 ~1.91 TB. A partition that stalls short of 3.6 TB
+# is normal, not a bug.
+#
+# Do NOT measure progress with `du`. Docs: "Diskspace measuring tools (e.g.
+# du, ls -l) will not be able to give an accurate measurement of the amount
+# of weave data synced" -- chunk_storage uses ~2 GB SPARSE files. Use the
+# v2_index_data_size_by_packing Prometheus metric. RUNBOOK section 7.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arweave-weave-p0
+  namespace: arweave
+  labels:
+    app: arweave
+    volume-role: weave-partition
+    weave-partition: "0"
+    app.kubernetes.io/part-of: arweave-node
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arweave-weave
+  resources:
+    requests:
+      storage: 4Ti
+
+---
+# -- weave partition 1 ---------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arweave-weave-p1
+  namespace: arweave
+  labels:
+    app: arweave
+    volume-role: weave-partition
+    weave-partition: "1"
+    app.kubernetes.io/part-of: arweave-node
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arweave-weave
+  resources:
+    requests:
+      storage: 4Ti
+
+# =============================================================================
+# TEMPLATE -- copy this block to add partition N (see RUNBOOK section 10.1).
+# Remember all THREE edits: this file, 02-configmap.yaml, 04-statefulset.yaml.
+# =============================================================================
+# ---
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: arweave-weave-p2
+#   namespace: arweave
+#   labels:
+#     app: arweave
+#     volume-role: weave-partition
+#     weave-partition: "2"
+#     app.kubernetes.io/part-of: arweave-node
+# spec:
+#   accessModes: [ReadWriteOnce]
+#   storageClassName: arweave-weave
+#   resources:
+#     requests:
+#       storage: 4Ti

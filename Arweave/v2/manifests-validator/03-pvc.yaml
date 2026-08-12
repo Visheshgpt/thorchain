@@ -1,0 +1,55 @@
+# =============================================================================
+# ONE PVC. Their docker run mounts three volumes:
+#
+#     -v /1Disk73/arweave-docker/data:/data        <- reproduced below
+#     -v /1Disk73/arweave-docker/storage:/storage  <- deliberately NOT here
+#     -v /1Disk73/arweave-docker/config:/config    <- now a ConfigMap
+#
+# WHY /storage IS DROPPED:
+#   Their config.json has no `storage_modules` key, so Arweave never writes
+#   anything to /storage. The mount exists in their docker run, and the
+#   directory tree (storage/disk{1..16}) gets created by their setup steps,
+#   but nothing ever lands in it. Reproducing it on AKS would mean paying for
+#   an Azure Disk to hold zero bytes.
+#
+#   Arweave does not use an arbitrary /storage path anyway. Storage modules
+#   live at [data_dir]/storage_modules/storage_module_<N>_<packing>, a path
+#   the node DERIVES from the config string. That is how the archive profile
+#   mounts them -- see ../manifests-archive/03-pvc.yaml.
+#
+# WHY /config IS A ConfigMap:
+#   Their setup writes config.json to a host directory with `sudo tee`. On
+#   Kubernetes that is a ConfigMap: declarative, diffable, versioned with the
+#   rest of the manifests, and it costs nothing. See 02-configmap.yaml.
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arweave-data
+  namespace: arweave
+  labels:
+    app: arweave
+    volume-role: data-dir
+    arweave-profile: validator
+    app.kubernetes.io/part-of: arweave-node
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: arweave-datadir
+  resources:
+    requests:
+      # 500Gi -- their hardware table: "Disk (data_dir): 200 GB SSD minimum /
+      # 500+ GB NVMe SSD recommended". The official docs agree: "The minimum
+      # recommended size for the data_dir is 256GB ... Many miners opt for a
+      # 500GB or 1TB data_dir."
+      #
+      # Holds: block index, block + tx headers, wallet list, RocksDB column
+      # families, and the disk pool. That last one matters -- this profile
+      # leaves max_disk_pool_buffer_mb at its real default of 100000, i.e.
+      # the disk pool alone may claim up to 100 GB. 500Gi absorbs that with
+      # room for RocksDB compaction churn.
+      #
+      # It grows slowly. header_sync_jobs defaults to 1 here (as in theirs),
+      # so headers accumulate gradually -- their node showed 208 blocks
+      # stored. Expansion procedure: RUNBOOK section 10.2.
+      # If pvc-watcher runs on this cluster, register this PVC.
+      storage: 500Gi

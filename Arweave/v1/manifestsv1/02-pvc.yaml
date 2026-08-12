@@ -1,0 +1,73 @@
+# ============================================================
+# FILE: 02-pvc.yaml
+# PURPOSE: PersistentVolumeClaims for the Arweave node.
+#          THREE volumes derived from the docker run mounts:
+#
+#   1. arweave-data    → /data
+#      Chain indices, wallet file, block headers, IAVL data.
+#      docker run: -v /1Disk73/arweave-docker/data:/data
+#      Size: 500Gi (archival validator minimum; grow as needed)
+#
+#   2. arweave-storage → /storage
+#      Arweave storage modules (HDDs for full weave archive).
+#      docker run: -v /1Disk73/arweave-docker/storage:/storage
+#      Size: 4096Gi default. FULL weave ≈ 373 TB — expand via
+#      allowVolumeExpansion:true or provision external disks.
+#      # TODO: Set to actual capacity planning size for your node.
+#
+#   3. arweave-config  → /config
+#      Holds config.json written by the init container.
+#      docker run: -v /1Disk73/arweave-docker/config:/config
+#      Size: 32Gi (config files are tiny; headroom for future use)
+#
+# NOTE: reclaimPolicy: Retain on arweave-storage means the
+#       underlying Azure Disk survives PVC deletion.
+# ============================================================
+
+
+---
+# ── PVC 1: Chain Data ────────────────────────────────────────
+apiVersion: v1                      # Stable Kubernetes core API
+kind: PersistentVolumeClaim
+metadata:
+  name: arweave-data                # Matches volumeMount name in 03-statefulset.yaml
+  namespace: arweave                # --namespace arweave
+  labels:
+    app: arweave
+    volume-role: chain-data
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  accessModes:
+    - ReadWriteOnce                 # Azure Disk supports single-node RWO only
+  storageClassName: arweave-storage # Must match StorageClass in 01-storageclass.yaml
+  resources:
+    requests:
+      storage: 500Gi               # Covers wallet + indices + block headers; expand as chain grows
+
+
+---
+# ── PVC 2: Archival Storage Modules ─────────────────────────
+# Arweave stores the "weave" (transaction data) across storage
+# modules, each mapped to a disk partition on the host.
+# A full weave requires ~373 TB. Provision what you can afford
+# and sync partial weave modules first.
+# TODO: Adjust storage size to match your target weave coverage.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arweave-storage             # Matches volumeMount name in 03-statefulset.yaml
+  namespace: arweave
+  labels:
+    app: arweave
+    volume-role: weave-storage
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  accessModes:
+    - ReadWriteOnce                 # Azure Disk — single writer
+  storageClassName: arweave-storage
+  resources:
+    requests:
+      storage: 4096Gi              # 4 TiB default — covers one storage module partition (~3.6 TB)
+                                   # TODO: Scale up or add additional PVCs per storage module disk

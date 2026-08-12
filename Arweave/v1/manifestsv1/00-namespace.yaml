@@ -1,0 +1,16 @@
+# ============================================================
+# FILE: 00-namespace.yaml
+# PURPOSE: Creates the dedicated Kubernetes namespace for the
+#          Arweave archival validator node.
+#          Apply this FIRST, before any other manifest.
+# ============================================================
+
+
+apiVersion: v1                      # Stable Kubernetes core API
+kind: Namespace
+metadata:
+  name: arweave                     # --namespace arweave
+  labels:
+    app: arweave
+    managed-by: manifest-generator
+    environment: production

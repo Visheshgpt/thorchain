@@ -1,0 +1,94 @@
+# ============================================================
+# FILE: 04-service.yaml
+# PURPOSE: Exposes the Arweave pod via TWO services.
+#          (One port mapping detected → headless + primary LB)
+#
+#   1. arweave-headless  — ClusterIP: None
+#      Provides stable DNS identity required by the StatefulSet:
+#        arweave-0.arweave-headless.arweave.svc.cluster.local
+#      Enables in-cluster pod-to-pod communication on port 1984.
+#
+#   2. arweave-api       — External Azure LoadBalancer (public IP)
+#      Exposes port 1984 to external traffic.
+#      Arweave uses a SINGLE port for both P2P peer gossip AND
+#      the HTTP API — external peers MUST reach this port to
+#      participate in block/tx exchange.
+#      Port mapping: host 1984 → container 1984
+#      (docker run used -p 8000:1984; in AKS we expose 1984
+#       directly — change spec.ports[0].port to 8000 if your
+#       firewall requires the alternative port)
+#
+# EXTERNAL LB RATIONALE:
+#   Arweave's peer discovery (via /peers endpoint) advertises
+#   the node's IP to the network. External reachability on 1984
+#   is required for healthy peer connections. If you need to
+#   restrict API access, add a Network Security Group rule on
+#   the AKS subnet to allow only peer IPs.
+#
+# TODO: After deployment, get the external IP and update your
+#       config.json if you want peers to find your node:
+#   kubectl get svc arweave-api -n arweave \
+#     -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+# ============================================================
+
+
+---
+# ── Service 1: Headless ──────────────────────────────────────
+# Required by StatefulSet for stable pod DNS identity.
+# ClusterIP: None — kube-dns returns pod IP directly.
+# publishNotReadyAddresses: true — include pod in DNS before
+# readiness probe passes (needed during sync / first startup).
+apiVersion: v1
+kind: Service
+metadata:
+  name: arweave-headless            # Referenced by spec.serviceName in StatefulSet
+  namespace: arweave                # --namespace arweave
+  labels:
+    app: arweave
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  clusterIP: None                   # Headless — DNS resolves directly to pod IP
+  selector:
+    app: arweave                    # Targets pods with label app=arweave
+  publishNotReadyAddresses: true    # Include pod in DNS even before readiness probe passes
+  ports:
+    - name: arweave
+      port: 1984                    # Arweave HTTP API + P2P (combined single port)
+      targetPort: 1984              # Container port (set via "port": 1984 in config.json)
+      protocol: TCP
+
+
+---
+# ── Service 2: External LoadBalancer — API + P2P ─────────────
+# Arweave uses port 1984 for BOTH P2P block/tx gossip AND the
+# HTTP REST API. External peers need inbound access to this port
+# for the node to participate in the network.
+#
+# Azure will assign a PUBLIC IP to this service.
+# To restrict inbound access, configure an NSG on the AKS subnet.
+#
+# NOTE: If your environment requires an Internal LB instead,
+#       add this annotation:
+#         service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+#       This will assign a private VNet IP instead of a public IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: arweave-api                 # Primary external-facing service
+  namespace: arweave                # --namespace arweave
+  labels:
+    app: arweave
+    role: api-p2p
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: LoadBalancer                # Azure will provision a Public Load Balancer
+  selector:
+    app: arweave                    # Targets pods with label app=arweave
+  ports:
+    - name: arweave
+      port: 1984                    # External port — docker run host port was 8000; 1984 is standard
+      targetPort: 1984              # Container port — Arweave listens on 1984 per config.json
+      protocol: TCP
+  sessionAffinity: None             # Stateless HTTP/P2P — no session pinning needed

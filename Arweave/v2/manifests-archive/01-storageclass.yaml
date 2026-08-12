@@ -1,0 +1,81 @@
+# =============================================================================
+# TWO storage classes, because Arweave has two very different disk workloads
+# and putting them on the same class wastes either money or performance.
+#
+#   1. arweave-datadir -- Premium SSD. Holds data_dir: the block index, block
+#      and tx headers, the wallet list, the disk pool, and RocksDB column
+#      families. Random-write heavy with its own fsync discipline.
+#      The docs are explicit that this must not be an HDD:
+#        "Storing your data_dir on an HDD can negatively impact the
+#         peformance of all node operations."   [sic]
+#        -- docs.arweave.org/mining/setup/hardware
+#
+#   2. arweave-weave -- Standard SSD. Holds the storage_module partitions:
+#      3.6 TB each of bulk chunk data. Written once during sync at whatever
+#      rate the network feeds it, then read sequentially. Mining only needs
+#      "an average of 5MB/s read throughput per 3.6TB partition", so paying
+#      Premium prices per 4 TiB partition is pure waste.
+#
+# cachingMode: None on BOTH.
+#   Azure host caching sits in front of the disk and reorders writes. For a
+#   write-heavy embedded DB that does its own fsync (RocksDB) this adds
+#   latency spikes and buys nothing. Same reasoning as thorchain-storage in
+#   AKS_SETUP/manifests-v2/01-storageclass.yaml. PremiumV2_LRS additionally
+#   REQUIRES cachingMode: None -- it does not support host caching at all.
+#
+# reclaimPolicy: Retain on BOTH, and this one really matters here.
+#   A 3.6 TB partition costs days of download bandwidth and CPU to rebuild,
+#   and there is NO snapshot to restore from (see RUNBOOK section 2). If a
+#   PVC is deleted by accident the Azure Disk survives and can be re-bound.
+#   The cost of that choice: deleting PVCs does NOT stop the billing. You
+#   must delete the disks by hand in the AKS node resource group.
+#
+# volumeBindingMode: WaitForFirstConsumer
+#   Provisions each disk in the same availability zone as the scheduled pod.
+#   Without it a disk can land in a zone the pod cannot reach.
+#   Side effect to expect: PVCs sit in `Pending` until the pod schedules.
+#   That is normal and is NOT a storage fault -- if the pod is Pending on
+#   CPU/memory, the PVCs stay Pending too. See RUNBOOK section 9.
+# =============================================================================
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arweave-datadir
+  labels:
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+  cachingMode: None
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arweave-weave
+  labels:
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com
+parameters:
+  # StandardSSD_LRS is the middle option and the right default:
+  #   Standard_LRS     (HDD)  cheapest, ~500 IOPS / 60 MB/s at 4 TiB.
+  #                           Fine for bulk sync, poor for serving data back
+  #                           to peers. Choose this if you are cost-bound and
+  #                           the node is an archive, not a data provider.
+  #   StandardSSD_LRS  (E50)  ~500 IOPS / 60 MB/s at 4 TiB, far better
+  #                           latency and consistency than HDD.   <-- default
+  #   Premium_LRS      (P50)  ~7500 IOPS / 250 MB/s at 4 TiB. Only worth it
+  #                           if you intend to mine these partitions later.
+  # Changing this is a per-partition decision -- you can point some weave
+  # PVCs at one class and some at another; nothing in Arweave cares.
+  skuName: StandardSSD_LRS
+  cachingMode: None
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

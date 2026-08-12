@@ -1,0 +1,32 @@
+# ============================================================
+# FILE: 01-storageclass.yaml
+# PURPOSE: Azure Disk StorageClass for all Arweave PVCs.
+#          Premium_LRS (Premium SSD) chosen for the chain data
+#          volume — Arweave uses intensive random I/O for its
+#          Merkle DAG / RandomX workloads.
+#
+#          reclaimPolicy: Retain — Arweave chain data is
+#          irreplaceable; the underlying Azure Disk survives
+#          PVC deletion and must be manually cleaned up.
+#
+#          NOTE: The archival storage volume (full weave ~373 TB)
+#          may require UltraSSD_LRS or large Premium_LRS arrays
+#          managed outside this StorageClass. See 02-pvc.yaml.
+# ============================================================
+
+
+apiVersion: storage.k8s.io/v1       # Stable StorageClass API
+kind: StorageClass
+metadata:
+  name: arweave-storage             # Referenced by all PVCs in 02-pvc.yaml
+  labels:
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com     # Azure Disk CSI driver — built into AKS 1.21+
+parameters:
+  skuName: Premium_LRS              # Premium SSD — required for RandomX random-read I/O
+  kind: Managed                     # Managed disk — no storage account required
+  cachingMode: ReadWrite            # OS-disk-style caching; safe for single-writer workload
+reclaimPolicy: Retain               # Disk is PRESERVED when PVC is deleted — do NOT change to Delete
+volumeBindingMode: WaitForFirstConsumer   # Provisions disk in the same AZ as the scheduled pod
+allowVolumeExpansion: true          # Allows online PVC resize without pod restart (AKS 1.24+)

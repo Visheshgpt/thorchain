@@ -1,0 +1,265 @@
+# ── PVC 3: Configuration ─────────────────────────────────────
+# Holds /config/config.json written by the init-config container.
+# Small but persisted so config survives pod restarts without
+# re-running the init container unconditionally.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arweave-config              # Matches volumeMount name in 03-statefulset.yaml
+  namespace: arweave
+  labels:
+    app: arweave
+    volume-role: config
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: arweave-storage
+  resources:
+    requests:
+      storage: 32Gi                # Generous headroom for config.json and future keys
+
+
+
+
+# ============================================================
+# FILE: 03-statefulset.yaml
+# PURPOSE: Runs a single Arweave archival validator node as a
+#          StatefulSet (stable network identity, ordered pod
+#          lifecycle, PVC affinity). One replica — blockchain
+#          archival nodes are not horizontally scaled.
+#
+# IMAGE NOTE:
+#   Arweave requires a custom Docker image built from the
+#   official binaries (see docker-setup.md "Building the
+#   Docker Image" section). The image must be pushed to an
+#   Azure Container Registry (ACR) before deploying.
+#   TODO: Replace <ACR_NAME>.azurecr.io/arweave-custom:2.9.5.1
+#         with your actual ACR image reference.
+#
+# ENTRYPOINT / COMMAND MAPPING (from docker run):
+#   docker run entrypoint: /opt/arweave/bin/arweave
+#   docker run command:    foreground config_file /config/config.json
+#                         → k8s args: ["foreground", "config_file", "/config/config.json"]
+#
+# PORT LAYOUT:
+#   1984   arweave  — Arweave HTTP API + P2P network (combined single port)
+#                     External peers connect here for block/tx gossip.
+#                     HTTP endpoints: /info, /block/current, /peers, /storage_modules
+#
+# ENVIRONMENT (from docker run --env / Dockerfile ENV):
+#   ARNODE   = arweave@127.0.0.1   — Erlang node name
+#   ARCOOKIE = arweave              — Erlang distribution cookie
+#
+# VOLUME MOUNT MAPPING (from docker run -v):
+#   arweave-data    → /data    (chain indices, wallet, block headers)
+#   arweave-storage → /storage (weave data / storage module partitions)
+#   arweave-config  → /config  (config.json written by init container)
+#
+# INIT CONTAINER PATTERN (1 stage):
+#   Stage 1 — init-config: Writes /config/config.json if not already
+#             present. Uses busybox so no package manager is needed.
+#             Sentinel file (.arweave-initialized) prevents re-running.
+#
+# SECURITY CONTEXT NOTES:
+#   The official Arweave binary runs as root (Dockerfile has no USER
+#   directive). runAsNonRoot: false at pod level permits this.
+#   fsGroup: 1000 ensures volume files are group-accessible.
+#   If your AKS cluster enforces a no-root Gatekeeper policy, build
+#   a custom image with a non-root user and adjust runAsUser below.
+#
+# RANDOMX / HUGEPAGES NOTE:
+#   Arweave's RandomX proof-of-work requires hugepages on the host.
+#   AKS nodes do NOT support vm.nr_hugepages tuning by default.
+#   The node will run in "light mode" without hugepages — this is
+#   acceptable for archival/sync purposes but reduces mining performance.
+#   For mining with RandomX, use a DaemonSet to configure hugepages
+#   on each node pool VM (requires privileged access / custom node image).
+#
+# RESOURCE SIZING (from docker run --memory=24g):
+#   requests.memory: 8Gi   (minimum per hardware spec: 8 GB)
+#   limits.memory:   24Gi  (docker run --memory=24g)
+#   requests.cpu:    2      (minimum 4 cores; 2 reserved baseline)
+#   limits.cpu:      8      (recommended 8+ cores burst cap)
+# ============================================================
+
+
+apiVersion: apps/v1                 # Stable StatefulSet API
+kind: StatefulSet
+metadata:
+  name: arweave                     # StatefulSet name
+  namespace: arweave                # --namespace arweave
+  labels:
+    app: arweave
+    app.kubernetes.io/name: arweave
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  serviceName: arweave-headless     # Links to headless service — stable DNS: arweave-0.arweave-headless.arweave.svc.cluster.local
+  replicas: 1                       # Single archival node — not horizontally scaled
+  selector:
+    matchLabels:
+      app: arweave
+  template:
+    metadata:
+      labels:
+        app: arweave
+        app.kubernetes.io/name: arweave
+    spec:
+      # ── Pod-level Security Context ────────────────────────
+      # Arweave binary runs as root (Dockerfile default: no USER directive)
+      # runAsNonRoot: false — root execution is permitted for this image
+      # fsGroup: 1000 — volume files group-owned by GID 1000
+      securityContext:
+        runAsNonRoot: false         # Arweave runs as root — required by Erlang VM + binary layout
+        fsGroup: 1000               # Group ownership for all mounted volumes
+      # ── Graceful Shutdown ─────────────────────────────────
+      # Arweave uses Erlang's graceful shutdown; 60s allows it to flush
+      # in-flight writes and close RocksDB/ETS tables cleanly
+      terminationGracePeriodSeconds: 60
+      # ── Init Containers ───────────────────────────────────
+      initContainers:
+
+
+        # ── Stage 1 — Write config.json ──────────────────────
+        # busybox is available without any package install.
+        # Sentinel file (.arweave-initialized) prevents re-running
+        # the init on every pod restart.
+        #
+        # PEERS: Official Arweave regional peer hostnames.
+        # TODO: Add your wallet address to "mining_addr" if enabling mining.
+        # TODO: Adjust "sync_jobs" based on available CPU (default 20).
+        - name: init-config
+          image: busybox:1.36       # Minimal image — no package manager needed
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+
+
+              if [ -f /config/.arweave-initialized ]; then
+                echo "==> [Stage 1] Config already present — skipping"
+                exit 0
+              fi
+
+
+              echo "==> [Stage 1] Writing /config/config.json..."
+              mkdir -p /config
+
+
+              cat > /config/config.json << 'EOFCFG'
+              {
+                "peers": [
+                  "asia.peers.arweave.xyz",
+                  "europe.peers.arweave.xyz",
+                  "india.peers.arweave.xyz",
+                  "north-america.peers.arweave.xyz",
+                  "oceania.peers.arweave.xyz",
+                  "peers.arweave.xyz"
+                ],
+                "data_dir": "/data",
+                "vdf_server_trusted_peers": ["vdf-server-3.arweave.xyz"],
+                "transaction_blacklist_urls": ["https://public_shepherd.arweave.net"],
+                "mining_addr": "REPLACE_WITH_WALLET_ADDRESS",
+                "sync_jobs": 20,
+                "port": 1984,
+                "mine": false
+              }
+              EOFCFG
+
+
+              # Strip leading whitespace introduced by heredoc indentation
+              sed -i 's/^              //' /config/config.json
+
+
+              echo "==> [Stage 1] config.json written successfully"
+              cat /config/config.json
+
+
+              touch /config/.arweave-initialized
+              echo "==> [Stage 1] Init complete"
+          securityContext:
+            runAsUser: 0            # busybox writes to /config volume; root ensures write permission
+          volumeMounts:
+            - name: arweave-config
+              mountPath: /config
+
+
+      # ── Main Container ─────────────────────────────────────
+      containers:
+        - name: arweave
+          # TODO: Replace with your ACR image after building and pushing:
+          #   docker build -t arweave-custom:2.9.5.1 .
+          #   docker tag arweave-custom:2.9.5.1 <ACR_NAME>.azurecr.io/arweave-custom:2.9.5.1
+          #   az acr login --name <ACR_NAME>
+          #   docker push <ACR_NAME>.azurecr.io/arweave-custom:2.9.5.1
+          image: "<ACR_NAME>.azurecr.io/arweave-custom:2.9.5.1"  # TODO: replace with your ACR image ref
+          # ── Security Context ─────────────────────────────────
+          securityContext:
+            runAsUser: 0            # Arweave Erlang binary requires root (no non-root image available)
+            runAsNonRoot: false     # Explicitly permitted — matches pod-level securityContext
+          # ── Args (from docker run command) ──────────────────
+          # Dockerfile ENTRYPOINT: /opt/arweave/bin/arweave
+          # docker run cmd:        foreground config_file /config/config.json
+          args:
+            - foreground            # Start Arweave in foreground (keeps container alive)
+            - config_file           # Instructs the node to load config from a file
+            - /config/config.json   # Path to config file written by init-config container
+          # ── Ports ────────────────────────────────────────────
+          ports:
+            - name: arweave         # Combined HTTP API + P2P port
+              containerPort: 1984   # Arweave always listens on 1984 (set via "port" in config.json)
+              protocol: TCP
+          # ── Environment Variables (from docker run + Dockerfile ENV) ──
+          env:
+            - name: ARNODE
+              value: "arweave@127.0.0.1"  # Erlang node name — required for IPC between processes
+            - name: ARCOOKIE
+              value: "arweave"            # Erlang distribution cookie — internal cluster auth
+          # ── Volume Mounts ────────────────────────────────────
+          volumeMounts:
+            - name: arweave-data
+              mountPath: /data      # Chain indices, wallet file, block headers
+            - name: arweave-storage
+              mountPath: /storage   # Weave data / storage module partitions
+            - name: arweave-config
+              mountPath: /config    # config.json written by init-config
+          # ── Resource Requests & Limits ───────────────────────
+          # Based on docker run --memory=24g and hardware spec (8+ cores recommended)
+          resources:
+            requests:
+              cpu: "2"              # Guaranteed 2 vCPU — minimum for sync workload
+              memory: "8Gi"         # Guaranteed 8 GiB — hardware minimum spec
+            limits:
+              cpu: "8"              # Max burst — matches 8+ core recommended spec
+              memory: "24Gi"        # Hard cap — docker run --memory=24g (--memory-swap=24g)
+          # ── Health Probes ─────────────────────────────────────
+          # tcpSocket on port 1984 — Arweave takes several minutes to initialize
+          # and join the network; generous initialDelaySeconds avoids premature restarts.
+          readinessProbe:
+            tcpSocket:
+              port: 1984            # Ready when HTTP/P2P listener is accepting connections
+            initialDelaySeconds: 60  # 60s grace — Arweave initialization takes ~5-10 min
+            periodSeconds: 30
+            failureThreshold: 10    # 300s window before pod marked NotReady
+            successThreshold: 1
+          livenessProbe:
+            tcpSocket:
+              port: 1984            # Restart if listener dies (e.g., Prometheus bug crash in 2.9.5.1)
+            initialDelaySeconds: 600  # 10 min — allow full chain join before liveness kicks in
+            periodSeconds: 60
+            failureThreshold: 5     # 300s unresponsive → pod killed and restarted
+
+
+      # ── Volumes ─────────────────────────────────────────────
+      volumes:
+        - name: arweave-data
+          persistentVolumeClaim:
+            claimName: arweave-data         # 02-pvc.yaml: 500Gi Premium_LRS
+        - name: arweave-storage
+          persistentVolumeClaim:
+            claimName: arweave-storage      # 02-pvc.yaml: 4096Gi Premium_LRS
+        - name: arweave-config
+          persistentVolumeClaim:
+            claimName: arweave-config       # 02-pvc.yaml: 32Gi Premium_LRS
