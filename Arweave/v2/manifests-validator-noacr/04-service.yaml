@@ -2,20 +2,48 @@
 # 04-service.yaml
 # TWO Services:
 #   Service 1 — Headless ClusterIP (StatefulSet DNS)
-#   Service 2 — Internal LB (port 1984 — HTTP API + P2P)
+#   Service 2 — ClusterIP (in-cluster API access)
 #
 # NOTE: Arweave uses a single port 1984 for EVERYTHING:
 #       HTTP API, P2P gossip, CM cluster communication, VDF server.
-#       Only ONE LoadBalancer service needed (unlike multi-port chains).
+#       There is no separate P2P port to expose.
 #
-# CRITICAL: azure-load-balancer-internal MUST be on all LB services.
+# ── WHY THERE IS NO LoadBalancer HERE ──────────────────────
+# The internal LB (arweave-node-lb) was removed. It could not be
+# provisioned — the VNet subnet is out of addresses:
 #
-# UNCHANGED from the original except for one added field, marked
-# below (publishNotReadyAddresses) — see the note on Service 1.
+#   SyncLoadBalancerFailed  service/arweave-node-lb
+#   RESPONSE 400  ERROR CODE: SubnetIsFull
+#   "Subnet .../subnets/default-0 with address prefix
+#    10.202.17.192/27 does not have enough capacity for 1 IP
+#    addresses."
+#
+# A /27 is 32 addresses, 27 usable after Azure's 5 reserved, and
+# it is shared by the whole cluster. That is an infrastructure
+# capacity problem, not a manifest problem — no annotation or
+# retry fixes it. It also affects any other team that tries to
+# add an internal LB, so it is worth raising with whoever owns
+# the VNet rather than just working around it here.
+#
+# Nothing is lost by dropping it for now:
+#   - in-cluster consumers  -> use the ClusterIP below
+#   - jumpbox / ad-hoc      -> kubectl port-forward
+#   - Arweave peering       -> unaffected. An INTERNAL LB hands out
+#     an RFC1918 address that public Arweave peers could never dial
+#     anyway, so it never contributed to peering. The node joins
+#     and syncs over outbound connectivity, which still works.
+#
+# ── TO RESTORE IT once subnet capacity exists ──────────────
+# Append the block at the bottom of this file. Keep port 1984 on
+# both sides — the node advertises its CONFIGURED port to peers,
+# so a remapped frontend would advertise an address that does not
+# answer.
 # ============================================================
 
 
 # ── Service 1: Headless ────────────────────────────────────
+# Required by the StatefulSet for stable pod DNS:
+#   arweave-node-0.arweave-node.arweave.svc.cluster.local
 apiVersion: v1
 kind: Service
 metadata:
@@ -27,12 +55,10 @@ metadata:
     service-type: headless
 spec:
   clusterIP: None
-  # ADDED: readiness is gated on /recent, which returns 503 until the
-  # node has actually joined the network — a 5-15 minute window on
-  # first boot, longer if peers are slow. Without this the pod has NO
-  # DNS name during that window, which makes early debugging harder
-  # than it needs to be (kubectl exec + curl still works, but
-  # arweave-node-0.arweave-node.arweave.svc would not resolve).
+  # Readiness is gated on /recent, which returns 503 until the node
+  # has actually joined — 5-15 minutes on first boot, longer if peers
+  # are slow. Without this the pod has NO DNS name during that window,
+  # which makes early debugging harder than it needs to be.
   publishNotReadyAddresses: true
   selector:
     app: arweave-node
@@ -46,34 +72,28 @@ spec:
 ---
 
 
-# ── Service 2: Internal LoadBalancer — HTTP API + P2P ─────
-# Arweave uses port 1984 for both API queries and P2P peering.
-# Port-enable request required for port 1984 TCP (inbound + outbound).
+# ── Service 2: ClusterIP — in-cluster API access ───────────
+# Replaces the internal LoadBalancer. Consumes NO VNet address —
+# a ClusterIP is allocated from the cluster's service CIDR, so it
+# is unaffected by the full subnet.
 #
-# SCOPE NOTE: an internal LB hands out an RFC1918 VNet address, so
-# this provides API access only — Arweave peers live on the public
-# internet and cannot dial it. That is fine: a node with outbound-only
-# connectivity joins, syncs and validates correctly; the docs note all
-# nodes also poll peers outbound for new blocks. Inbound reachability
-# would only improve block-propagation latency and let this node serve
-# data back to the network.
+# Prefer this over the headless Service for anything that consumes
+# the node: the headless one sets publishNotReadyAddresses, so it
+# will hand out the pod IP while the node is still "not_joined" and
+# answering 503. This one only routes once readiness passes.
 #
-# If inbound peering is ever wanted, it needs a PUBLIC LB plus an NSG
-# rule for TCP 1984 — and the LB port MUST stay 1984, because the node
-# advertises its CONFIGURED port to peers. Do both or neither.
+#   http://arweave-node-api.arweave.svc.cluster.local:1984/info
 apiVersion: v1
 kind: Service
 metadata:
-  name: arweave-node-lb
+  name: arweave-node-api
   namespace: arweave
   labels:
     app: arweave-node
     blockchain: arweave-node
-    service-type: internal-lb
-  annotations:
-    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service-type: clusterip
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: arweave-node
   ports:
@@ -81,3 +101,35 @@ spec:
       port: 1984
       targetPort: 1984
       protocol: TCP
+
+
+# ============================================================
+# RESTORE-LATER BLOCK — uncomment only after the subnet has free
+# addresses. Verify first:
+#   az network vnet subnet show \
+#     --resource-group AZRG-ALL-ITS-VNET-SYS \
+#     --vnet-name VNET-CUS-COINIAAKSDEV-10.202.17.192-27 \
+#     --name default-0 \
+#     --query "{prefix:addressPrefix,used:length(ipConfigurations)}"
+# ============================================================
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: arweave-node-lb
+#   namespace: arweave
+#   labels:
+#     app: arweave-node
+#     blockchain: arweave-node
+#     service-type: internal-lb
+#   annotations:
+#     service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+# spec:
+#   type: LoadBalancer
+#   selector:
+#     app: arweave-node
+#   ports:
+#     - name: http-p2p
+#       port: 1984
+#       targetPort: 1984
+#       protocol: TCP

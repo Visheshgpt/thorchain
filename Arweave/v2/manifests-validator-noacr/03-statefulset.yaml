@@ -136,14 +136,51 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
 
       # ── Node placement ──────────────────────────────────────
-      # Measured capacity: 5x Standard_D2s_v3, ~1900m / ~5810Mi
-      # allocatable each. Free right now:
-      #   node1 340m/1394Mi   node2 420m/1224Mi   node3 333m/894Mi
-      #   node4 740m/3266Mi  <-- the only node this pod fits
-      #   node5  13m/2098Mi  (CPU exhausted at 99%)
-      # Requests below (500m/2Gi) leave node4 240m/1218Mi spare.
-      # No nodeSelector: with one viable node, pinning would only
-      # turn a reschedule into a permanent Pending.
+      # *** REQUIRES A DEDICATED NODE POOL. MEASURED, NOT ASSUMED. ***
+      #
+      # This was tried on the shared Standard_D2s_v3 pool (~1900m /
+      # ~5810Mi allocatable, ~2544Mi already committed) at 500m/2Gi
+      # request with a 4Gi limit. It did not merely fail — it took
+      # the node down with it. Two consecutive evictions:
+      #
+      #   Evicted: node was low on resource: memory.
+      #     threshold 100Mi, available 2240Ki
+      #     container was using 3039124Ki (2.90 GiB), request 2Gi
+      #   Evicted: ... available 13960Ki
+      #     container was using 3772536Ki (3.60 GiB), request 2Gi
+      #
+      # Note what that says: the container never reached its own 4Gi
+      # limit. It exhausted the NODE first, leaving 2.2 MiB free, and
+      # the kubelet evicted the biggest over-request offender — us.
+      # Other teams' pods were next.
+      #
+      # Note also that 2.90 -> 3.60 GiB was still CLIMBING when it was
+      # killed. That is not the working set, it is a lower bound on it.
+      # Arweave holds the whole block index (~1.98M blocks) plus the
+      # account tree in memory regardless of storage_modules, which is
+      # why the documented floor is 8GB and why no amount of tuning
+      # reaches 2Gi. The vm.args patch above removed real
+      # container-hostile overhead and was worth doing — it just
+      # cannot shrink the working set itself.
+      #
+      # Create the pool BEFORE applying this file:
+      #   az aks nodepool add \
+      #     --resource-group azrg-cus-coinia-dev \
+      #     --cluster-name cuscoiniadevaks \
+      #     --name arweave --node-count 1 \
+      #     --node-vm-size Standard_D8s_v3 --node-osdisk-size 128 \
+      #     --labels workload=arweave \
+      #     --node-taints workload=arweave:NoSchedule
+      #
+      # The taint keeps other workloads off it; the toleration below
+      # is what lets this pod on. Both are required.
+      nodeSelector:
+        workload: arweave
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: arweave
+          effect: NoSchedule
 
       initContainers:
         # ── Download, verify and install the Arweave release ────
@@ -335,19 +372,30 @@ spec:
             # /tmp, /dev/shm) is a mounted volume.
             readOnlyRootFilesystem: true
 
+          # Sized from Arweave's documented floor ("1GB of RAM per
+          # partition being mined - with a MINIMUM of 8GB"), not from
+          # what we wished would fit. The 500m/2Gi attempt evicted the
+          # node twice at 2.90 and 3.60 GiB while still climbing.
+          #
+          # request 8Gi is the RESERVATION that stops this pod from
+          # ever again being scheduled somewhere it cannot survive.
+          # On a Standard_D8s_v3 (~7900m / ~26Gi allocatable) it fits
+          # with ample room.
+          #
+          # limit 16Gi, not the 24Gi of their bare-metal docker run:
+          # still generous headroom above the observed 3.6 GiB, while
+          # leaving the node enough margin that a runaway cannot
+          # trigger node-level eviction the way 4Gi did here.
+          #
+          # NO cpu limit, on purpose — CFS throttling stalls block
+          # validation and makes the node fall behind while still
+          # looking healthy. Their docker run sets no --cpus either.
           resources:
             requests:
-              cpu: "500m"
-              memory: "2Gi"
+              cpu: "1"
+              memory: "8Gi"
             limits:
-              memory: "4Gi"
-              # NO cpu limit, on purpose. CFS throttling stalls block
-              # validation and makes the node fall behind while still
-              # looking healthy. The team's docker run sets no --cpus
-              # either.
-              #
-              # 2Gi is BELOW Arweave's documented 8GB floor — the
-              # deliberate trade to fit node4. Watch for OOMKilled.
+              memory: "16Gi"
 
           # startup on /info: returns 200 as soon as the listener is
           # up, even before joining (reports "height": -1, "current":
