@@ -1,0 +1,381 @@
+# ============================================================
+# 03-statefulset.yaml
+# ConfigMap: arweave-node-config  |  StatefulSet: arweave-node
+# Replicas: 1 | Namespace: arweave
+#
+# Images:  alpine:3.19 (init) + ubuntu:22.04 (main) — BOTH PUBLIC
+# Release: Arweave N.2.9.5.1 (latest stable, 2026-04-02)
+#
+# NO ACR REQUIRED. The init container downloads the official
+# release tarball from GitHub, verifies its SHA256, and extracts
+# it onto the existing PVC. The main container runs it from there.
+#
+# Node type: Validator (official Arweave term) — joins, validates,
+#            serves the HTTP API + GraphQL. Stores NO weave data.
+#            Mining disabled. Matches the team's bare-metal Docker
+#            node in Arweave/v1/docker-setup.md.
+#
+# Port: 1984 TCP — HTTP API, P2P gossip, VDF and Prometheus all
+#       share ONE port. Arweave has no separate P2P port.
+#
+# ── STORAGE: one PVC, two subPaths ─────────────────────────
+#   arweave-data-pvc
+#   ├── app/    -> /opt/arweave   binary   (read-only in main)
+#   └── chain/  -> /data          data_dir
+#
+# ── WHY NOT bin/start ──────────────────────────────────────
+# bin/start is a bash `while true` loop that does NOT exec and
+# has NO trap handlers. As PID 1 it swallows SIGTERM, so the pod
+# is always SIGKILLed at the grace deadline — and the docs warn
+# "if you kill the node abruptly it can cause rocksdb corruption
+# that can be difficult to recover from." Its 15s restart loop
+# also hides crashes from Kubernetes.
+# bin/arweave foreground execs erlexec -> beam.smp, so the Erlang
+# VM is PID 1 and SIGTERM reaches it directly.
+#
+# ── WHY NO apt-get ─────────────────────────────────────────
+# The release bundles its own ERTS and precompiled NIFs. Their
+# DT_NEEDED across every ELF resolves to exactly: libc6,
+# libgcc-s1, libstdc++6, libssl3(libcrypto.so.3), libtinfo6,
+# zlib1g, libsystemd0 — ALL already present in ubuntu:22.04.
+# Installing packages would require root (blocked by Gatekeeper),
+# make every pod start depend on Ubuntu archives, and make the
+# pod non-deterministic. ubuntu:22.04 is NOT interchangeable:
+# 20.04/bullseye ship libcrypto.so.1.1 and will NOT work.
+# ============================================================
+
+
+# ── ConfigMap: node configuration ──────────────────────────
+# Byte-for-byte the config.json from Arweave/v1/docker-setup.md,
+# with two AKS-forced changes:
+#   + log_dir   — default is a RELATIVE path into the install dir,
+#                 which is read-only here
+#   - mining_addr — inert at mine:false; a placeholder would be a
+#                 FATAL parse error (must be exactly 43 chars)
+#
+# WARNING: an unknown JSON key is FATAL. ar_config.erl ends its
+# parser with parse_options([Opt|_], _) -> {error, unknown, Opt}.
+# One typo = CrashLoopBackOff. This is the team's own "Issue 3",
+# where "mining" instead of "mine" produced:
+#   Failed to parse config: unknown: {<<"mining">>,false}
+# Treat this schema as CLOSED.
+#
+# Editing this ConfigMap does NOT restart the pod. Always follow
+# with: kubectl rollout restart statefulset/arweave-node -n arweave
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arweave-node-config
+  namespace: arweave
+  labels:
+    app: arweave-node
+    blockchain: arweave-node
+    environment: non-prod
+data:
+  config.json: |
+    {
+      "peers": [
+        "asia.peers.arweave.xyz",
+        "europe.peers.arweave.xyz",
+        "india.peers.arweave.xyz",
+        "north-america.peers.arweave.xyz",
+        "oceania.peers.arweave.xyz",
+        "peers.arweave.xyz"
+      ],
+      "data_dir": "/data",
+      "log_dir": "/var/log/arweave",
+      "vdf_server_trusted_peers": ["vdf-server-3.arweave.xyz"],
+      "transaction_blacklist_urls": ["https://public_shepherd.arweave.net"],
+      "sync_jobs": 20,
+      "port": 1984,
+      "mine": false
+    }
+
+
+---
+# ── StatefulSet ────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: arweave-node
+  namespace: arweave
+  labels:
+    app: arweave-node
+    blockchain: arweave-node
+    component: blockchain-node
+spec:
+  serviceName: arweave-node
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arweave-node
+  template:
+    metadata:
+      labels:
+        app: arweave-node
+        blockchain: arweave-node
+        component: blockchain-node
+    spec:
+      enableServiceLinks: false
+
+      # RocksDB must close cleanly or a resync is required. 600s,
+      # not the 60s default — shutdown is documented as slow.
+      terminationGracePeriodSeconds: 600
+
+      securityContext:
+        # Non-root throughout. Gatekeeper / Azure Policy on this
+        # cluster forbids root containers — and this works only
+        # because nothing here installs packages. UID 1025 matches
+        # thornode and mantra on this cluster.
+        runAsUser: 1025
+        runAsGroup: 1025
+        runAsNonRoot: true
+        fsGroup: 1025
+        # NOT the default "Always", which recursively chowns every
+        # mounted volume on every pod start.
+        fsGroupChangePolicy: OnRootMismatch
+
+      # ── Node placement ──────────────────────────────────────
+      # Measured capacity: 5x Standard_D2s_v3, ~1900m / ~5810Mi
+      # allocatable each. Free right now:
+      #   node1 340m/1394Mi   node2 420m/1224Mi   node3 333m/894Mi
+      #   node4 740m/3266Mi  <-- the only node this pod fits
+      #   node5  13m/2098Mi  (CPU exhausted at 99%)
+      # Requests below (500m/2Gi) leave node4 240m/1218Mi spare.
+      # No nodeSelector: with one viable node, pinning would only
+      # turn a reschedule into a permanent Pending.
+
+      initContainers:
+        # ── Download, verify and install the Arweave release ────
+        # alpine:3.19 already ships busybox wget, tar, sha256sum
+        # AND ca-certificates-bundle, so nothing is installed and
+        # this runs happily as non-root. It never RUNS the Arweave
+        # binary, so musl vs glibc is irrelevant here.
+        - name: install-arweave
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              VERSION="2.9.5.1"
+              TAG="N.2.9.5.1"
+              ASSET="arweave-${VERSION}.ubuntu22.x86_64.tar.gz"
+              # From the release's checksums.txt — verified against
+              # the real asset before shipping this manifest.
+              SHA="dcacd52be21cb6b00da438a762fc5b352d1afa410608039d5255901916bc968f"
+
+              ROOT="/opt/arweave"
+              DEST="${ROOT}/${VERSION}"
+
+              # -- idempotency, KEYED ON VERSION ------------------
+              # Version-stamped, so bumping VERSION actually installs
+              # the new release. An unversioned guard (e.g.
+              # `if [ -f /data/app/bin/start ]`) silently skips
+              # forever and makes upgrades impossible.
+              if [ -x "${DEST}/bin/arweave" ]; then
+                echo "[init] ${VERSION} already installed — skipping download"
+              else
+                echo "[init] downloading ${ASSET}"
+                rm -rf "${DEST}.partial"
+                mkdir -p "${DEST}.partial"
+
+                # ASSET NAME: no "N." prefix (that is only in the git
+                # tag), and there is NO generic linux-x86_64 build —
+                # it was dropped after 2.9.5-alpha4. Both mistakes
+                # produce a 404.
+                wget -q -O "${ROOT}/${ASSET}" \
+                  "https://github.com/ArweaveTeam/arweave/releases/download/${TAG}/${ASSET}"
+
+                echo "[init] verifying sha256"
+                echo "${SHA}  ${ROOT}/${ASSET}" | sha256sum -c -
+
+                # The tarball extracts FLAT — bin/ lib/ releases/
+                # erts-14.2.5.11/ genesis_data/ — with no wrapper
+                # directory. DO NOT add --strip-components; it would
+                # shred the layout and bin/arweave would not exist.
+                echo "[init] extracting"
+                tar -xzf "${ROOT}/${ASSET}" -C "${DEST}.partial"
+                rm -f "${ROOT}/${ASSET}"
+
+                # Arweave CI packaging bug: two members carry absolute
+                # paths (/home/runner/actions-runner/...), so tar
+                # strips the leading "/" and creates a junk ./home
+                # tree. Unused at runtime.
+                rm -rf "${DEST}.partial/home"
+
+                # Rename last, so an interrupted install can never
+                # look complete to the guard above.
+                mv "${DEST}.partial" "${DEST}"
+                echo "[init] installed ${VERSION}"
+              fi
+
+              # -- container tuning -------------------------------
+              # Upstream ships +sbwt very_long, which makes the Erlang
+              # schedulers busy-wait: ~100% CPU at idle inside a
+              # cgroup and CFS throttling during real work. Upstream's
+              # own vm.args.src carries the fix, commented out:
+              #   "## Uncomment the following line if running in a
+              #    ## container.  +sbwt none"
+              # Idempotent — the grep guards re-runs.
+              VMARGS="${DEST}/releases/${VERSION}/vm.args.src"
+              if grep -q '^+sbwt very_long' "${VMARGS}"; then
+                sed -i \
+                  -e 's/^+sbwt very_long/+sbwt none/' \
+                  -e 's/^+sbwtdcpu very_long/+sbwtdcpu none/' \
+                  -e 's/^+sbwtdio very_long/+sbwtdio none/' \
+                  "${VMARGS}"
+                echo "[init] patched vm.args.src -> +sbwt none"
+              fi
+
+              # -- stable path for the main container -------------
+              # The StatefulSet execs /opt/arweave/current/bin/arweave,
+              # so an upgrade is just this symlink moving. bin/arweave
+              # resolves its own root with `pwd -P`, so the symlink is
+              # transparent to it.
+              ln -sfn "${DEST}" "${ROOT}/current"
+
+              echo "[init] ready:"
+              ls -la "${ROOT}/"
+              "${ROOT}/current/bin/arweave" version || true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            readOnlyRootFilesystem: true
+          # MUST stay under the main container's requests. A pod's
+          # effective request is max(init, sum of app containers) —
+          # a greedier init would raise the pod request and it would
+          # stop fitting on node4.
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { memory: "512Mi" }
+          volumeMounts:
+            - name: arweave-data
+              mountPath: /opt/arweave
+              subPath: app
+
+      containers:
+        - name: arweave-node
+          image: ubuntu:22.04
+          imagePullPolicy: IfNotPresent
+
+          # No shell wrapper — the binary is PID 1 and receives
+          # SIGTERM itself. OTP's erl_signal_handler maps SIGTERM to
+          # init:stop() -> ar:prep_stop/1 -> clean RocksDB close.
+          command: ["/opt/arweave/current/bin/arweave"]
+          args:
+            - foreground
+            - config_file
+            - /etc/arweave/config.json
+
+          env:
+            # bin/arweave regenerates releases/<vsn>/vm.args from
+            # vm.args.src on EVERY invocation (including `stop`).
+            # Redirect that write so the install stays immutable.
+            # The directory must ALREADY EXIST — bin/arweave tests
+            # [ -d "$RELX_OUT_FILE_PATH" ] and SILENTLY falls back if
+            # not, leaving an unexpanded "${ARNAME:-...}" literal in
+            # vm.args that ERTS cannot parse. The emptyDir guarantees it.
+            - { name: RELX_OUT_FILE_PATH, value: /run/arweave }
+            # bin/arweave does `cd $ROOTDIR` before exec, and that
+            # directory is read-only here — without this, a VM crash
+            # would also fail to write its crash dump.
+            - { name: ERL_CRASH_DUMP, value: /tmp/erl_crash.dump }
+
+          ports:
+            - name: http-p2p
+              containerPort: 1984      # Single port: HTTP API + P2P gossip
+              protocol: TCP
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            # Safe: nothing installs packages, and every write target
+            # (/data, /opt/arweave, /run/arweave, /var/log/arweave,
+            # /tmp, /dev/shm) is a mounted volume.
+            readOnlyRootFilesystem: true
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              memory: "4Gi"
+              # NO cpu limit, on purpose. CFS throttling stalls block
+              # validation and makes the node fall behind while still
+              # looking healthy. The team's docker run sets no --cpus
+              # either.
+              #
+              # 2Gi is BELOW Arweave's documented 8GB floor — the
+              # deliberate trade to fit node4. Watch for OOMKilled.
+
+          # startup on /info: returns 200 as soon as the listener is
+          # up, even before joining (reports "height": -1, "current":
+          # "not_joined"). Generous threshold because ar_info's ETS
+          # lookup can 500 briefly during boot.
+          startupProbe:
+            httpGet: { path: /info, port: http-p2p }
+            periodSeconds: 10
+            failureThreshold: 90
+            timeoutSeconds: 5
+
+          # readiness on /recent, NOT /info. /info answers 200
+          # unconditionally, so probing it would mark the pod Ready
+          # while still "not_joined". /recent is gated on
+          # ar_node:is_joined() — 503 until genuinely joined.
+          readinessProbe:
+            httpGet: { path: /recent, port: http-p2p }
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+
+          # NO livenessProbe, deliberately. Restarting a node that is
+          # merely behind does not help it catch up, and each restart
+          # risks interrupting a RocksDB compaction. A wedged node
+          # still surfaces: readiness fails and the pod goes 0/1.
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/opt/arweave/current/bin/arweave", "stop"]
+
+          volumeMounts:
+            # chain data -> data_dir
+            - name: arweave-data
+              mountPath: /data
+              subPath: chain
+            # the release, READ-ONLY — a running node has no business
+            # modifying its own installation
+            - name: arweave-data
+              mountPath: /opt/arweave
+              subPath: app
+              readOnly: true
+            - { name: config,  mountPath: /etc/arweave, readOnly: true }
+            - { name: runtime, mountPath: /run/arweave }
+            - { name: logs,    mountPath: /var/log/arweave }
+            - { name: tmp,     mountPath: /tmp }
+            - { name: dshm,    mountPath: /dev/shm }
+
+      volumes:
+        # THE EXISTING CLAIM — nothing new is provisioned.
+        - name: arweave-data
+          persistentVolumeClaim:
+            claimName: arweave-data-pvc
+        - name: config
+          configMap:
+            name: arweave-node-config
+        - name: runtime
+          emptyDir: { sizeLimit: 8Mi }
+        - name: logs
+          emptyDir: { sizeLimit: 512Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+        # The team's docker run uses --shm-size=4g; Kubernetes (like
+        # Docker) defaults /dev/shm to 64 MB. medium: Memory is a
+        # tmpfs and is CHARGED AGAINST the 4Gi limit above, so 256Mi
+        # (4x the default) leaves 3.75Gi for the Erlang heap.
+        # Raise this only together with the memory limit.
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi

@@ -1,57 +1,46 @@
-# =============================================================================
-# Storage classes for the NO-ACR profile.
+# ============================================================
+# 01-storageclass.yaml
+# Azure Disk StorageClass — provisioner: disk.csi.azure.com
+# reclaimPolicy: Retain | volumeBindingMode: WaitForFirstConsumer
 #
-# Two classes, because this profile has two very different volumes:
-#   arweave-datadir -- Premium SSD for the chain data_dir (write-heavy RocksDB)
-#   arweave-bin     -- cheapest possible, for the ~250 MB extracted Arweave
-#                      release. Read-once at startup, then idle.
+# UNCHANGED — this is the existing class, already applied.
+# Re-applying it is a no-op.
 #
-# WHY THE BINARY GETS A DISK AT ALL (rather than an emptyDir):
-#   An emptyDir would re-download 52 MB from github.com on EVERY pod start.
-#   That is fine once, but during an OOMKill or eviction loop it becomes a
-#   download loop against GitHub, and it means a GitHub outage blocks the pod
-#   from starting at all. A tiny persistent disk removes both problems: the
-#   binary is fetched once and survives every restart.
+# NOTE: StorageClass `parameters` are IMMUTABLE. skuName cannot be
+#       switched in place; changing it needs a new class + new PVC
+#       + a full resync. Not worth it here — see below.
 #
-# cachingMode: ReadOnly on the binary volume -- unlike the data volume, this
-# one genuinely IS read-mostly, so host caching helps here and hurts there.
+# skuName: StandardSSD_LRS is the right call for this node.
+#   StandardSSD_LRS  baseline 500 IOPS / 60 MB/s, FLAT across almost
+#                    all disk sizes (growing the disk buys capacity,
+#                    not speed). No single-instance SLA.
+#   Premium_LRS      IOPS scale with size (P10 500 -> P30 5000),
+#                    100-200 MB/s, consistent low latency, 99.9%
+#                    single-instance SLA. Roughly 2x the cost.
 #
-# reclaimPolicy: Delete on the binary volume, NOT Retain. It holds no state --
-# everything on it can be re-downloaded from GitHub in 30 seconds. Retaining
-# it would just accumulate orphaned 4 GiB disks you have to clean up by hand.
-# The data volume keeps Retain, because that one IS irreplaceable.
-# =============================================================================
----
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: arweave-datadir
-  labels:
-    app.kubernetes.io/part-of: arweave-node
-    app.kubernetes.io/managed-by: kubectl
-provisioner: disk.csi.azure.com
-parameters:
-  skuName: Premium_LRS
-  cachingMode: None
-reclaimPolicy: Retain
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
+#   This profile stores NO weave data (no storage_modules), so the
+#   write load is just block headers — roughly one block every two
+#   minutes plus the backfill. That is nowhere near 500 IOPS, so
+#   Standard SSD is not a bottleneck here.
+#
+#   It WOULD be a bottleneck for an archive node: RocksDB compaction
+#   across multi-TB storage modules will saturate 500 IOPS. If weave
+#   partitions are ever added, put THOSE on a separate Premium class
+#   rather than trying to change this one.
+# ============================================================
 
----
+
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: arweave-bin
+  name: arweave-storage
   labels:
-    app.kubernetes.io/part-of: arweave-node
-    app.kubernetes.io/managed-by: kubectl
+    app: arweave-node
+    blockchain: arweave-node
+    environment: non-prod
 provisioner: disk.csi.azure.com
 parameters:
-  skuName: StandardSSD_LRS
-  cachingMode: ReadOnly
-reclaimPolicy: Delete
+  skuName: StandardSSD_LRS             # Standard SSD — default SKU for this cluster
+reclaimPolicy: Retain                  # NEVER Delete — blockchain data is irreplaceable
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: true
-# NOTE: do NOT add mountOptions with `noexec` here. The Arweave binary is
-# EXECUTED from this volume -- a noexec mount would fail with "Permission
-# denied" on exec, which reads like a file-permission bug and is not one.

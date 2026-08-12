@@ -1,0 +1,83 @@
+# ============================================================
+# 04-service.yaml
+# TWO Services:
+#   Service 1 — Headless ClusterIP (StatefulSet DNS)
+#   Service 2 — Internal LB (port 1984 — HTTP API + P2P)
+#
+# NOTE: Arweave uses a single port 1984 for EVERYTHING:
+#       HTTP API, P2P gossip, CM cluster communication, VDF server.
+#       Only ONE LoadBalancer service needed (unlike multi-port chains).
+#
+# CRITICAL: azure-load-balancer-internal MUST be on all LB services.
+#
+# UNCHANGED from the original except for one added field, marked
+# below (publishNotReadyAddresses) — see the note on Service 1.
+# ============================================================
+
+
+# ── Service 1: Headless ────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: arweave-node
+  namespace: arweave
+  labels:
+    app: arweave-node
+    blockchain: arweave-node
+    service-type: headless
+spec:
+  clusterIP: None
+  # ADDED: readiness is gated on /recent, which returns 503 until the
+  # node has actually joined the network — a 5-15 minute window on
+  # first boot, longer if peers are slow. Without this the pod has NO
+  # DNS name during that window, which makes early debugging harder
+  # than it needs to be (kubectl exec + curl still works, but
+  # arweave-node-0.arweave-node.arweave.svc would not resolve).
+  publishNotReadyAddresses: true
+  selector:
+    app: arweave-node
+  ports:
+    - name: http-p2p
+      port: 1984
+      targetPort: 1984
+      protocol: TCP
+
+
+---
+
+
+# ── Service 2: Internal LoadBalancer — HTTP API + P2P ─────
+# Arweave uses port 1984 for both API queries and P2P peering.
+# Port-enable request required for port 1984 TCP (inbound + outbound).
+#
+# SCOPE NOTE: an internal LB hands out an RFC1918 VNet address, so
+# this provides API access only — Arweave peers live on the public
+# internet and cannot dial it. That is fine: a node with outbound-only
+# connectivity joins, syncs and validates correctly; the docs note all
+# nodes also poll peers outbound for new blocks. Inbound reachability
+# would only improve block-propagation latency and let this node serve
+# data back to the network.
+#
+# If inbound peering is ever wanted, it needs a PUBLIC LB plus an NSG
+# rule for TCP 1984 — and the LB port MUST stay 1984, because the node
+# advertises its CONFIGURED port to peers. Do both or neither.
+apiVersion: v1
+kind: Service
+metadata:
+  name: arweave-node-lb
+  namespace: arweave
+  labels:
+    app: arweave-node
+    blockchain: arweave-node
+    service-type: internal-lb
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: arweave-node
+  ports:
+    - name: http-p2p
+      port: 1984
+      targetPort: 1984
+      protocol: TCP

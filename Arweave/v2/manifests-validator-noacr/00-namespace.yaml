@@ -1,7 +1,15 @@
+# ============================================================
+# 00-namespace.yaml
+# Creates the dedicated Kubernetes namespace for arweave-node
+# Apply this first, before any other manifest
+# ============================================================
+
+
 apiVersion: v1
 kind: Namespace
 metadata:
   name: arweave
   labels:
-    app.kubernetes.io/part-of: arweave-node
-    app.kubernetes.io/managed-by: kubectl
+    app: arweave-node
+    managed-by: manifest-generator
+    environment: non-prod

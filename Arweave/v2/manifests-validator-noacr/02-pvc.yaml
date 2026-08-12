@@ -1,0 +1,56 @@
+# ============================================================
+# 02-pvc.yaml
+# PersistentVolumeClaim — single /data volume
+# StorageClass: arweave-storage | Size: 200Gi
+# pvc-watcher will auto-expand at 80% up to 2000Gi
+#
+# UNCHANGED — this is the existing PVC, already applied.
+# Re-applying it is a no-op. NOTHING NEW IS PROVISIONED.
+#
+# ── HOW THIS ONE DISK IS SHARED ─────────────────────────────
+# The StatefulSet mounts this single claim TWICE, via subPath,
+# so the Arweave install and the chain data never overlap:
+#
+#   arweave-data-pvc
+#   ├── app/    -> mounted at /opt/arweave   (the release binary)
+#   └── chain/  -> mounted at /data          (data_dir)
+#
+# The official docs are explicit: "There should be no overlap
+# between the install directory and your data_dir." Two subPaths
+# on one claim satisfies that without a second Azure Disk.
+#
+# ── SIZING NOTE ─────────────────────────────────────────────
+# 200Gi sits right at the documented floor — Arweave docs say
+# "The minimum recommended size for the data_dir is 256GB", and
+# the team's own hardware table says "200 GB SSD minimum /
+# 500+ GB NVMe recommended".
+#
+# It is workable here because this profile stores no weave data,
+# and pvc-watcher auto-expands at 80%. Register it if you have
+# not already (RUNBOOK section 10.2):
+#   "arweave|arweave-node-0|/data|arweave-data-pvc|80|200|2000"
+#
+# Watch one thing: max_disk_pool_buffer_mb is left at its real
+# default of 100000 (100 GB) for parity with the docker node.
+# The disk pool only fills with chunks POSTed to this node, and
+# nothing posts to it behind an internal LB — but on a 200Gi
+# disk that default is half the volume. If /data ever climbs
+# unexpectedly, cap it in the ConfigMap before growing the disk.
+# ============================================================
+
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arweave-data-pvc
+  namespace: arweave
+  labels:
+    app: arweave-node
+    environment: non-prod
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: arweave-storage
+  resources:
+    requests:
+      storage: 200Gi
