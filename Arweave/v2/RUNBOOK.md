@@ -8,25 +8,33 @@ This is a first deployment — nothing here deletes or migrates an existing node
 
 ---
 
-## 0. Two profiles — pick one
+## 0. Three profiles — pick one
 
-Same image, same namespace, same binary. They differ **only in configuration**.
+Same Arweave release, same namespace, same `config.json`. They differ in **how the binary is delivered** and **how much weave data is stored**.
 
-| | `manifests-validator/` | `manifests-archive/` |
-|---|---|---|
-| Matches | **`Arweave/v1/docker-setup.md` exactly** | What you originally asked for |
-| `storage_modules` | none | `0,unpacked`, `1,unpacked` |
-| Weave data stored | **none** | 2 partitions (~4 TB actual) |
-| Disks | 1 × 500Gi | 1 × 1Ti + 2 × 4Ti |
-| Requests | **500m / 2Gi** (sized to node4) | 2 CPU / 8Gi (needs a new pool) |
-| Memory limit | 4Gi | 24Gi |
-| Time to useful | 5–15 min | days–weeks per partition |
-| Est. disk cost | ~$70/mo | ~$800/mo, ×55 for a full archive |
-| Fits current cluster | yes, **on node4 only** | no |
+| | `manifests-validator-noacr/` | `manifests-validator/` | `manifests-archive/` |
+|---|---|---|---|
+| Binary delivery | init container → PVC | custom ACR image | custom ACR image |
+| **Needs ACR?** | **no** | yes | yes |
+| Images | `alpine:3.19` + `ubuntu:22.04` (public) | your ACR | your ACR |
+| Matches `docker-setup.md` | yes | yes | no (adds storage) |
+| `storage_modules` | none | none | `0,unpacked`, `1,unpacked` |
+| Weave data | none | none | 2 partitions (~4 TB) |
+| Disks | 500Gi + 4Gi | 1 × 500Gi | 1Ti + 2 × 4Ti |
+| Requests | 500m / 2Gi | 500m / 2Gi | 2 CPU / 8Gi |
+| Memory limit | 4Gi | 4Gi | 24Gi |
+| Fits current cluster | yes, **node4 only** | yes, **node4 only** | no — needs a new pool |
+| Est. disk cost | ~$70/mo | ~$70/mo | ~$800/mo (×55 for full) |
 
-**Start with `manifests-validator/`.** It's a straight port of the node your team already proved out, so if it misbehaves the problem is the AKS wrapper, not Arweave. Switching to the archive profile later is `kubectl apply -f ../manifests-archive/` over the top — the data PVC only grows (500Gi → 1Ti, expandable in place).
+### Which one
 
-Everything below applies to both; where they differ it's called out.
+**`manifests-validator-noacr/` — start here if the ACR permission is blocked.** `az acr build` needs `Microsoft.ContainerRegistry/registries/scheduleRun/action` (effectively Contributor on the registry). If that's denied, this profile deploys today using only public images. Section 3b.
+
+**`manifests-validator/`** — same node, cleaner supply chain. Move to it once the ACR permission lands. Switching is a drop-in: identical ConfigMap, Services, and data PVC.
+
+**`manifests-archive/`** — what you originally asked for. Won't fit the current cluster and is a budget conversation (section 2).
+
+Everything below applies to all three; where they differ it's called out.
 
 ---
 
@@ -158,6 +166,41 @@ Select-String -Path .\manifests\04-statefulset.yaml -Pattern 'image:'
 
 ---
 
+## 3b. No-ACR path — nothing to build
+
+If `az acr build` returns `AuthorizationFailed` on `scheduleRun`, **skip section 3 entirely**. That error is RBAC on your identity, so Cloud Shell and the portal hit the same wall — they use the same identity, and current Cloud Shell has no Docker daemon either.
+
+`manifests-validator-noacr/` needs no registry. An init container (`alpine:3.19`) downloads the official release tarball, verifies its SHA256, extracts it to a small PVC, and the main container (`ubuntu:22.04`) runs it from there. Both images are public.
+
+**No image reference to edit** — go straight to section 5 with `cd .\Arweave\v2\manifests-validator-noacr`.
+
+Two prerequisites:
+
+```powershell
+# 1. The cluster must reach github.com on 443 (first boot only; cached after).
+kubectl run egress-test --image=alpine:3.19 --restart=Never -n default --rm -it -- `
+  wget -q --spider https://github.com/ArweaveTeam/arweave/releases && echo REACHABLE
+
+# 2. Public images must be pullable (no registry allow-list blocking docker.io).
+kubectl run pull-test --image=ubuntu:22.04 --restart=Never -n default --rm -it -- echo OK
+```
+
+If either fails, the no-ACR path won't work and the ACR permission request (section 3) is the only route.
+
+**Verified against the real artifact**, so these won't surprise you at runtime:
+
+| Check | Result |
+|---|---|
+| Asset URL | `arweave-2.9.5.1.ubuntu22.x86_64.tar.gz` → HTTP 200 |
+| SHA256 | matches the manifest exactly |
+| Layout | flat: `bin/ lib/ releases/ erts-14.2.5.11/ genesis_data/` — so **no `--strip-components`** |
+| Packaging bug | 2 absolute-path members under `/home/runner/...` → the init container's `rm -rf home` |
+| `vm.args.src` | present at `releases/2.9.5.1/vm.args.src`; the `+sbwt` patch matches lines 93/96/99 |
+
+**Trade-offs to accept:** first boot depends on GitHub; the binary isn't scanned by your registry pipeline; two public base images to keep current. Prefer the ACR profile once you can.
+
+---
+
 ## 4. Cluster prerequisites
 
 ### 4.1 Node pool — check this before anything else
@@ -191,9 +234,10 @@ Default posture is outbound-only (internal LB), which works fine. If you uncomme
 ## 5. Deploy
 
 ```powershell
-# Pick ONE profile — see section 0. Validator = parity with the team's node.
-cd .\Arweave\v2\manifests-validator
-# cd .\Arweave\v2\manifests-archive
+# Pick ONE profile — see section 0.
+cd .\Arweave\v2\manifests-validator-noacr   # no ACR needed  <-- start here if blocked
+# cd .\Arweave\v2\manifests-validator       # ACR image
+# cd .\Arweave\v2\manifests-archive         # ACR image + weave partitions
 
 kubectl apply -f 00-namespace.yaml
 kubectl apply -f 01-storageclass.yaml
@@ -346,6 +390,10 @@ kubectl exec -n arweave arweave-0 -- cat /etc/arweave/config.json
 | Node "Running" but stuck | No liveness probe by design | See below |
 | `Peer [IP]:1984 is not available.` repeating, never joins | **DNS** — every `peers` entry is a hostname. Pod can't resolve `*.arweave.xyz` | Uncomment `dnsConfig` in `04-statefulset.yaml`. Test: `kubectl exec -n arweave arweave-0 -- getent hosts peers.arweave.xyz` |
 | `randomx_alloc_cache failed` | On bare metal this means hugepages; **on AKS it means memory** | Raise the memory limit. Do **not** add `enable randomx_large_pages` — AKS nodes have no hugepages and you can't sysctl them without a privileged DaemonSet |
+| **no-ACR:** `Init:CrashLoopBackOff` | Init container failed — usually no egress to github.com, or a wrong asset name | `kubectl logs -n arweave arweave-0 -c install-arweave`. Asset is `arweave-<ver>.ubuntu22.x86_64.tar.gz` — **no `N.` prefix** in the filename (only in the tag), and there is **no** generic `linux-x86_64` build |
+| **no-ACR:** `sha256sum: WARNING: 1 computed checksum did NOT match` | Truncated download or wrong `SHA` for the version | Working as designed — it refused a bad binary. Re-check `SHA` against the release's `checksums.txt` |
+| **no-ACR:** main container `exec ... permission denied` | The binary PVC mounted `noexec`, or init never completed | `kubectl exec -n arweave arweave-0 -c arweave -- ls -la /opt/arweave/current/bin/`. Do not add `noexec` to `mountOptions` on the `arweave-bin` StorageClass |
+| **no-ACR:** `no such file or directory` on `/opt/arweave/current/bin/arweave` | Init skipped or the symlink is stale | `kubectl exec -n arweave arweave-0 -- ls -la /opt/arweave/` — expect a version dir plus `current ->` pointing at it |
 | `badarg` in `ets:lookup` for `prometheus_gauge_table`, or `[os_mon] cpu supervisor port (cpu_sup): Erlang has closed` | Known 2.9.5.1 instability — the team hit this on bare metal (their Issues 4 & 11) | See "2.9.5.1 instability" below |
 
 **Diagnostics:**
@@ -480,6 +528,41 @@ curl.exe -s http://localhost:1984/info | ConvertFrom-Json | Select-Object releas
 ```
 
 > The `COPY vm.args.src /opt/arweave/releases/${ARWEAVE_VERSION}/vm.args.src` path is version-stamped — the `ARWEAVE_VERSION` build-arg keeps it correct. If a future release also changes upstream's `vm.args.src`, re-diff ours against it rather than carrying ours forward blind.
+
+---
+
+## 12b. Upgrade — no-ACR profile
+
+The install directory is **version-stamped** and the pod runs a symlink, so an upgrade is a two-line edit:
+
+```
+/opt/arweave/2.9.5.1/          <- extracted release
+/opt/arweave/current -> 2.9.5.1  <- what the StatefulSet execs
+```
+
+In `04-statefulset.yaml`, inside the init container script, change `VERSION` and `SHA` (get the new checksum from the release's `checksums.txt`):
+
+```sh
+VERSION="2.9.6"
+SHA="<sha256-from-checksums.txt>"
+```
+
+```powershell
+kubectl apply -f 04-statefulset.yaml
+kubectl rollout status statefulset/arweave -n arweave --timeout=30m
+kubectl exec -n arweave arweave-0 -- /opt/arweave/current/bin/arweave version
+```
+
+The init container downloads the new version alongside the old one, then moves the symlink. The 4Gi binary PVC has room for both — that's what the headroom is for.
+
+**Rollback** is a symlink flip, no download:
+
+```powershell
+kubectl exec -n arweave arweave-0 -- ln -sfn /opt/arweave/2.9.5.1 /opt/arweave/current
+kubectl rollout restart statefulset/arweave -n arweave
+```
+
+> This works *because* the guard is `if [ -x "${DEST}/bin/arweave" ]` with `DEST` containing `${VERSION}`. The broken pattern this replaces used an unversioned path (`if [ -f /data/app/bin/start ]`), which meant bumping the version in the manifest did nothing — the guard saw the old binary and skipped forever.
 
 ---
 

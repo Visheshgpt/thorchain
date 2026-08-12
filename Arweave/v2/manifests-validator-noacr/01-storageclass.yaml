@@ -1,0 +1,57 @@
+# =============================================================================
+# Storage classes for the NO-ACR profile.
+#
+# Two classes, because this profile has two very different volumes:
+#   arweave-datadir -- Premium SSD for the chain data_dir (write-heavy RocksDB)
+#   arweave-bin     -- cheapest possible, for the ~250 MB extracted Arweave
+#                      release. Read-once at startup, then idle.
+#
+# WHY THE BINARY GETS A DISK AT ALL (rather than an emptyDir):
+#   An emptyDir would re-download 52 MB from github.com on EVERY pod start.
+#   That is fine once, but during an OOMKill or eviction loop it becomes a
+#   download loop against GitHub, and it means a GitHub outage blocks the pod
+#   from starting at all. A tiny persistent disk removes both problems: the
+#   binary is fetched once and survives every restart.
+#
+# cachingMode: ReadOnly on the binary volume -- unlike the data volume, this
+# one genuinely IS read-mostly, so host caching helps here and hurts there.
+#
+# reclaimPolicy: Delete on the binary volume, NOT Retain. It holds no state --
+# everything on it can be re-downloaded from GitHub in 30 seconds. Retaining
+# it would just accumulate orphaned 4 GiB disks you have to clean up by hand.
+# The data volume keeps Retain, because that one IS irreplaceable.
+# =============================================================================
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arweave-datadir
+  labels:
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+  cachingMode: None
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arweave-bin
+  labels:
+    app.kubernetes.io/part-of: arweave-node
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: StandardSSD_LRS
+  cachingMode: ReadOnly
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+# NOTE: do NOT add mountOptions with `noexec` here. The Arweave binary is
+# EXECUTED from this volume -- a noexec mount would fail with "Permission
+# denied" on exec, which reads like a file-permission bug and is not one.
