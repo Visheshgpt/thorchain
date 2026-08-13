@@ -46,12 +46,19 @@
 
 
 # ── ConfigMap: node configuration ──────────────────────────
-# Byte-for-byte the config.json from Arweave/v1/docker-setup.md,
-# with two AKS-forced changes:
+# The config.json from Arweave/v1/docker-setup.md, with three changes:
 #   + log_dir   — default is a RELATIVE path into the install dir,
-#                 which is read-only here
+#                 which is read-only here. AKS-forced.
 #   - mining_addr — inert at mine:false; a placeholder would be a
 #                 FATAL parse error (must be exactly 43 chars)
+#   + max_disk_pool_buffer_mb: 2000 — the REAL default is 100000
+#                 (100 GB). That is the buffer for chunks POSTed to
+#                 this node, held inside data_dir. On the 64Gi PVC
+#                 used here it could fill the whole volume. Nothing
+#                 posts to a node behind a ClusterIP, so this is tail
+#                 risk rather than likely — but 2 GB removes it for
+#                 free. Verified valid in ar_config.erl; raise it if
+#                 this node is ever exposed for uploads.
 #
 # WARNING: an unknown JSON key is FATAL. ar_config.erl ends its
 # parser with parse_options([Opt|_], _) -> {error, unknown, Opt}.
@@ -87,6 +94,7 @@ data:
       "vdf_server_trusted_peers": ["vdf-server-3.arweave.xyz"],
       "transaction_blacklist_urls": ["https://public_shepherd.arweave.net"],
       "sync_jobs": 20,
+      "max_disk_pool_buffer_mb": 2000,
       "port": 1984,
       "mine": false
     }
@@ -168,9 +176,15 @@ spec:
       #     --resource-group azrg-cus-coinia-dev \
       #     --cluster-name cuscoiniadevaks \
       #     --name arweave --node-count 1 \
-      #     --node-vm-size Standard_D8s_v3 --node-osdisk-size 128 \
+      #     --node-vm-size Standard_E2s_v5 --node-osdisk-size 64 \
       #     --labels workload=arweave \
       #     --node-taints workload=arweave:NoSchedule
+      #
+      # Standard_E2s_v5 = 2 vCPU / 16 GiB, ~13 GiB allocatable.
+      # Memory-optimized, which is what this workload actually needs.
+      # A D4s_v6 would cost ~50% more for the same 16 GiB just to add
+      # cores this node will never use. Standard_E2as_v5 (AMD) is the
+      # same shape and usually slightly cheaper if quota allows.
       #
       # The taint keeps other workloads off it; the toleration below
       # is what lets this pod on. Both are required.
@@ -374,28 +388,48 @@ spec:
 
           # Sized from Arweave's documented floor ("1GB of RAM per
           # partition being mined - with a MINIMUM of 8GB"), not from
-          # what we wished would fit. The 500m/2Gi attempt evicted the
+          # what we hoped would fit. The 500m/2Gi attempt evicted the
           # node twice at 2.90 and 3.60 GiB while still climbing.
           #
-          # request 8Gi is the RESERVATION that stops this pod from
-          # ever again being scheduled somewhere it cannot survive.
-          # On a Standard_D8s_v3 (~7900m / ~26Gi allocatable) it fits
-          # with ample room.
+          # MINIMAL SIZING — this is a proof-of-concept node that will
+          # be torn down once syncing is demonstrated. Production gets
+          # its own build. Sized to run, not to run fast.
           #
-          # limit 16Gi, not the 24Gi of their bare-metal docker run:
-          # still generous headroom above the observed 3.6 GiB, while
-          # leaving the node enough margin that a runaway cannot
-          # trigger node-level eviction the way 4Gi did here.
+          # TUNED FOR Standard_E2s_v5 (2 vCPU / 16 GiB, ~13 GiB
+          # allocatable). E-series is MEMORY-OPTIMIZED: 8 GiB per vCPU
+          # instead of the D-series' 4. That matches the actual
+          # bottleneck here — a validator with no storage_modules does
+          # no chunk syncing, therefore no RandomX unpack/pack (the
+          # CPU-heavy part), and takes VDF from vdf-server-3 rather
+          # than computing its own. 2 vCPU is genuinely enough; paying
+          # for 4 cores just to reach 16 GiB is waste.
+          #
+          #   request 4Gi -- the node is tainted and dedicated, so
+          #                  nothing competes. The request only has to
+          #                  guarantee scheduling; over-reserving buys
+          #                  nothing on a single-tenant node.
+          #   limit   8Gi -- THE number that matters. 2.2x the observed
+          #                  3.6 GiB peak, and it leaves ~5 GiB on the
+          #                  node so our own pod can never trigger the
+          #                  node-level eviction that killed the last
+          #                  attempt. This is the safety margin, not
+          #                  an allocation -- unused memory is not
+          #                  billed differently.
+          #
+          # The 3.6 GiB figure was measured mid-climb, not at plateau,
+          # so 8Gi is a deliberate cushion over an unknown. If it ever
+          # OOMKills, the fix is to raise THIS number first (up to
+          # ~10Gi on this node), not to buy a bigger VM.
           #
           # NO cpu limit, on purpose — CFS throttling stalls block
           # validation and makes the node fall behind while still
           # looking healthy. Their docker run sets no --cpus either.
           resources:
             requests:
-              cpu: "1"
-              memory: "8Gi"
+              cpu: "500m"
+              memory: "4Gi"
             limits:
-              memory: "16Gi"
+              memory: "8Gi"
 
           # startup on /info: returns 200 as soon as the listener is
           # up, even before joining (reports "height": -1, "current":

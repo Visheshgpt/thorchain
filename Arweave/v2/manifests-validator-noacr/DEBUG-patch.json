@@ -1,0 +1,59 @@
+{
+  "_comment": [
+    "TEMPORARY DEBUG OVERLAY -- NOT a deployment config. Do not leave this applied.",
+    "",
+    "Purpose: get the main container to actually START on the existing shared pool,",
+    "long enough to capture Arweave's own startup logs, WITHOUT repeating the node",
+    "eviction. We still have never seen a single line from the arweave-node container.",
+    "",
+    "It does two things:",
+    "",
+    "1. Removes nodeSelector + tolerations, so the pod can land on node4 while the",
+    "   dedicated pool does not exist yet.",
+    "",
+    "2. Sets memory limit EQUAL to memory request (2560Mi).",
+    "   This is the safety mechanism. Previously request=2Gi / limit=4Gi made the pod",
+    "   Burstable: it grew to 3.6 GiB, overran its request by the largest margin of",
+    "   anything on the node, and the kubelet evicted it -- taking node4 down to 2.2 MiB",
+    "   free and endangering other teams' pods. Eviction also DELETES the pod, which is",
+    "   why 'kubectl logs --previous' returned 'not found'.",
+    "",
+    "   With limit == request the container is OOMKilled by its own cgroup at 2560Mi.",
+    "   It can never exceed its request, so its eviction score stays <= 0 and the node",
+    "   is never starved. The pod object SURVIVES an OOMKill, so --previous logs work.",
+    "",
+    "   Expect roughly 40-60 seconds of runtime before the OOMKill -- it reached 2.9 GiB",
+    "   last time. That is enough to prove: binary executes, config.json parses, the",
+    "   HTTP listener binds 1984, and the join begins. It is NOT enough to sync.",
+    "",
+    "No CPU limit is set: CPU limits cause CFS throttling and are irrelevant to the",
+    "memory eviction we are guarding against.",
+    "",
+    "APPLY:",
+    "  kubectl patch statefulset arweave-node -n arweave --type=strategic --patch-file DEBUG-patch.json",
+    "REVERT (do this as soon as you have the logs):",
+    "  kubectl apply -f 03-statefulset.yaml"
+  ],
+  "spec": {
+    "template": {
+      "spec": {
+        "nodeSelector": null,
+        "tolerations": null,
+        "containers": [
+          {
+            "name": "arweave-node",
+            "resources": {
+              "requests": {
+                "cpu": "500m",
+                "memory": "2560Mi"
+              },
+              "limits": {
+                "memory": "2560Mi"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

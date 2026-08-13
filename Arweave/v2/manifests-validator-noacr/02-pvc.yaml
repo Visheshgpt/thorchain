@@ -53,4 +53,25 @@ spec:
   storageClassName: arweave-storage
   resources:
     requests:
-      storage: 200Gi
+      # 64Gi — MINIMAL, sized for a proof-of-concept node that will be
+      # torn down once syncing is demonstrated.
+      #
+      # The docs' "256GB minimum" assumes a node backfilling the full
+      # header set and running for months. This one stores NO weave
+      # data (no storage_modules) and backfills headers at the default
+      # header_sync_jobs: 1 — the reference node sits at 208 blocks.
+      # Actual consumption over a few weeks is single-digit GB:
+      #   block index      ~172 MB
+      #   block headers    ~1-2 KB each, accumulating slowly
+      #   RocksDB overhead a few GB
+      #   disk pool        capped at 2 GB in the ConfigMap (see below)
+      #
+      # Azure bills StandardSSD in tiers, so this matters: 64Gi lands
+      # in E6 (~$5/mo) where 200Gi lands in E15/256GiB (~$19/mo).
+      # allowVolumeExpansion is true on the StorageClass, so this can
+      # grow online if it ever fills — it cannot shrink, which is the
+      # other reason to start small.
+      #
+      # >>> PRODUCTION should use 500Gi-1Ti per the official guidance.
+      #     This value is for the throwaway validation node only.
+      storage: 64Gi
