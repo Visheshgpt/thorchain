@@ -75,7 +75,23 @@ spec:
   type: LoadBalancer
   selector:
     app: thornode
+  # nodePort is PINNED, not auto-allocated.
+  #
+  # The Azure internal LB cannot be provisioned here -- the AKS subnet
+  # (10.202.17.192/27) is full, so EXTERNAL-IP stays <pending>. But a
+  # LoadBalancer Service still allocates NodePorts and kube-proxy still
+  # programs them, so the node is reachable at <any-node-ip>:<nodePort>
+  # today, consuming ZERO subnet addresses.
+  #
+  # Left auto-allocated, these numbers are reassigned at random if the
+  # Service is ever deleted and recreated -- breaking every URL handed
+  # to consumers. Pinned to the values already in use so they survive.
+  #
+  # Type stays LoadBalancer so the IP appears automatically if subnet
+  # capacity is ever freed. The cost is a SyncLoadBalancerFailed event
+  # every ~4 min; switch to type: NodePort to silence it, keeping these
+  # same nodePort values.
   ports:
-    - { name: rpc,  port: 27147, targetPort: 27147, protocol: TCP }
-    - { name: rest, port: 1317,  targetPort: 1317,  protocol: TCP }
-    - { name: grpc, port: 9090,  targetPort: 9090,  protocol: TCP }
+    - { name: rpc,  port: 27147, targetPort: 27147, nodePort: 30399, protocol: TCP }
+    - { name: rest, port: 1317,  targetPort: 1317,  nodePort: 32210, protocol: TCP }
+    - { name: grpc, port: 9090,  targetPort: 9090,  nodePort: 30609, protocol: TCP }

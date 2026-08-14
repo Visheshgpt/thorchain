@@ -2,8 +2,46 @@
 
 
 **Namespace:** `thorchain` | **Chain:** `thorchain-1` | **Sync:** Snapshot sync (Liquify `mainnet-pruned`) via `thornode`
-**Internal LB — RPC/API:** ⚠️ `<pending>` — subnet exhausted, see Issue 9
-**Status:** ✅ Running — syncing from snapshot block `27,356,957` (2026-08-10)
+**Status:** ✅ Running — restored from Liquify pruned snapshot
+
+
+### ⚠️ Internal LB is `<pending>` — use the NodePort endpoint for testing
+
+
+The Azure internal LoadBalancer cannot be provisioned: the AKS subnet
+`10.202.17.192/27` is full (`SubnetIsFull`, see Issue 9). **This does not block access.**
+A LoadBalancer Service still allocates NodePorts, and kube-proxy programs them on every
+node — so the node is reachable today at a node IP, consuming **zero** subnet addresses.
+
+
+**Use these for testing:**
+
+
+| Service | Endpoint |
+|---|---|
+| CometBFT RPC | `http://10.202.17.198:30399` |
+| REST / LCD API | `http://10.202.17.198:32210` |
+| gRPC | `10.202.17.198:30609` |
+
+
+```powershell
+curl.exe -s --max-time 20 http://10.202.17.198:30399/status
+curl.exe -s --max-time 20 http://10.202.17.198:32210/thorchain/lastblock
+```
+
+
+> **`10.202.17.198` is a NODE IP, not a service IP.** It survives reboots but **not**
+> node replacement — AKS node-image upgrades, autoscaler scale-down, VMSS reimage and
+> auto-repair all replace the VM and it takes a new address. Re-read it any time with
+> `kubectl get nodes -o wide`, and note that **any** node IP in the cluster works, not
+> just this one (`externalTrafficPolicy` defaults to `Cluster`, so kube-proxy forwards
+> to the pod wherever it runs). Hand consumers the full node list, not one address.
+>
+> The NodePort numbers **are** stable — they are pinned in `05-service.yaml`
+> (`30399` / `32210` / `30609`), so a Service recreate cannot reassign them.
+>
+> In-cluster consumers should ignore all of this and use
+> `http://thornode.thorchain.svc.cluster.local:1317`, which is permanently stable.
 
 
 ---
@@ -559,10 +597,93 @@ filename is simply where THORChain routes handler errors.
 ## 6. Verification — curl Commands
 
 
-> The Internal LB is `<pending>` (Issue 9). Use port-forward or in-cluster DNS.
+> The Internal LB is `<pending>` (Issue 9). Use the **NodePort** endpoint below — it is
+> the primary access path today. Port-forward and in-cluster DNS also work.
 
 
-### Port-forward (jumpbox)
+### 6.1 NodePort — the endpoint to give consumers
+
+
+Reachable from anywhere in the VNet. No LB, no subnet IP required.
+
+
+| Service | Port | NodePort | Endpoint |
+|---|---|---|---|
+| CometBFT RPC | 27147 | **30399** | `http://10.202.17.198:30399` |
+| REST / LCD | 1317 | **32210** | `http://10.202.17.198:32210` |
+| gRPC | 9090 | **30609** | `10.202.17.198:30609` |
+
+
+**Always pass `--max-time`.** CometBFT's RPC shares a lock with block execution, so
+`/status` can block for minutes during catch-up and an unbounded `curl` will appear to
+hang — that is not a connectivity failure.
+
+
+```powershell
+# is it alive?
+curl.exe -s --max-time 20 http://10.202.17.198:30399/health
+
+# sync state — the number that matters
+curl.exe -s --max-time 20 http://10.202.17.198:30399/status | ConvertFrom-Json | ForEach-Object result | ForEach-Object sync_info | Select-Object latest_block_height, latest_block_time, catching_up
+
+# peers — 0 means it will never sync
+curl.exe -s --max-time 20 http://10.202.17.198:30399/net_info | ConvertFrom-Json | ForEach-Object result | Select-Object n_peers
+
+# THORChain REST
+curl.exe -s --max-time 20 http://10.202.17.198:32210/thorchain/lastblock
+curl.exe -s --max-time 20 http://10.202.17.198:32210/thorchain/version
+curl.exe -s --max-time 20 http://10.202.17.198:32210/thorchain/pools
+curl.exe -s --max-time 20 http://10.202.17.198:32210/thorchain/inbound_addresses
+```
+
+
+**Is the data fresh?** Consumers must check this before trusting any response — a
+catching-up node answers happily with days-old state:
+
+
+```powershell
+$local  = (curl.exe -s --max-time 20 http://10.202.17.198:30399/status | ConvertFrom-Json).result.sync_info.latest_block_height
+$remote = (curl.exe -s "https://gateway.liquify.com/chain/thorchain_rpc/status" | ConvertFrom-Json).result.sync_info.latest_block_height
+"local=$local  network=$remote  behind=$([int]$remote - [int]$local)"
+```
+
+
+Under ~100 blocks behind is current. Thousands means it is still catching up.
+
+
+**If a NodePort stops answering** — the node was probably replaced and its IP changed.
+Get the current list; any node in the cluster serves the same NodePorts:
+
+
+```powershell
+kubectl get nodes -o wide
+kubectl get nodes -o jsonpath="{range .items[*]}{.status.addresses[?(@.type=='InternalIP')].address}{'\n'}{end}"
+```
+
+
+Distinguish a blocked port from a slow app — a hang is usually an NSG, not the node:
+
+
+```powershell
+Test-NetConnection -ComputerName 10.202.17.198 -Port 30399
+```
+
+
+`TcpTestSucceeded : False` → an NSG is blocking the NodePort range 30000-32767 inside
+the VNet. Prove the Service itself is healthy from inside the cluster:
+
+
+```powershell
+kubectl get svc thornode-rpc -n thorchain
+kubectl get endpoints thornode-rpc -n thorchain
+```
+
+
+`ENDPOINTS` must list a pod IP. If it says `<none>`, the pod is not Ready and no endpoint
+will work.
+
+
+### 6.2 Port-forward (jumpbox only)
 
 
 ```powershell
@@ -1099,15 +1220,22 @@ Confirm all five **before** starting — three of them cannot be fixed once you 
 ## Node Endpoint Summary
 
 
-| Endpoint | Type | Address |
-|---|---|---|
-| P2P | Pod-only (outbound) | `27146` — no Service; a full node needs only outbound |
-| RPC | Internal LB | `<pending>` — Issue 9. Use `svc/thornode:27147` |
-| REST API | Internal LB | `<pending>` — Issue 9. Use `svc/thornode:1317` |
-| gRPC | Internal LB | `<pending>` — Issue 9. Use `svc/thornode:9090` |
-| Metrics | ClusterIP | `http://thornode.thorchain.svc.cluster.local:26660/metrics` |
-| Headless DNS | Cluster-internal | `thornode-0.thornode-headless.thorchain.svc.cluster.local` |
-| ClusterIP | Cluster-internal | `thornode.thorchain.svc.cluster.local` |
+| Endpoint | Type | Address | Stable? |
+|---|---|---|---|
+| **RPC** | **NodePort** | **`http://10.202.17.198:30399`** | port yes, node IP no |
+| **REST API** | **NodePort** | **`http://10.202.17.198:32210`** | port yes, node IP no |
+| **gRPC** | **NodePort** | **`10.202.17.198:30609`** | port yes, node IP no |
+| RPC / REST / gRPC | Internal LB | `<pending>` — `SubnetIsFull`, Issue 9 | — |
+| P2P | Pod-only (outbound) | `27146` — no Service; a full node needs only outbound | — |
+| Metrics | ClusterIP | `http://thornode.thorchain.svc.cluster.local:26660/metrics` | ✅ |
+| RPC / REST / gRPC (in-cluster) | ClusterIP | `http://thornode.thorchain.svc.cluster.local:27147` / `:1317` / `:9090` | ✅ |
+| Headless DNS | Cluster-internal | `thornode-0.thornode-headless.thorchain.svc.cluster.local` | ✅ — StatefulSet plumbing, do not hand out |
+
+
+**NodePorts are pinned** in `05-service.yaml` (`30399` / `32210` / `30609`), so a Service
+recreate cannot reassign them. **Node IPs are not** — any node in the cluster serves the
+same NodePorts, so distribute the whole list from `kubectl get nodes -o wide` rather than
+a single address.
 
 
 ## Reference
