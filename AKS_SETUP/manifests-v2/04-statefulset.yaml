@@ -264,13 +264,14 @@ spec:
             # Prometheus on :26660.
             - { name: THOR_TENDERMINT_INSTRUMENTATION_PROMETHEUS, value: "true" }
 
-            # Every peer costs memory (send/recv buffers per connection).
-            # On a 3Gi cap we trade catch-up parallelism for headroom:
-            # 8 outbound is enough to blocksync from, 4 inbound keeps
-            # strangers from eating the budget. Raise both to 40/40 if
-            # this ever lands on a dedicated node.
-            - { name: THOR_TENDERMINT_P2P_MAX_NUM_OUTBOUND_PEERS, value: "8" }
-            - { name: THOR_TENDERMINT_P2P_MAX_NUM_INBOUND_PEERS,  value: "4" }
+            # Raised from 8/4 after two blocksync stalls. The original
+            # low values were to protect the 3Gi cap, but measurement
+            # showed the node sitting at 1.6Gi of 3Gi with 10 peers --
+            # memory was never the constraint. A larger pool gives
+            # blocksync more block sources to fall back on when one
+            # goes quiet.
+            - { name: THOR_TENDERMINT_P2P_MAX_NUM_OUTBOUND_PEERS, value: "20" }
+            - { name: THOR_TENDERMINT_P2P_MAX_NUM_INBOUND_PEERS,  value: "10" }
 
             # ---- EXTERNAL_IP: intentionally absent -------------
             # Setting EXTERNAL_IP makes render-config advertise
@@ -386,10 +387,45 @@ spec:
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 4
-          # No livenessProbe. Restarting a node that is behind does not
-          # help it catch up, and killing it mid-compaction risks
-          # LevelDB corruption. Watch height with the README commands
-          # and restart deliberately.
+          # HEIGHT-PROGRESS liveness probe.
+          #
+          # There was no liveness probe here originally, on the
+          # reasoning that restarting a node which is merely BEHIND
+          # does not help it catch up. That is still true -- but it
+          # left a node which is STALLED with nothing to recover it,
+          # and CometBFT's blocksync reactor stalls in practice: this
+          # node hung twice in four days, each time with healthy peers,
+          # correct app hashes, 45m CPU and 1.6Gi of 3Gi in use. It
+          # simply stopped requesting the next block.
+          #
+          # So the probe checks PROGRESS, not liveness of a socket.
+          # v1's tcpSocket-on-p2p probe stayed green through a 5-day
+          # freeze because the listener never closed; this cannot.
+          #
+          # It restarts only when the height has not moved across three
+          # consecutive 10-minute checks -- a 30-minute stall. While
+          # catching up the node does ~21 blocks/min, so a false
+          # positive is not plausible. If a very long LevelDB
+          # compaction ever trips it, raise failureThreshold rather
+          # than deleting the probe.
+          #
+          # /tmp is writable by UID 1025 and is emptyDir-free (container
+          # filesystem), so the counter resets naturally on restart.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  H=$(curl -s --max-time 10 http://localhost:27147/status \
+                      | jq -r .result.sync_info.latest_block_height)
+                  P=$(cat /tmp/last_height 2>/dev/null || echo 0)
+                  echo "$H" > /tmp/last_height
+                  [ -n "$H" ] && [ "$H" != "null" ] && [ "$H" -gt "$P" ]
+            initialDelaySeconds: 1800
+            periodSeconds: 600
+            timeoutSeconds: 20
+            failureThreshold: 3
 
           volumeMounts:
             - { name: thornode-data, mountPath: /data }
