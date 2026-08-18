@@ -361,6 +361,51 @@ spec:
               echo "[init] effective emulator flags:"
               grep -E '^\+' "${VMARGS}" 2>/dev/null | sed 's/^/         /' || echo "         (vm.args.src not found — using release defaults)"
 
+              # -- CA certificates --------------------------------
+              # ROOT CAUSE OF THE ORIGINAL CRASH LOOP. ubuntu:22.04
+              # ships every shared library Arweave needs but does NOT
+              # ship ca-certificates. Erlang's TLS resolves its trust
+              # store via pubkey_os_cacerts:get/0, which reads the OS
+              # bundle; with no bundle it returns `undefined` and gun
+              # dies with:
+              #   {badmatch,undefined}
+              #     {pubkey_os_cacerts,get,0,...}
+              #     {gun,ensure_tls_opts,3,...}
+              #     {gun,initial_tls_handshake,3,...}
+              #
+              # Arweave makes exactly ONE https call -- fetching
+              # transaction_blacklist_urls from
+              # https://public_shepherd.arweave.net:443. That crash
+              # repeats on a timer, gun_conns_sup restarts the child
+              # until it exceeds max restart intensity, and then the
+              # SUPERVISOR ITSELF dies. gun_conns_sup owns every gun
+              # connection, including the PLAIN-HTTP peer connections,
+              # so after that every peer request fails with
+              #   {noproc,{gen_server,call,[gun_conns_sup,...]}}
+              # which surfaces as "Peer x.x.x.x:1984 is not available"
+              # and then the prometheus badarg cascade.
+              #
+              # So the peer failures were a SYMPTOM. Outbound TCP 1984
+              # was never blocked -- verified from a pod:
+              #   wget -T 10 http://peers.arweave.xyz:1984/info
+              #     -> {"network":"arweave.N.1","peers":498,...}
+              #
+              # The fix: alpine DOES ship ca-certificates-bundle in its
+              # base image (which is how this very container downloaded
+              # the release over https a few lines above). Copy that
+              # bundle onto the shared volume; the main container mounts
+              # it at /etc/ssl/certs/ca-certificates.crt, which is the
+              # FIRST path pubkey_os_cacerts checks on Linux.
+              #
+              # Cheaper than adding a package install, and it keeps the
+              # main container non-root with no apt dependency.
+              if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+                cp /etc/ssl/certs/ca-certificates.crt "${ROOT}/ca-certificates.crt"
+                echo "[init] CA bundle staged ($(wc -l < "${ROOT}/ca-certificates.crt") lines)"
+              else
+                echo "[init] WARNING: no CA bundle in the init image — TLS will fail"
+              fi
+
               # -- stable path for the main container -------------
               # The StatefulSet execs /opt/arweave/current/bin/arweave,
               # so an upgrade is just this symlink moving. bin/arweave
@@ -513,6 +558,22 @@ spec:
             - name: arweave-data
               mountPath: /opt/arweave
               subPath: app
+              readOnly: true
+            # CA trust store, staged by the init container from the
+            # alpine image. ubuntu:22.04 has NO ca-certificates, and
+            # without this Erlang's pubkey_os_cacerts:get/0 returns
+            # `undefined`, gun's TLS handshake crashes, and it takes
+            # gun_conns_sup down with it — which kills the plain-HTTP
+            # peer connections too. See the init container for the
+            # full chain.
+            #
+            # This exact path matters: it is the first entry in the
+            # list pubkey_os_cacerts checks on Linux. A single-FILE
+            # subPath mount, so it does not shadow the rest of
+            # /etc/ssl/certs.
+            - name: arweave-data
+              mountPath: /etc/ssl/certs/ca-certificates.crt
+              subPath: app/ca-certificates.crt
               readOnly: true
             - { name: config,  mountPath: /etc/arweave, readOnly: true }
             - { name: runtime, mountPath: /run/arweave }
