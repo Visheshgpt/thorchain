@@ -144,12 +144,20 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
 
       # ── Node placement ──────────────────────────────────────
-      # *** REQUIRES A DEDICATED NODE POOL. MEASURED, NOT ASSUMED. ***
+      # NO nodeSelector, NO tolerations, NO dedicated pool needed.
       #
-      # This was tried on the shared Standard_D2s_v3 pool (~1900m /
-      # ~5810Mi allocatable, ~2544Mi already committed) at 500m/2Gi
-      # request with a 4Gi limit. It did not merely fail — it took
-      # the node down with it. Two consecutive evictions:
+      # The cluster was rebuilt. The old pool -- 5x Standard_D2s_v6
+      # (8 GiB, ~5.8 GiB allocatable) running at ~90% memory, with the
+      # autoscaler already at max node group size -- is gone. It is now
+      # 3x Standard_D8s_v6 (8 vCPU / 32 GiB, ~7820m / ~30 GiB
+      # allocatable each). Measured free memory after the change:
+      #
+      #   vmss00000m  14222Mi used (47%)  -> ~15 GiB free
+      #   vmss00000n   9909Mi used (33%)  -> ~20 GiB free
+      #   vmss00000p   4126Mi used (13%)  -> ~25 GiB free
+      #
+      # That removes the constraint behind every earlier failure. For
+      # the record, what went wrong before:
       #
       #   Evicted: node was low on resource: memory.
       #     threshold 100Mi, available 2240Ki
@@ -157,44 +165,23 @@ spec:
       #   Evicted: ... available 13960Ki
       #     container was using 3772536Ki (3.60 GiB), request 2Gi
       #
-      # Note what that says: the container never reached its own 4Gi
-      # limit. It exhausted the NODE first, leaving 2.2 MiB free, and
-      # the kubelet evicted the biggest over-request offender — us.
-      # Other teams' pods were next.
+      # The container never reached its own 4Gi limit -- it exhausted
+      # the NODE first and the kubelet evicted the biggest
+      # over-request offender. And 2.90 -> 3.60 GiB was still CLIMBING
+      # when killed, so 3.6 GiB is a lower bound on the working set,
+      # not the peak. Arweave holds the whole block index (~1.98M
+      # blocks) plus the account tree in memory regardless of
+      # storage_modules; that is why the documented floor is 8GB.
       #
-      # Note also that 2.90 -> 3.60 GiB was still CLIMBING when it was
-      # killed. That is not the working set, it is a lower bound on it.
-      # Arweave holds the whole block index (~1.98M blocks) plus the
-      # account tree in memory regardless of storage_modules, which is
-      # why the documented floor is 8GB and why no amount of tuning
-      # reaches 2Gi. The vm.args patch above removed real
-      # container-hostile overhead and was worth doing — it just
-      # cannot shrink the working set itself.
+      # Today the WORST node has ~15 GiB free -- roughly 4x that lower
+      # bound -- so the pod is left schedulable on all three nodes.
+      # That is also more resilient than pinning: if a node is drained
+      # the pod simply moves, instead of going Pending with nowhere to
+      # go.
       #
-      # Create the pool BEFORE applying this file:
-      #   az aks nodepool add \
-      #     --resource-group azrg-cus-coinia-dev \
-      #     --cluster-name cuscoiniadevaks \
-      #     --name arweave --node-count 1 \
-      #     --node-vm-size Standard_E2s_v5 --node-osdisk-size 64 \
-      #     --labels workload=arweave \
-      #     --node-taints workload=arweave:NoSchedule
-      #
-      # Standard_E2s_v5 = 2 vCPU / 16 GiB, ~13 GiB allocatable.
-      # Memory-optimized, which is what this workload actually needs.
-      # A D4s_v6 would cost ~50% more for the same 16 GiB just to add
-      # cores this node will never use. Standard_E2as_v5 (AMD) is the
-      # same shape and usually slightly cheaper if quota allows.
-      #
-      # The taint keeps other workloads off it; the toleration below
-      # is what lets this pod on. Both are required.
-      nodeSelector:
-        workload: arweave
-      tolerations:
-        - key: workload
-          operator: Equal
-          value: arweave
-          effect: NoSchedule
+      # If this ever ends up sharing a node with another memory-hungry
+      # workload and starts getting evicted again, THEN add a labelled
+      # pool and reinstate a nodeSelector -- not before.
 
       initContainers:
         # ── Download, verify and install the Arweave release ────
@@ -395,41 +382,37 @@ spec:
           # be torn down once syncing is demonstrated. Production gets
           # its own build. Sized to run, not to run fast.
           #
-          # TUNED FOR Standard_E2s_v5 (2 vCPU / 16 GiB, ~13 GiB
-          # allocatable). E-series is MEMORY-OPTIMIZED: 8 GiB per vCPU
-          # instead of the D-series' 4. That matches the actual
-          # bottleneck here — a validator with no storage_modules does
-          # no chunk syncing, therefore no RandomX unpack/pack (the
-          # CPU-heavy part), and takes VDF from vdf-server-3 rather
-          # than computing its own. 2 vCPU is genuinely enough; paying
-          # for 4 cores just to reach 16 GiB is waste.
+          # TUNED FOR the rebuilt pool: Standard_D8s_v6, ~7820m CPU /
+          # ~30 GiB allocatable per node, with 15-25 GiB actually free.
           #
-          #   request 4Gi -- the node is tainted and dedicated, so
-          #                  nothing competes. The request only has to
-          #                  guarantee scheduling; over-reserving buys
-          #                  nothing on a single-tenant node.
-          #   limit   8Gi -- THE number that matters. 2.2x the observed
-          #                  3.6 GiB peak, and it leaves ~5 GiB on the
-          #                  node so our own pod can never trigger the
-          #                  node-level eviction that killed the last
-          #                  attempt. This is the safety margin, not
-          #                  an allocation -- unused memory is not
-          #                  billed differently.
+          #   request 1 CPU / 4Gi -- the scheduling reservation. Modest
+          #                  on purpose so the pod fits on any of the
+          #                  three nodes even as other workloads come
+          #                  and go.
+          #   limit      12Gi -- THE number that matters, and the one
+          #                  that failed last time at 4Gi. 3.3x the
+          #                  observed 3.6 GiB lower bound, and only
+          #                  ~40% of a node's allocatable memory, so
+          #                  this pod cannot starve the node the way
+          #                  it did on the old 8 GiB machines.
           #
-          # The 3.6 GiB figure was measured mid-climb, not at plateau,
-          # so 8Gi is a deliberate cushion over an unknown. If it ever
-          # OOMKills, the fix is to raise THIS number first (up to
-          # ~10Gi on this node), not to buy a bigger VM.
+          # 3.6 GiB was measured mid-climb, not at plateau, so the
+          # headroom above it is deliberate insurance against an
+          # unknown -- not an allocation. Unused memory costs nothing;
+          # a limit is a ceiling, not a reservation.
+          #
+          # If it ever OOMKills, raise THIS number first (there is room
+          # up to ~20Gi on these nodes) before touching anything else.
           #
           # NO cpu limit, on purpose — CFS throttling stalls block
           # validation and makes the node fall behind while still
           # looking healthy. Their docker run sets no --cpus either.
           resources:
             requests:
-              cpu: "500m"
+              cpu: "1"
               memory: "4Gi"
             limits:
-              memory: "8Gi"
+              memory: "12Gi"
 
           # startup on /info: returns 200 as soon as the listener is
           # up, even before joining (reports "height": -1, "current":
