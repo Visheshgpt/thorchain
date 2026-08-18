@@ -108,6 +108,53 @@
 #          ls -l /etc/ssl/certs/ca-certificates.crt
 # ############################################################
 #
+# ############################################################
+# ##  PEERS: North-America-first, individually named         ##
+# ############################################################
+#
+# The reference config used the six regional DNS pools
+# (asia/europe/india/north-america/oceania + global). Changed for
+# two measured reasons.
+#
+# 1. THE 503s. A test pod in this namespace hit a peer IP straight
+#    from the crash log:
+#      wget http://15.235.228.134:1984/info
+#      -> HTTP/1.1 503 Service Unavailable   in 0.19s
+#    190 ms, so the network is fast and the route is fine -- the
+#    PEER refused us. The same peers answered 200 OK from an
+#    unrelated network at the same moment, so they are healthy;
+#    they were rejecting THIS cluster's egress address.
+#
+#    All AKS egress shares one public IP. The node had been
+#    crash-looping for hours, re-probing ~30 peers on every restart,
+#    so that single address looked like a flood. Arweave nodes rate
+#    limit per IP (requests_per_minute_limit, default 900).
+#    Self-inflicted, and it clears with a cooldown -- which is why
+#    the rebuild procedure has a wait in it.
+#
+#    Arweave reports ANY non-200 as "Peer x.x.x.x is not available",
+#    which is what sent this investigation down a firewall
+#    rabbit-hole. It was never a firewall.
+#
+# 2. LATENCY BUDGET. Arweave probes trusted peers with
+#    `connect_timeout => 1000` -- ONE second -- and a 2s total
+#    request timeout (both visible in the crash log). This cluster
+#    is in centralus, so North American peers have the widest
+#    margin against those timeouts. Asia/Oceania peers add RTT and
+#    extra probe volume for no benefit here.
+#
+# Every hostname below was verified returning 200 OK at the same
+# chain height before being added. Naming individual servers rather
+# than only DNS pools means the node gets a known-good set instead
+# of whatever the pool happens to return.
+#
+# Full official list (all regions):
+#   https://docs.arweave.org/mining/overview/trusted-peers
+#   live status: https://status.arweave.xyz/
+#
+# If this node is ever redeployed outside the US, swap these for
+# the matching regional hostnames.
+#
 # ── ConfigMap: node configuration ──────────────────────────
 # The config.json from Arweave/v1/docker-setup.md, with three changes:
 #   + log_dir   — default is a RELATIVE path into the install dir,
@@ -145,11 +192,13 @@ data:
   config.json: |
     {
       "peers": [
-        "asia.peers.arweave.xyz",
-        "europe.peers.arweave.xyz",
-        "india.peers.arweave.xyz",
+        "dal-1.east.us.north-america.arweave.xyz",
+        "den-1.west.us.north-america.arweave.xyz",
+        "vin-1.east.us.north-america.arweave.xyz",
+        "pho-1.east.us.north-america.arweave.xyz",
+        "bhs-1.ca.north-america.arweave.xyz",
+        "van-1.ca.north-america.arweave.xyz",
         "north-america.peers.arweave.xyz",
-        "oceania.peers.arweave.xyz",
         "peers.arweave.xyz"
       ],
       "data_dir": "/data",
