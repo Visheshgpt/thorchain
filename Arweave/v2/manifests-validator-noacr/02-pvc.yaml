@@ -53,25 +53,23 @@ spec:
   storageClassName: arweave-storage
   resources:
     requests:
-      # 64Gi — MINIMAL, sized for a proof-of-concept node that will be
-      # torn down once syncing is demonstrated.
+      # 200Gi — matches the original TL manifest.
       #
-      # The docs' "256GB minimum" assumes a node backfilling the full
-      # header set and running for months. This one stores NO weave
-      # data (no storage_modules) and backfills headers at the default
-      # header_sync_jobs: 1 — the reference node sits at 208 blocks.
-      # Actual consumption over a few weeks is single-digit GB:
-      #   block index      ~172 MB
-      #   block headers    ~1-2 KB each, accumulating slowly
-      #   RocksDB overhead a few GB
-      #   disk pool        capped at 2 GB in the ConfigMap (see below)
+      # Actual consumption for THIS profile is single-digit GB: it
+      # stores no weave data (no storage_modules) and backfills block
+      # headers at the default header_sync_jobs: 1 — the reference
+      # node sits at ~208 blocks. So this is mostly headroom.
       #
-      # Azure bills StandardSSD in tiers, so this matters: 64Gi lands
-      # in E6 (~$5/mo) where 200Gi lands in E15/256GiB (~$19/mo).
-      # allowVolumeExpansion is true on the StorageClass, so this can
-      # grow online if it ever fills — it cannot shrink, which is the
-      # other reason to start small.
+      # Sizing notes if you ever want to change it:
+      #   - Azure bills StandardSSD in TIERS. 200Gi lands in E15
+      #     (256 GiB, ~$19/mo); 64Gi would land in E6 (~$5/mo). Asking
+      #     for less than a tier boundary saves nothing.
+      #   - allowVolumeExpansion is true on the StorageClass, so this
+      #     can grow online. It can NEVER shrink.
+      #   - The disk pool is capped at 2 GB in the ConfigMap; without
+      #     that cap its default is 100 GB, which would be half of
+      #     this volume.
       #
-      # >>> PRODUCTION should use 500Gi-1Ti per the official guidance.
-      #     This value is for the throwaway validation node only.
-      storage: 64Gi
+      # PRODUCTION guidance is 500Gi-1Ti for a data_dir that backfills
+      # the full header set and runs for months.
+      storage: 200Gi

@@ -1,3 +1,57 @@
+# BLOCKED: egress is filtered by FQDN, Arweave connects by IP
+
+The Kubernetes side is complete and working. The node cannot join the Arweave
+network because of a network egress policy, not a configuration problem.
+
+## Evidence (all from a pod inside the `arweave` namespace)
+
+Same destination IP, same port, only the Host header differs:
+
+```
+wget http://40.160.31.17:1984/info                                  -> HTTP 503   (0.02s)
+wget --header Host:vin-1.east.us.north-america.arweave.xyz
+     http://40.160.31.17:1984/info                                  -> HTTP 200
+```
+
+The same bare IP from outside this network returns **HTTP 200 in 0.64s**.
+
+The 503 arrives in **0.02 s — 30x faster than the real round trip**, so it is
+generated locally by an egress proxy / firewall, not by the Arweave peer.
+
+## Why this breaks Arweave specifically
+
+Arweave resolves its trusted-peer hostnames to IP addresses **once at startup**,
+then connects to those addresses directly. Every request therefore carries
+`Host: <ip-address>`, matches no FQDN allow rule, and is denied.
+
+The node reports this as `Peer x.x.x.x:1984 is not available` for every peer,
+followed by `The specified trusted peers are not valid.` That message is
+misleading — the peers are healthy and reachable.
+
+## The ask for the network team
+
+> Outbound egress from AKS cluster `cuscoiniadevaks` is filtered by FQDN
+> (Azure Firewall application rules or an HTTP proxy). The Arweave node
+> connects to blockchain peers **by IP address**, so those connections are
+> denied with a synthetic HTTP 503 in 0.02s and never leave the network.
+>
+> Verified from a pod in the cluster: the same IP and port succeeds when a
+> matching hostname is supplied in the Host header and fails without it.
+>
+> Please add a **network rule** (IP/port based) permitting outbound TCP 1984
+> to any destination. An application/FQDN rule cannot work here, because
+> Arweave peers are discovered dynamically as IP addresses.
+
+## Not workaroundable in the manifests
+
+- Arweave's HTTP client does not expose a Host-header override.
+- Peer IPs are discovered from the network at runtime, so no static
+  IP-to-hostname mapping would stay correct.
+- A rewriting proxy sidecar would have to invent hostnames for peers it has
+  never seen.
+
+---
+
 # Arweave on AKS — clean rebuild
 
 Run in order. Step 3's wait is not optional — it is the rate-limit cooldown.
