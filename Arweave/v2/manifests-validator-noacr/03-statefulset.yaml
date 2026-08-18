@@ -45,6 +45,69 @@
 # ============================================================
 
 
+# ############################################################
+# ##  ROOT CAUSE OF THE CRASH LOOP — AND WHY THIS CONFIG     ##
+# ##  NO LONGER SETS transaction_blacklist_urls              ##
+# ############################################################
+#
+# The FIRST error in every crashed start was:
+#
+#   {badmatch,undefined}
+#     {pubkey_os_cacerts,get,0,...}
+#     {gun,ensure_tls_opts,3,...}
+#     {gun,initial_tls_handshake,3,...}
+#   State: ... "public_shepherd.arweave.net", 443, <<"https">> ...
+#
+# Erlang resolves its TLS trust store through
+# pubkey_os_cacerts:get/0, which reads the OS CA bundle. The
+# ubuntu:22.04 base image ships every shared library Arweave needs
+# but does NOT ship ca-certificates, so that call returns
+# `undefined` and gun crashes before the handshake.
+#
+# THE CASCADE — this is why it looked like a network problem:
+#   1. gun crashes on the https blacklist fetch, retrying on a timer
+#   2. gun_conns_sup restarts the child until it exceeds max restart
+#      intensity, then the SUPERVISOR ITSELF dies
+#   3. gun_conns_sup owns EVERY gun connection — including the
+#      PLAIN-HTTP peer connections on port 1984
+#   4. every peer request then fails with
+#        {noproc,{gen_server,call,[gun_conns_sup,...]}}
+#      surfacing as "Peer x.x.x.x:1984 is not available"
+#   5. those error paths hammer prometheus, whose ETS tables die
+#      with their owning process -> {badarg,[{ets,lookup,
+#      [prometheus_counter_table,...  -> ar_http, ar_header_sync
+#      and ar_nonce_limiter_client all collapse -> CrashLoopBackOff
+#
+# So the peer failures and the prometheus storm were BOTH symptoms
+# of one missing file. Outbound TCP 1984 was never blocked —
+# verified from a pod in this cluster:
+#   wget -T 10 http://peers.arweave.xyz:1984/info
+#     -> {"network":"arweave.N.1","height":1982583,"peers":498,...}
+#
+# THE FIX: transaction_blacklist_urls is REMOVED. It was the only
+# https call Arweave makes. With no TLS there is no CA lookup, and
+# the whole cascade cannot start. The init container also stages a
+# CA bundle onto the volume as belt-and-braces, but nothing now
+# depends on it.
+#
+# WHAT REMOVING IT COSTS: the blacklist is the public Shepherd
+# NSFW/illegal-content filter. It stops the node STORING or SERVING
+# blacklisted content. This profile sets no storage_modules, so it
+# stores zero weave data and serves none — the filter has nothing
+# to act on here. The reference bare-metal node keeps it because
+# its image installs libssl-dev and wget, which pull in CA certs
+# as a dependency.
+#
+# TO RESTORE IT (required if storage_modules are ever added, since
+# the node would then actually hold content):
+#   1. add back, after log_dir:
+#        "transaction_blacklist_urls": ["https://public_shepherd.arweave.net"],
+#   2. confirm the CA bundle is in place first, or this crash
+#      returns:
+#        kubectl exec -n arweave arweave-node-0 -c arweave-node -- \
+#          ls -l /etc/ssl/certs/ca-certificates.crt
+# ############################################################
+#
 # ── ConfigMap: node configuration ──────────────────────────
 # The config.json from Arweave/v1/docker-setup.md, with three changes:
 #   + log_dir   — default is a RELATIVE path into the install dir,
@@ -92,7 +155,6 @@ data:
       "data_dir": "/data",
       "log_dir": "/var/log/arweave",
       "vdf_server_trusted_peers": ["vdf-server-3.arweave.xyz"],
-      "transaction_blacklist_urls": ["https://public_shepherd.arweave.net"],
       "sync_jobs": 20,
       "max_disk_pool_buffer_mb": 2000,
       "port": 1984,
