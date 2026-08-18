@@ -99,6 +99,44 @@ data:
       "mine": false
     }
 
+# ############################################################
+# ##  NETWORK: NOT BLOCKED. Verified from inside the cluster ##
+# ############################################################
+#
+#   wget -T 10 http://peers.arweave.xyz:1984/info
+#     -> {"network":"arweave.N.1","height":1982583,"peers":498,...}
+#
+# Outbound TCP 1984 WORKS. An earlier test with a 5-second timeout
+# returned "download timed out" and was misread as a firewall block;
+# a 10-second timeout succeeds. The connection is SLOW to establish,
+# not refused.
+#
+# That distinction matters, because Arweave's HTTP client uses a
+# 2-SECOND connect timeout (visible in the crash log:
+# `connect_timeout => 2000`). If peer connections need longer than
+# that to establish from this cluster, every peer is marked
+# "not available" even though the route is fine.
+#
+# So there are two candidate root causes, and the ORDER of the log
+# decides between them:
+#
+#   A) Slow connects -> peer probes exceed the 2s timeout -> the
+#      error path runs constantly -> the process owning the
+#      prometheus ETS tables dies -> every later metric call gets
+#      {badarg,[{ets,lookup,[prometheus_counter_table,...]}] ->
+#      ar_http dies -> gun_conns_sup dies -> CrashLoopBackOff.
+#
+#   B) The prometheus bug fires FIRST and kills ar_http (the HTTP
+#      CLIENT). With ar_http down, every peer request fails, so
+#      "Peer X is not available" is a SYMPTOM, not the cause. The
+#      `{noproc,{gen_server,call,[gun_conns_sup,...]}}` errors point
+#      this way -- that supervisor is already gone by then.
+#
+# `kubectl logs --tail=50` cannot distinguish these: it shows only
+# the end. Capture the FIRST 60 lines of a fresh start instead --
+# whichever error appears first is the cause.
+# ############################################################
+
 
 ---
 # ── StatefulSet ────────────────────────────────────────────
@@ -196,12 +234,29 @@ spec:
             - |
               set -eu
 
+              # ---- VERSION SELECTION ----------------------------
+              # Set ALL FOUR together. Do NOT build ASSET from
+              # VERSION with a template: the asset filename format is
+              # NOT stable across releases --
+              #   2.9.5.1 -> arweave-2.9.5.1.ubuntu22.x86_64.tar.gz
+              #   2.9.4.1 -> arweave-2.9.4.1.ubuntu22-x86_64.tar.gz
+              #                                    ^ hyphen, not dot
+              # A templated name silently 404s on the other release.
+              # SHA values are from each release's checksums.txt.
+
               VERSION="2.9.5.1"
               TAG="N.2.9.5.1"
-              ASSET="arweave-${VERSION}.ubuntu22.x86_64.tar.gz"
-              # From the release's checksums.txt — verified against
-              # the real asset before shipping this manifest.
+              ASSET="arweave-2.9.5.1.ubuntu22.x86_64.tar.gz"
               SHA="dcacd52be21cb6b00da438a762fc5b352d1afa410608039d5255901916bc968f"
+
+              # --- 2.9.4.1 alternative: swap the four lines above for
+              # --- these four. Older (2025-04-03) but the version the
+              # --- reference runbook falls back to for the prometheus
+              # --- crash. See the notes above the ConfigMap.
+              # VERSION="2.9.4.1"
+              # TAG="N.2.9.4.1"
+              # ASSET="arweave-2.9.4.1.ubuntu22-x86_64.tar.gz"
+              # SHA="fb1b63b1853bbf36f3ea34bc7a58e9ca8bccf84ecc74a91e0c0f1978d37f4d53"
 
               ROOT="/opt/arweave"
               DEST="${ROOT}/${VERSION}"
@@ -282,8 +337,12 @@ spec:
               # values -- an existing PVC may already have +sbwt
               # patched from a previous run, and guarding on that
               # would skip the memory fixes entirely.
+              # The [ -f ] guard matters when changing versions: an
+              # older release may lay out releases/<vsn>/ differently,
+              # and without it `set -e` would abort the whole init on
+              # a missing file rather than just skipping the tuning.
               VMARGS="${DEST}/releases/${VERSION}/vm.args.src"
-              if ! grep -q '^## k8s-container-tuned' "${VMARGS}"; then
+              if [ -f "${VMARGS}" ] && ! grep -q '^## k8s-container-tuned' "${VMARGS}"; then
                 sed -i \
                   -e 's/^+sbwt very_long/+sbwt none/' \
                   -e 's/^+sbwtdcpu very_long/+sbwtdcpu none/' \
@@ -300,7 +359,7 @@ spec:
                 echo "[init] vm.args.src already tuned"
               fi
               echo "[init] effective emulator flags:"
-              grep -E '^\+' "${VMARGS}" | sed 's/^/         /'
+              grep -E '^\+' "${VMARGS}" 2>/dev/null | sed 's/^/         /' || echo "         (vm.args.src not found — using release defaults)"
 
               # -- stable path for the main container -------------
               # The StatefulSet execs /opt/arweave/current/bin/arweave,
