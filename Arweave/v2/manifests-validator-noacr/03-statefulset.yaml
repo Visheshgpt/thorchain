@@ -205,6 +205,96 @@ data:
       "port": 1984,
       "mine": false
     }
+  # Upstream's releases/2.9.5.1/vm.args.src, VERBATIM, with exactly one
+  # change: the three +sbwt* values are `none` instead of `very_long`.
+  # That is upstream's OWN commented-out advice ("Uncomment the following
+  # line if running in a container") -- it stops the Erlang schedulers
+  # busy-waiting at ~100% CPU inside a cgroup, and has nothing to do with
+  # memory.
+  #
+  # EVERY OTHER VALUE IS UPSTREAM'S. In particular the binary allocator
+  # settings are left alone:
+  #     +MBsbct 103424   (101 MiB singleblock carrier threshold)
+  #     +MBlmbcs 410629  (~401 MiB largest multi-block carrier)
+  #     +A1024 +SDio1024
+  # An earlier version of this deployment lowered those to squeeze into a
+  # 4Gi container, and it caused OOMKills during "Downloading the wallet
+  # tree" -- see upstream's own comment on +MBsbct below for why they are
+  # deliberately high. Do not lower them again.
+  #
+  # THIS IS MOUNTED OVER THE EXTRACTED RELEASE'S COPY. Previously the init
+  # container sed-patched the file on the PVC, guarded by a marker line.
+  # That made the outcome depend on PVC state, marker state, and whether
+  # the pod had actually been recreated -- three ways for a change to
+  # silently not apply. A ConfigMap mount has none of those: whatever is
+  # here is what the node runs, every time, and `kubectl apply` always
+  # wins.
+  vm.args.src: |
+    ## Name of the node
+    -name ${ARNODE:-arweave@127.0.0.1}
+
+    ## Cookie for distributed erlang
+    -setcookie ${ARCOOKIE:-arweave}
+
+    ## Disable the emulator break handler. Note this also makes the VM
+    ## ignore SIGINT/SIGQUIT -- inside the pod only SIGTERM stops the node.
+    +Bi
+
+    ## Enables the kernel poll functionality.
+    +Ktrue
+
+    ## +A1024: emulator number of threads in the Async long thread pool for
+    ## linked in drivers, mostly unused
+    +A1024
+
+    ## +SDio1024: emulator Scheduler thread count for Dirty I/O, 200
+    ## threads for file access
+    +SDio1024
+
+    ## +MBsbct 103424: binary_alloc singleblock carrier threshold (in KiB)
+    ## (101MiB, default 512KiB). Blocks larger than the threshold are
+    ## placed in singleblock carriers. However multi-block carriers are
+    ## more efficient. Since we have so many 100MiB binary blocks due to
+    ## the recall range, set the threshold so that they are all placed in
+    ## multi-block carriers and not single-block carriers.
+    +MBsbct 103424
+
+    ## +MBsmbcs 10240: binary_alloc smallest multi-block carrier size (in
+    ## KiB) (10MiB, default 256KiB).
+    +MBsmbcs 10240
+
+    ## MBlmbcs 410629: binary_alloc largest multi-block carrier size (in
+    ## KiB) (~401MiB, default 5MiB). Set so that a single multi-block
+    ## carrier can hold roughly 4 full recall ranges.
+    +MBlmbcs 410629
+
+    ## +MBmmsbc 1024: binary_alloc maximum mseg_alloc singleblock carriers
+    ## (1024 carriers, default 256).
+    +MBmmmbc 1024
+
+    ## +MBas aobf: emulator Memory Binary Allocation Strategy set to
+    ## Address Order Best Fit.
+    +MBas aobf
+
+    ## ---- THE ONLY CHANGE FROM UPSTREAM: container busy-wait ----
+    ## Sets scheduler busy wait threshold. Upstream ships `very_long`.
+    +sbwt none
+
+    ## Sets dirty scheduler busy wait threshold.
+    +sbwtdcpu none
+
+    ## Sets dirty IO scheduler busy wait threshold
+    +sbwtdio none
+    ## -----------------------------------------------------------
+
+    ##  Sets scheduler wakeup threshold.
+    +swt very_low
+
+    ##  Sets dirty scheduler wakeup threshold.
+    +swtdcpu very_low
+
+    ## Sets dirty IO scheduler wakeup threshold.
+    +swtdio very_low
   nginx.conf: |
     # Host-rewriting proxy. See the block above config.json for why.
     #
@@ -497,102 +587,13 @@ spec:
                 echo "[init] installed ${VERSION}"
               fi
 
-              # -- container tuning -------------------------------
-              # Upstream's vm.args is tuned for a MINER on bare metal.
-              # Two families of setting are actively harmful here.
-              #
-              # 1. BUSY-WAIT. +sbwt very_long makes the Erlang
-              #    schedulers spin while waiting for work: ~100% CPU
-              #    at idle inside a cgroup, CFS throttling during real
-              #    work. Upstream's own vm.args.src carries the fix,
-              #    commented out: "## Uncomment the following line if
-              #    running in a container.  ## +sbwt none"
-              #
-              # 2. MEMORY. This is what OOMKills the pod at 4Gi:
-              #      +A1024 +SDio1024  -> ~2048 OS threads, each with
-              #                           its own stack, on a 2-core pod
-              #      +MBlmbcs 410629   -> ~401 MiB largest binary carrier
-              #      +MBsbct  103424   -> ~101 MiB singleblock threshold
-              #    Those sizes exist to hold 100 MiB recall-range
-              #    binaries while mining. A validator with NO
-              #    storage_modules never allocates one, so they are
-              #    pure overhead against the memory limit.
-              #
-              #    Values below are sized for this pod, not invented:
-              #    16 async / 16 dirty-IO threads comfortably serve
-              #    sync_jobs 20, and 5 MiB / 512 KiB carriers are the
-              #    ERTS defaults the miner tuning overrode.
-              #
-              # IF YOU MOVE TO A DEDICATED NODE with >= 8Gi, delete
-              # this whole block and let upstream's values stand --
-              # they are faster when the memory is actually there.
-              #
-              # Idempotent via a marker line, NOT by matching the old
-              # values -- an existing PVC may already have +sbwt
-              # patched from a previous run, and guarding on that
-              # would skip the memory fixes entirely.
-              # The [ -f ] guard matters when changing versions: an
-              # older release may lay out releases/<vsn>/ differently,
-              # and without it `set -e` would abort the whole init on
-              # a missing file rather than just skipping the tuning.
-              VMARGS="${DEST}/releases/${VERSION}/vm.args.src"
-              if [ -f "${VMARGS}" ] && ! grep -q '^## k8s-container-tuned-v2' "${VMARGS}"; then
-                sed -i \
-                  -e 's/^+sbwt very_long/+sbwt none/' \
-                  -e 's/^+sbwtdcpu very_long/+sbwtdcpu none/' \
-                  -e 's/^+sbwtdio very_long/+sbwtdio none/' \
-                  -e 's/^+MBsbct 512$/+MBsbct 103424/' \
-                  -e 's/^+MBsmbcs 1024$/+MBsmbcs 10240/' \
-                  -e 's/^+MBlmbcs 5120$/+MBlmbcs 410629/' \
-                  -e 's/^+A16$/+A1024/' \
-                  -e 's/^+SDio16$/+SDio1024/' \
-                  "${VMARGS}"
-                echo '## k8s-container-tuned-v2' >> "${VMARGS}"
-                echo "[init] patched vm.args.src: +sbwt none (container busy-wait fix only)"
-              else
-                echo "[init] vm.args.src already tuned"
-              fi
-
-              # -- WHY ONLY +sbwt IS PATCHED ----------------------
-              # An earlier version of this script also rewrote the
-              # binary allocator settings, to squeeze the node into a
-              # 4Gi container:
-              #     +MBsbct  103424 -> 512      (101 MiB -> 512 KiB)
-              #     +MBlmbcs 410629 -> 5120     (401 MiB -> 5 MiB)
-              #     +MBsmbcs  10240 -> 1024
-              #     +A1024/+SDio1024 -> 16
-              # That was a mistake and it caused OOMKills during
-              # "Downloading the wallet tree".
-              #
-              # Upstream's own comment explains why those values are
-              # what they are:
-              #   "+MBsbct 103424: binary_alloc singleblock carrier
-              #    threshold (101MiB, default 512KiB). Blocks larger
-              #    than the threshold are placed in singleblock
-              #    carriers. However multi-block carriers are more
-              #    efficient. Since we have so many 100MiB binary
-              #    blocks due to the recall range, set the threshold so
-              #    that they are all placed in multi-block carriers and
-              #    not single-block carriers."
-              #
-              # Lowering the threshold to 512 KiB forces EVERY binary
-              # over 512 KiB into its own mmap'd singleblock carrier,
-              # and cutting +MBlmbcs to 5 MiB means large binaries can
-              # no longer fit a multi-block carrier at all. The wallet
-              # tree is a stream of large binaries, so the fragmentation
-              # lands exactly on the phase that was dying.
-              #
-              # +sbwt none stays: it is upstream's OWN commented-out
-              # recommendation ("Uncomment the following line if
-              # running in a container"), it stops the schedulers
-              # busy-waiting at ~100% CPU inside a cgroup, and it has
-              # nothing to do with memory.
-              #
-              # Marker is *-v2 so an existing PVC carrying the old,
-              # harmful patch gets re-patched from the freshly
-              # extracted release rather than being skipped.
-              echo "[init] effective emulator flags:"
-              grep -E '^\+' "${VMARGS}" 2>/dev/null | sed 's/^/         /' || echo "         (vm.args.src not found — using release defaults)"
+              # -- vm.args.src is NOT patched here anymore --------
+              # It is supplied by the ConfigMap and mounted straight
+              # over the extracted release copy in the main
+              # container. See the vm.args.src key in the ConfigMap
+              # above for why: sed-patching made the result depend on
+              # PVC state and a marker line, which meant a change
+              # could silently fail to apply.
 
               # -- CA certificates --------------------------------
               # ROOT CAUSE OF THE ORIGINAL CRASH LOOP. ubuntu:22.04
@@ -903,6 +904,17 @@ spec:
             - name: arweave-data
               mountPath: /etc/ssl/certs/ca-certificates.crt
               subPath: app/ca-certificates.crt
+              readOnly: true
+            # Erlang VM args, mounted OVER the extracted release's copy.
+            # bin/arweave regenerates releases/<vsn>/vm.args from this
+            # .src on every start, so whatever the ConfigMap says is what
+            # the VM runs -- no sed, no marker file, no dependence on
+            # what happens to be on the PVC. `kubectl apply` always wins.
+            # (Path is version-stamped to match VERSION in the init
+            # container; bump both together on an upgrade.)
+            - name: config
+              mountPath: /opt/arweave/2.9.5.1/releases/2.9.5.1/vm.args.src
+              subPath: vm.args.src
               readOnly: true
             - { name: config,  mountPath: /etc/arweave, readOnly: true }
             - { name: runtime, mountPath: /run/arweave }
