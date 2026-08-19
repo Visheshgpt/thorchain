@@ -731,12 +731,36 @@ spec:
           # NO cpu limit, on purpose — CFS throttling stalls block
           # validation and makes the node fall behind while still
           # looking healthy. Their docker run sets no --cpus either.
+          # RAISED after an OOMKill during the wallet-tree download.
+          #
+          # The node got all the way through joining -- block index,
+          # joining block, block trail -- and died on "Downloading the
+          # wallet tree, chunk 7". That phase pulls Arweave's entire
+          # account tree into memory and is the peak of the whole node
+          # lifecycle; steady state afterwards is much lower.
+          #
+          #   request 8Gi -- matches Arweave's documented floor and
+          #                  reserves it, so the pod cannot land on a
+          #                  node that has no room for the peak.
+          #   limit  16Gi -- was 12Gi, which the wallet tree exceeded.
+          #                  The reference bare-metal node runs the
+          #                  whole thing in 24 GB total, so 16Gi is a
+          #                  real ceiling rather than a guess.
+          #
+          # Node capacity check (D8s_v6, ~30Gi allocatable each):
+          #   vmss00000m ~15Gi free   vmss00000n ~20Gi free
+          #   vmss00000p ~25Gi free
+          # A 16Gi limit fits even the busiest of the three.
+          #
+          # If it OOMKills again, raise the LIMIT before anything
+          # else -- there is room up to ~20Gi -- and check
+          # `kubectl top pod` to see where it actually peaked.
           resources:
             requests:
               cpu: "1"
-              memory: "4Gi"
+              memory: "8Gi"
             limits:
-              memory: "12Gi"
+              memory: "16Gi"
 
           # startup on /info: returns 200 as soon as the listener is
           # up, even before joining (reports "height": -1, "current":
