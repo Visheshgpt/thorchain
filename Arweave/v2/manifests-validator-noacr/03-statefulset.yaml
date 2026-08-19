@@ -195,11 +195,13 @@ data:
         "127.0.0.1:9001",
         "127.0.0.1:9002",
         "127.0.0.1:9003",
-        "127.0.0.1:9004"
+        "127.0.0.1:9004",
+        "127.0.0.1:9005",
+        "127.0.0.1:9006"
       ],
       "data_dir": "/data",
       "log_dir": "/var/log/arweave",
-      "vdf_server_trusted_peers": ["vdf-server-3.arweave.xyz"],
+      "vdf_server_trusted_peers": ["127.0.0.1:9010", "127.0.0.1:9011"],
       "sync_jobs": 20,
       "max_disk_pool_buffer_mb": 2000,
       "port": 1984,
@@ -357,6 +359,56 @@ data:
           proxy_set_header Host den-1.west.us.north-america.arweave.xyz;
         }
       }
+      server {
+        listen 127.0.0.1:9005;
+        location / {
+          proxy_pass http://pho-1.east.us.north-america.arweave.xyz:1984;
+          proxy_set_header Host pho-1.east.us.north-america.arweave.xyz;
+        }
+      }
+      server {
+        listen 127.0.0.1:9006;
+        location / {
+          proxy_pass http://van-1.ca.north-america.arweave.xyz:1984;
+          proxy_set_header Host van-1.ca.north-america.arweave.xyz;
+        }
+      }
+
+      # ---- VDF SERVERS. Without these the chain height FREEZES. ----
+      # Arweave 2.6+ cannot validate a new block without VDF (nonce
+      # limiter) output. ar_config.erl:
+      #     compute_own_vdf() ->
+      #       case nonce_limiter_server_trusted_peers of
+      #         [] -> compute locally (unless disabled);
+      #         _  -> DO NOT compute locally, unless compute_own_vdf
+      #               is in `enable`
+      # So a NON-EMPTY vdf_server_trusted_peers list makes the node
+      # refuse to compute VDF itself and wait on the server.
+      #
+      # The original config pointed straight at
+      # vdf-server-3.arweave.xyz, which Arweave resolves to an IP --
+      # blocked by the FQDN egress filter exactly like the peers were.
+      # Result: the node joined, backfilled headers happily (no VDF
+      # needed for that), and never advanced past its join height.
+      # Symptom was a frozen `height` with a healthy, climbing `blocks`.
+      #
+      # Proxying them keeps VDF offloaded (it is single-threaded SHA256
+      # and expensive to self-compute) and reuses the mechanism already
+      # proven for peers.
+      server {
+        listen 127.0.0.1:9010;
+        location / {
+          proxy_pass http://vdf-server-3.arweave.xyz:1984;
+          proxy_set_header Host vdf-server-3.arweave.xyz;
+        }
+      }
+      server {
+        listen 127.0.0.1:9011;
+        location / {
+          proxy_pass http://vdf-server-4.arweave.xyz:1984;
+          proxy_set_header Host vdf-server-4.arweave.xyz;
+        }
+      }
     }
 
 # ############################################################
@@ -498,12 +550,17 @@ spec:
       #
       # So for the wallet-tree run, pin to the empty node.
       #
-      # REMOVE THIS once the node is past the wallet tree and steady
-      # state memory is known -- pinning by hostname is brittle (the
-      # name changes on scale/upgrade, and a drain leaves the pod
-      # Pending with nowhere to go).
-      nodeSelector:
-        kubernetes.io/hostname: aks-aksnodepool-15306923-vmss00000p
+      # REMOVED. The pin existed to guarantee headroom for the
+      # wallet-tree spike, which is now past: the node joined at height
+      # 1983235 and settled at ~10.5Gi. Leaving it pinned by hostname
+      # would be brittle -- the name changes on scale/upgrade, and a
+      # drain would leave the pod Pending with nowhere to go.
+      #
+      # To re-pin (e.g. before a fresh join on a busy cluster):
+      #   nodeSelector:
+      #     kubernetes.io/hostname: <node-name>
+      # Pick the node with the most FREE memory in `kubectl top nodes`,
+      # not the most free by requests -- the two differ a lot here.
 
       initContainers:
         # ── Download, verify and install the Arweave release ────
@@ -822,18 +879,35 @@ spec:
           resources:
             requests:
               cpu: "1"
-              # 16Gi, not 8Gi. This is eviction protection, not an
-              # allocation. The kubelet ranks eviction victims by
-              # (usage - request), so a pod using 18Gi against an 8Gi
-              # request is the first thing killed under node pressure.
-              # Requesting 16Gi makes that overage small and puts us
-              # near the back of the queue instead of the front.
-              #
-              # Fits: every node has ~21-22Gi free by REQUESTS.
-              memory: "16Gi"
+              # 6Gi. The REQUEST is what actually reserves node
+              # capacity, so this is the number that matters for
+              # sharing the cluster. Measured steady state is ~10.5Gi,
+              # so the pod will run above its request -- acceptable
+              # here because the nodes have ~29Gi allocatable and
+              # plenty spare. Raise it back toward 12Gi if this ever
+              # shares a node with another memory-hungry workload,
+              # since eviction ranks by (usage - request).
+              memory: "6Gi"
             limits:
-              # 20Gi. Raised twice: 12Gi -> 16Gi -> 20Gi, each time
-              # OOMKilled during "Downloading the wallet tree".
+              # 14Gi. Lowered from 20Gi now that the real cause of the
+              # wallet-tree OOMKills is fixed -- it was the binary
+              # allocator tuning (+MBsbct 512 / +MBlmbcs 5120), not the
+              # size of the workload. With upstream allocator values the
+              # node settles at ~10.5Gi, so 14Gi is ~1.3x measured
+              # steady state.
+              #
+              # A restart re-runs the wallet tree, and its peak has NOT
+              # been measured with the corrected vm.args. Watch it:
+              #   while ($true) { kubectl top pod arweave-node-0 -n arweave --no-headers; Start-Sleep 2 }
+              # If it OOMKills during the wallet tree, raise this to
+              # 16-18Gi -- the nodes have ~29Gi allocatable, so there is
+              # room. Do not go past ~20Gi: node-level eviction is worse
+              # than an OOMKill because it destroys the pod and takes
+              # headroom from other workloads.
+              #
+              # Earlier history, for context: 12Gi -> 16Gi -> 20Gi, each
+              # OOMKilled during the wallet tree -- all with the harmful
+              # allocator settings still in place.
               #
               # This is near the practical ceiling for these nodes:
               # ~30Gi allocatable, and the least-loaded had ~25Gi free.
@@ -846,7 +920,7 @@ spec:
               # 24 GB TOTAL (docker run --memory=24g), so if 20Gi is not
               # enough the problem is not sizing -- see the note on
               # ERL_FLAGS below before raising this again.
-              memory: "20Gi"
+              memory: "14Gi"
 
           # startup on /info: returns 200 as soon as the listener is
           # up, even before joining (reports "height": -1, "current":
