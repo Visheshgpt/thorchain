@@ -1,0 +1,150 @@
+# =============================================================================
+# TEST-proxy.yaml — PROVE THE PROXY WORKAROUND BEFORE DEPLOYING IT
+#
+# Self-contained: its own ConfigMap + a single Pod. Touches nothing else, and
+# deletes cleanly. Run this BEFORE applying the real StatefulSet.
+#
+# It answers two of the three unknowns:
+#   1. Does nginx start non-root, read-only rootfs, under Gatekeeper?
+#   2. Does a request to 127.0.0.1:9001 come back with real Arweave data?
+#
+# It does NOT answer the third — whether Arweave accepts a loopback address as
+# a trusted peer, and whether peers it DISCOVERS at runtime (plain IPs, still
+# refused by the egress filter) destabilise it. Only the real deployment shows
+# that.
+#
+# USE:
+#   kubectl apply -f TEST-proxy.yaml
+#   kubectl logs -n arweave proxy-test -f
+#   kubectl delete -f TEST-proxy.yaml
+#
+# PASS looks like:
+#   [1] nginx started
+#   [2] PASS - proxy returned Arweave data
+#       {"version":5,"release":92,...,"network":"arweave.N.1",...}
+#   [3] PASS - direct IP is blocked (503), proxy path is not
+#
+# Step 3 is the control: it re-confirms the bare IP still fails, so a pass in
+# step 2 can only be the Host-header rewrite doing its job.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxy-test-config
+  namespace: arweave
+data:
+  nginx.conf: |
+    worker_processes 1;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+    events { worker_connections 512; }
+    http {
+      access_log off;
+      client_body_temp_path /tmp/nginx-client;
+      proxy_temp_path       /tmp/nginx-proxy;
+      fastcgi_temp_path     /tmp/nginx-fastcgi;
+      uwsgi_temp_path       /tmp/nginx-uwsgi;
+      scgi_temp_path        /tmp/nginx-scgi;
+      proxy_http_version 1.1;
+      proxy_connect_timeout 3s;
+      proxy_read_timeout 30s;
+      proxy_buffering off;
+      server {
+        listen 127.0.0.1:9001;
+        location / {
+          proxy_pass http://vin-1.east.us.north-america.arweave.xyz:1984;
+          proxy_set_header Host vin-1.east.us.north-america.arweave.xyz;
+        }
+      }
+      server {
+        listen 127.0.0.1:9002;
+        location / {
+          proxy_pass http://bhs-1.ca.north-america.arweave.xyz:1984;
+          proxy_set_header Host bhs-1.ca.north-america.arweave.xyz;
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: proxy-test
+  namespace: arweave
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 1025
+    runAsGroup: 1025
+    runAsNonRoot: true
+    fsGroup: 1025
+  containers:
+    - name: test
+      image: nginx:1.27-alpine
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+        readOnlyRootFilesystem: true
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -u
+
+          echo "[1] starting nginx..."
+          nginx -c /etc/nginx/nginx.conf
+          sleep 3
+          if ! pgrep nginx > /dev/null 2>&1; then
+            echo "[1] FAIL - nginx did not start (see errors above)"
+            exit 1
+          fi
+          echo "[1] nginx started"
+
+          echo
+          echo "[2] request via proxy 127.0.0.1:9001 (nginx rewrites Host)..."
+          if OUT=$(wget -T 15 -q -O- http://127.0.0.1:9001/info 2>&1); then
+            case "$OUT" in
+              *arweave.N.1*)
+                echo "[2] PASS - proxy returned Arweave data"
+                echo "    $(echo "$OUT" | head -c 200)"
+                ;;
+              *)
+                echo "[2] FAIL - got a response but not Arweave data:"
+                echo "    $(echo "$OUT" | head -c 200)"
+                ;;
+            esac
+          else
+            echo "[2] FAIL - no response through the proxy"
+          fi
+
+          echo
+          echo "[2b] second peer via 127.0.0.1:9002..."
+          if wget -T 15 -q -O- http://127.0.0.1:9002/info 2>&1 | grep -q arweave.N.1; then
+            echo "[2b] PASS - second proxied peer also works"
+          else
+            echo "[2b] FAIL - second proxied peer did not respond"
+          fi
+
+          echo
+          echo "[3] CONTROL: same peer by bare IP, no Host rewrite..."
+          if wget -T 10 -q -O- http://40.160.31.17:1984/info 2>&1 | grep -q arweave.N.1; then
+            echo "[3] bare IP WORKS - the egress filter is gone, you do not"
+            echo "    need the proxy at all. Use hostnames directly."
+          else
+            echo "[3] PASS - bare IP still blocked, so step 2 proves the"
+            echo "    Host-header rewrite is what made the difference."
+          fi
+
+          echo
+          echo "=== done ==="
+      volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: config
+      configMap:
+        name: proxy-test-config
+    - name: tmp
+      emptyDir: { sizeLimit: 64Mi }

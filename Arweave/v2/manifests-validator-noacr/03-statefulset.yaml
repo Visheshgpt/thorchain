@@ -192,14 +192,10 @@ data:
   config.json: |
     {
       "peers": [
-        "dal-1.east.us.north-america.arweave.xyz",
-        "den-1.west.us.north-america.arweave.xyz",
-        "vin-1.east.us.north-america.arweave.xyz",
-        "pho-1.east.us.north-america.arweave.xyz",
-        "bhs-1.ca.north-america.arweave.xyz",
-        "van-1.ca.north-america.arweave.xyz",
-        "north-america.peers.arweave.xyz",
-        "peers.arweave.xyz"
+        "127.0.0.1:9001",
+        "127.0.0.1:9002",
+        "127.0.0.1:9003",
+        "127.0.0.1:9004"
       ],
       "data_dir": "/data",
       "log_dir": "/var/log/arweave",
@@ -208,6 +204,69 @@ data:
       "max_disk_pool_buffer_mb": 2000,
       "port": 1984,
       "mine": false
+    }
+  nginx.conf: |
+    # Host-rewriting proxy. See the block above config.json for why.
+    #
+    # Arweave connects to 127.0.0.1:900X (same pod = same network
+    # namespace, so no firewall involved). This proxy then makes the
+    # REAL request using the peer's HOSTNAME, which is what the egress
+    # filter requires.
+    worker_processes 1;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+
+    events { worker_connections 512; }
+
+    http {
+      access_log off;
+      # All temp paths under /tmp so nginx runs as an unprivileged UID
+      # on a read-only root filesystem.
+      client_body_temp_path /tmp/nginx-client;
+      proxy_temp_path       /tmp/nginx-proxy;
+      fastcgi_temp_path     /tmp/nginx-fastcgi;
+      uwsgi_temp_path       /tmp/nginx-uwsgi;
+      scgi_temp_path        /tmp/nginx-scgi;
+
+      proxy_http_version 1.1;
+      # Arweave's own probe timeout is 2s, so fail faster than that
+      # and let it move to the next peer rather than stall.
+      proxy_connect_timeout 3s;
+      proxy_send_timeout    30s;
+      proxy_read_timeout    30s;
+      proxy_buffering off;
+
+      # Pass Arweave's peer headers straight through.
+      proxy_pass_request_headers on;
+
+      server {
+        listen 127.0.0.1:9001;
+        location / {
+          proxy_pass http://vin-1.east.us.north-america.arweave.xyz:1984;
+          proxy_set_header Host vin-1.east.us.north-america.arweave.xyz;
+        }
+      }
+      server {
+        listen 127.0.0.1:9002;
+        location / {
+          proxy_pass http://bhs-1.ca.north-america.arweave.xyz:1984;
+          proxy_set_header Host bhs-1.ca.north-america.arweave.xyz;
+        }
+      }
+      server {
+        listen 127.0.0.1:9003;
+        location / {
+          proxy_pass http://dal-1.east.us.north-america.arweave.xyz:1984;
+          proxy_set_header Host dal-1.east.us.north-america.arweave.xyz;
+        }
+      }
+      server {
+        listen 127.0.0.1:9004;
+        location / {
+          proxy_pass http://den-1.west.us.north-america.arweave.xyz:1984;
+          proxy_set_header Host den-1.west.us.north-america.arweave.xyz;
+        }
+      }
     }
 
 # ############################################################
@@ -548,6 +607,56 @@ spec:
               subPath: app
 
       containers:
+        # ── Host-rewriting egress proxy ──────────────────────────
+        # THE WORKAROUND for this cluster's FQDN-filtered egress.
+        #
+        # Proven from a pod in this namespace, same IP and port:
+        #   wget http://40.160.31.17:1984/info               -> 503 in 0.02s
+        #   wget --header Host:vin-1...arweave.xyz
+        #        http://40.160.31.17:1984/info               -> 200 OK
+        # The same bare IP answers 200 in 0.64s from outside this
+        # network, and 0.02s is far too fast to be a real round trip,
+        # so that 503 is synthesised locally by the egress filter.
+        #
+        # Arweave resolves peer hostnames to IPs ONCE at startup and
+        # then dials the addresses directly, so every request carries
+        # `Host: <ip>`, matches no FQDN rule, and is denied. Its HTTP
+        # client offers no way to override that header.
+        #
+        # So: Arweave talks to 127.0.0.1:900X instead. Containers in a
+        # pod share a network namespace, so that traffic never touches
+        # the firewall. nginx then makes the real request using the
+        # peer's HOSTNAME, which the filter permits.
+        #
+        # THIS IS A WORKAROUND, NOT A FIX. It gets the node joined and
+        # following the chain through four proxied peers. Peers that
+        # Arweave DISCOVERS at runtime are still plain IPs and will
+        # still be refused, so peering stays degraded. The real fix is
+        # a network rule permitting outbound TCP 1984 by IP — see the
+        # top of cmnds.md.
+        - name: peer-proxy
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          # Bypass the image's entrypoint scripts: they try to write to
+          # /var/cache/nginx and /etc/nginx/conf.d, which fails for a
+          # non-root UID on a read-only rootfs. Running nginx directly
+          # with our own config avoids all of it.
+          command: ["nginx", "-c", "/etc/nginx/nginx.conf", "-g", "daemon off;"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            readOnlyRootFilesystem: true
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { memory: "256Mi" }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: proxy-tmp
+              mountPath: /tmp
+
         - name: arweave-node
           image: ubuntu:22.04
           imagePullPolicy: IfNotPresent
@@ -706,6 +815,10 @@ spec:
           emptyDir: { sizeLimit: 512Mi }
         - name: tmp
           emptyDir: { sizeLimit: 256Mi }
+        # nginx writes its pid and temp buffers here so the proxy can
+        # run non-root with a read-only root filesystem.
+        - name: proxy-tmp
+          emptyDir: { sizeLimit: 64Mi }
         # The team's docker run uses --shm-size=4g; Kubernetes (like
         # Docker) defaults /dev/shm to 64 MB. medium: Memory is a
         # tmpfs and is CHARGED AGAINST the 4Gi limit above, so 256Mi
