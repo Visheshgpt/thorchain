@@ -536,22 +536,61 @@ spec:
               # and without it `set -e` would abort the whole init on
               # a missing file rather than just skipping the tuning.
               VMARGS="${DEST}/releases/${VERSION}/vm.args.src"
-              if [ -f "${VMARGS}" ] && ! grep -q '^## k8s-container-tuned' "${VMARGS}"; then
+              if [ -f "${VMARGS}" ] && ! grep -q '^## k8s-container-tuned-v2' "${VMARGS}"; then
                 sed -i \
                   -e 's/^+sbwt very_long/+sbwt none/' \
                   -e 's/^+sbwtdcpu very_long/+sbwtdcpu none/' \
                   -e 's/^+sbwtdio very_long/+sbwtdio none/' \
-                  -e 's/^+A1024/+A16/' \
-                  -e 's/^+SDio1024/+SDio16/' \
-                  -e 's/^+MBsbct 103424/+MBsbct 512/' \
-                  -e 's/^+MBsmbcs 10240/+MBsmbcs 1024/' \
-                  -e 's/^+MBlmbcs 410629/+MBlmbcs 5120/' \
+                  -e 's/^+MBsbct 512$/+MBsbct 103424/' \
+                  -e 's/^+MBsmbcs 1024$/+MBsmbcs 10240/' \
+                  -e 's/^+MBlmbcs 5120$/+MBlmbcs 410629/' \
+                  -e 's/^+A16$/+A1024/' \
+                  -e 's/^+SDio16$/+SDio1024/' \
                   "${VMARGS}"
-                echo '## k8s-container-tuned' >> "${VMARGS}"
-                echo "[init] patched vm.args.src for container limits"
+                echo '## k8s-container-tuned-v2' >> "${VMARGS}"
+                echo "[init] patched vm.args.src: +sbwt none (container busy-wait fix only)"
               else
                 echo "[init] vm.args.src already tuned"
               fi
+
+              # -- WHY ONLY +sbwt IS PATCHED ----------------------
+              # An earlier version of this script also rewrote the
+              # binary allocator settings, to squeeze the node into a
+              # 4Gi container:
+              #     +MBsbct  103424 -> 512      (101 MiB -> 512 KiB)
+              #     +MBlmbcs 410629 -> 5120     (401 MiB -> 5 MiB)
+              #     +MBsmbcs  10240 -> 1024
+              #     +A1024/+SDio1024 -> 16
+              # That was a mistake and it caused OOMKills during
+              # "Downloading the wallet tree".
+              #
+              # Upstream's own comment explains why those values are
+              # what they are:
+              #   "+MBsbct 103424: binary_alloc singleblock carrier
+              #    threshold (101MiB, default 512KiB). Blocks larger
+              #    than the threshold are placed in singleblock
+              #    carriers. However multi-block carriers are more
+              #    efficient. Since we have so many 100MiB binary
+              #    blocks due to the recall range, set the threshold so
+              #    that they are all placed in multi-block carriers and
+              #    not single-block carriers."
+              #
+              # Lowering the threshold to 512 KiB forces EVERY binary
+              # over 512 KiB into its own mmap'd singleblock carrier,
+              # and cutting +MBlmbcs to 5 MiB means large binaries can
+              # no longer fit a multi-block carrier at all. The wallet
+              # tree is a stream of large binaries, so the fragmentation
+              # lands exactly on the phase that was dying.
+              #
+              # +sbwt none stays: it is upstream's OWN commented-out
+              # recommendation ("Uncomment the following line if
+              # running in a container"), it stops the schedulers
+              # busy-waiting at ~100% CPU inside a cgroup, and it has
+              # nothing to do with memory.
+              #
+              # Marker is *-v2 so an existing PVC carrying the old,
+              # harmful patch gets re-patched from the freshly
+              # extracted release rather than being skipped.
               echo "[init] effective emulator flags:"
               grep -E '^\+' "${VMARGS}" 2>/dev/null | sed 's/^/         /' || echo "         (vm.args.src not found — using release defaults)"
 
