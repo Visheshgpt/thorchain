@@ -390,6 +390,30 @@ spec:
       # If this ever ends up sharing a node with another memory-hungry
       # workload and starts getting evicted again, THEN add a labelled
       # pool and reinstate a nodeSelector -- not before.
+      #
+      # ---- PINNED, deliberately and temporarily --------------------
+      # A 20Gi limit is NOT safe on every node. Measured actual usage:
+      #   vmss00000m  14551Mi used -> ~14.8Gi free   20Gi does NOT fit
+      #   vmss00000n  11276Mi used -> ~18.0Gi free   marginal
+      #   vmss00000p   2616Mi used -> ~26.5Gi free   fits comfortably
+      # (all three: 30452504Ki = ~29 GiB allocatable)
+      #
+      # Requests tell a rosier story -- ~21-22Gi free everywhere -- but
+      # requests are not what triggers eviction. On vmss00000m the pods
+      # already USE 14.5Gi while only REQUESTING 8Gi, so a 20Gi
+      # neighbour would push that node over and the kubelet would start
+      # evicting. That already happened once on the old pool and it is
+      # worse than an OOMKill: eviction destroys the pod and steals
+      # headroom from other teams' workloads.
+      #
+      # So for the wallet-tree run, pin to the empty node.
+      #
+      # REMOVE THIS once the node is past the wallet tree and steady
+      # state memory is known -- pinning by hostname is brittle (the
+      # name changes on scale/upgrade, and a drain leaves the pod
+      # Pending with nowhere to go).
+      nodeSelector:
+        kubernetes.io/hostname: aks-aksnodepool-15306923-vmss00000p
 
       initContainers:
         # ── Download, verify and install the Arweave release ────
@@ -758,9 +782,31 @@ spec:
           resources:
             requests:
               cpu: "1"
-              memory: "8Gi"
-            limits:
+              # 16Gi, not 8Gi. This is eviction protection, not an
+              # allocation. The kubelet ranks eviction victims by
+              # (usage - request), so a pod using 18Gi against an 8Gi
+              # request is the first thing killed under node pressure.
+              # Requesting 16Gi makes that overage small and puts us
+              # near the back of the queue instead of the front.
+              #
+              # Fits: every node has ~21-22Gi free by REQUESTS.
               memory: "16Gi"
+            limits:
+              # 20Gi. Raised twice: 12Gi -> 16Gi -> 20Gi, each time
+              # OOMKilled during "Downloading the wallet tree".
+              #
+              # This is near the practical ceiling for these nodes:
+              # ~30Gi allocatable, and the least-loaded had ~25Gi free.
+              # Going higher risks starving the node and triggering the
+              # kubelet eviction that killed an earlier attempt -- which
+              # is worse than an OOMKill, because eviction destroys the
+              # pod and takes other workloads' headroom with it.
+              #
+              # The reference bare-metal node runs the whole thing in
+              # 24 GB TOTAL (docker run --memory=24g), so if 20Gi is not
+              # enough the problem is not sizing -- see the note on
+              # ERL_FLAGS below before raising this again.
+              memory: "20Gi"
 
           # startup on /info: returns 200 as soon as the listener is
           # up, even before joining (reports "height": -1, "current":
