@@ -920,7 +920,7 @@ spec:
               # 24 GB TOTAL (docker run --memory=24g), so if 20Gi is not
               # enough the problem is not sizing -- see the note on
               # ERL_FLAGS below before raising this again.
-              memory: "16Gi"
+              memory: "20Gi"
 
           # startup on /info: returns 200 as soon as the listener is
           # up, even before joining (reports "height": -1, "current":
