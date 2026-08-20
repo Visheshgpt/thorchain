@@ -1,0 +1,17 @@
+# ============================================================
+# Cronos POS (Crypto.org Chain) mainnet FULL NODE on AKS.
+#
+#   chain-id   crypto-org-chain-mainnet-1
+#   daemon     chain-maind v8.0.0   (live consensus version -- verified)
+#   cometbft   0.38.22
+#   block time ~5.08s  (~17,000 blocks/day)
+#
+# Apply in numeric order. The prefixes ARE the order.
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cronospos
+  labels:
+    app.kubernetes.io/part-of: cronospos-fullnode
+    app.kubernetes.io/managed-by: kubectl

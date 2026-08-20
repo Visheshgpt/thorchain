@@ -1,0 +1,13 @@
+services:
+  chainmaind:
+    container_name: cronospos
+    image: cryptocom/chain-main:v8.0.0
+    restart: unless-stopped
+    volumes:
+      - /1Disk121/node_cronospos/data:/chain-home
+    ports:
+      - "26656:26656" #P2P port
+      - "1332:26657" #RPCAPI port
+      - "2332:1317" #CosmosAPI port
+      - "3332:9090" #gRPCAPI port
+    command: ["chain-maind", "start", "--home", "/chain-home", "--rpc.laddr", "tcp://0.0.0.0:26657"]

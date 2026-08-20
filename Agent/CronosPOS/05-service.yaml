@@ -1,0 +1,161 @@
+# ============================================================
+# Services.
+#
+# NO LOADBALANCER ON P2P (26656), on purpose.
+#
+# A full node needs only OUTBOUND p2p, which works from the pod
+# IP via the cluster's egress path with no Service involved. An
+# internal LB would hand out an RFC1918 VNet address that no
+# Cronos POS peer on the internet can dial.
+#
+# Inbound peering is all-or-nothing: it needs a PUBLIC IP *and*
+# external_address set to that IP in config.toml. Do both or
+# neither -- advertising an address you cannot be reached on
+# gets you deprioritised and dropped by peers, which is worse
+# than advertising nothing. We do neither.
+#
+# ------------------------------------------------------------
+# SHARING ONE LOAD BALANCER IP ACROSS CHAINS
+#
+# The rule, stated precisely:
+#
+#   AKS runs ONE Azure Standard Load Balancer per cluster.
+#   Each type: LoadBalancer Service gets its own FRONTEND IP
+#   by default.
+#
+#   Several Services may share ONE frontend IP  <=>  their
+#   port sets are DISJOINT.
+#
+# So "same ports, same IP" is exactly the case that CANNOT
+# work: every Cosmos chain defaults to 26657/1317/9090, and two
+# Services claiming 26657 on one IP collide. The Service sticks
+# in SyncLoadBalancerFailed and the chain is silently
+# unreachable.
+#
+# Two workable modes -- pick one and record it:
+#
+#   dedicated-ip  (ACTIVE below)  one IP per chain, standard
+#                 ports unchanged. Costs one VNet address per
+#                 chain. Zero surprise for consumers.
+#
+#   shared-ip     one IP for every chain, ports remapped by a
+#                 per-chain offset. Costs one address total.
+#                 Consumers must learn a non-standard port.
+#                 See the commented block at the bottom.
+#
+# Whichever you choose, keep a PORT-REGISTRY so the next chain
+# does not collide. See README section 5.
+# ============================================================
+---
+# Stable DNS identity for the StatefulSet.
+# publishNotReadyAddresses keeps the pod resolvable while it is
+# still catching up -- readiness will fail for a while after a
+# snapshot restore, and you still want to reach it to watch.
+apiVersion: v1
+kind: Service
+metadata:
+  name: chain-maind-headless
+  namespace: cronospos
+  labels:
+    app: chain-maind
+    app.kubernetes.io/part-of: cronospos-fullnode
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: chain-maind
+  ports:
+    - { name: p2p,     port: 26656, targetPort: 26656, protocol: TCP }
+    - { name: rpc,     port: 26657, targetPort: 26657, protocol: TCP }
+    - { name: rest,    port: 1317,  targetPort: 1317,  protocol: TCP }
+    - { name: grpc,    port: 9090,  targetPort: 9090,  protocol: TCP }
+    - { name: metrics, port: 26660, targetPort: 26660, protocol: TCP }
+---
+# In-cluster consumers. Prefer this over the headless service:
+# traffic only reaches the pod once readiness passes, so a node
+# that is still catching up is not serving stale answers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: chain-maind
+  namespace: cronospos
+  labels:
+    app: chain-maind
+    app.kubernetes.io/part-of: cronospos-fullnode
+spec:
+  type: ClusterIP
+  selector:
+    app: chain-maind
+  ports:
+    - { name: rpc,     port: 26657, targetPort: 26657, protocol: TCP }
+    - { name: rest,    port: 1317,  targetPort: 1317,  protocol: TCP }
+    - { name: grpc,    port: 9090,  targetPort: 9090,  protocol: TCP }
+    - { name: metrics, port: 26660, targetPort: 26660, protocol: TCP }
+---
+# Private VNet IP for consumers outside the cluster.
+# Delete this whole section if nothing off-cluster needs the node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: chain-maind-rpc
+  namespace: cronospos
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  labels:
+    app: chain-maind
+    app.kubernetes.io/part-of: cronospos-fullnode
+spec:
+  type: LoadBalancer
+  selector:
+    app: chain-maind
+  # nodePorts are PINNED, not auto-allocated.
+  #
+  # If the AKS subnet has no free address the internal LB cannot
+  # provision and EXTERNAL-IP stays <pending> -- but a LoadBalancer
+  # Service still allocates NodePorts and kube-proxy still programs
+  # them, so the node is reachable at <any-node-ip>:<nodePort>
+  # immediately, consuming ZERO subnet addresses.
+  #
+  # Left auto-allocated these numbers are reassigned at random if the
+  # Service is ever deleted and recreated, breaking every URL handed
+  # to a consumer. Pinned, they survive.
+  #
+  # Type stays LoadBalancer so the IP appears automatically if subnet
+  # capacity is freed. The cost is a SyncLoadBalancerFailed event
+  # every few minutes while it cannot provision; switch to
+  # type: NodePort to silence it, keeping these same numbers.
+  ports:
+    - { name: rpc,  port: 26657, targetPort: 26657, nodePort: 30657, protocol: TCP }
+    - { name: rest, port: 1317,  targetPort: 1317,  nodePort: 31317, protocol: TCP }
+    - { name: grpc, port: 9090,  targetPort: 9090,  nodePort: 30909, protocol: TCP }
+
+# ------------------------------------------------------------
+# SHARED-IP VARIANT -- use INSTEAD of chain-maind-rpc above if
+# you want one VNet address to serve every chain.
+#
+# Only the LB frontend `port` is offset. `targetPort` stays the
+# chain's real container port, so the node itself is never
+# reconfigured and nothing inside the pod changes.
+#
+# Offsets (keep in PORT-REGISTRY.md, one row per chain):
+#     cronospos  +0     rpc 26657  rest 1317  grpc 9090
+#     <next>     +100   rpc 26757  rest 1417  grpc 9190
+#     <next>     +200   rpc 26857  rest 1517  grpc 9290
+#
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: chain-maind-rpc
+#   namespace: cronospos
+#   annotations:
+#     service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+# spec:
+#   type: LoadBalancer
+#   loadBalancerIP: 10.202.17.220     # the ONE shared address
+#   selector:
+#     app: chain-maind
+#   ports:
+#     - { name: rpc,  port: 26657, targetPort: 26657, protocol: TCP }
+#     - { name: rest, port: 1317,  targetPort: 1317,  protocol: TCP }
+#     - { name: grpc, port: 9090,  targetPort: 9090,  protocol: TCP }
+# ------------------------------------------------------------

@@ -1,0 +1,252 @@
+# ============================================================
+# Cronos POS mainnet FULL NODE -- StatefulSet.
+#
+# WHAT THE COMPOSE FILE SAID, AND WHAT WE DID INSTEAD
+#
+#  compose                          here                 why
+#  ------------------------------   ------------------   ----------------------
+#  image cryptocom/chain-main:8.0.0  alpine + verified    that image is not
+#                                    upstream binary      publicly pullable
+#                                                         (401 everywhere)
+#  ports 1332/2332/3332 on host      26657/1317/9090      host ports are one
+#                                                         box's local choice
+#  --home /chain-home                --home /chain-home   kept: matches prod
+#  no resource limits                no CPU limit,        CFS throttling breaks
+#                                    4Gi mem limit        consensus timing
+#  restart: unless-stopped           StatefulSet          stable identity + PVC
+#
+# VERIFIED AGAINST THE LIVE NETWORK (not assumed):
+#   chain-id  crypto-org-chain-mainnet-1
+#   app       chain-maind 8.0.0, app_version 6   <- matches the v8.0.0 tag
+#   cometbft  0.38.22
+#   block     ~5.08s, ~17,000/day
+#
+# Init flow, each step idempotent:
+#   init-bootstrap (root)  passwd shim -> binary (sha256) ->
+#                          genesis -> streamed snapshot -> chmod
+#   init-config    (1025)  chain-maind init -> genesis -> TOML patch
+#   chain-maind    (1025)  start
+#
+# Deliberately NOT set: external_address. See 05-service.yaml.
+# ============================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: chain-maind
+  namespace: cronospos
+  labels:
+    app: chain-maind
+    app.kubernetes.io/name: chain-maind
+    app.kubernetes.io/part-of: cronospos-fullnode
+spec:
+  serviceName: chain-maind-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chain-maind
+  template:
+    metadata:
+      labels:
+        app: chain-maind
+        app.kubernetes.io/name: chain-maind
+    spec:
+      # Kubernetes' auto-injected <SVC>_PORT vars have collided with
+      # cosmos/viper key lookups before. Turn them off.
+      enableServiceLinks: false
+
+      # chain-maind must flush LevelDB cleanly. SIGKILL mid-write
+      # corrupts the store and costs a full 8.7 GB re-restore.
+      # Docker's default 10s -- what `restart: unless-stopped` gives
+      # you on the VM -- is nowhere near enough.
+      terminationGracePeriodSeconds: 600
+
+      securityContext:
+        fsGroup: 1025
+        # Only relabel when the volume's top-level owner is wrong.
+        # The default "Always" re-chowns the entire tree on EVERY
+        # start; on a pruned Cosmos store that is minutes per restart.
+        fsGroupChangePolicy: OnRootMismatch
+
+      initContainers:
+
+        # -- 1. bootstrap: tools, binary, genesis, snapshot -----
+        # Root ONLY because it must `apk add` and because it must
+        # own the extracted tree so the closing chmod can open it
+        # up to UID 1025. Capabilities are fully dropped, so this
+        # root has no CAP_DAC_OVERRIDE and cannot read or clobber
+        # files belonging to anyone else.
+        - name: init-bootstrap
+          image: alpine:3.19
+          command: ["/bin/sh", "/scripts/bootstrap.sh"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          # MUST NOT exceed the main container's requests: a pod's
+          # effective request is max(init, sum(app containers)), so a
+          # greedy init container makes the whole pod unschedulable.
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { memory: "1Gi" }
+          volumeMounts:
+            - { name: chain-home, mountPath: /chain-home }
+            - { name: bin-vol,    mountPath: /bin-vol }
+            - { name: passwd-vol, mountPath: /passwd-vol }
+            - { name: scripts,    mountPath: /scripts }
+
+        # -- 2. config: init + genesis + TOML ------------------
+        # Runs as 1025 -- the same identity as the main container --
+        # so everything it writes is readable by it with no chown.
+        - name: init-config
+          image: alpine:3.19
+          command: ["/bin/sh", "/scripts/configure.sh"]
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - { name: HOME,    value: "/chain-home" }
+            - { name: MONIKER, value: "cronospos-aks" }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "512Mi" }
+          volumeMounts:
+            - { name: chain-home, mountPath: /chain-home }
+            - { name: bin-vol,    mountPath: /bin-vol }
+            - { name: scripts,    mountPath: /scripts }
+            - { name: passwd-vol, mountPath: /etc/passwd, subPath: passwd }
+
+      containers:
+        - name: chain-maind
+          image: alpine:3.19
+          imagePullPolicy: IfNotPresent
+
+          # The upstream image's CMD is just ["chain-maind"] -- there
+          # is no entrypoint that renders config or resolves seeds, so
+          # unlike most chain images there is nothing to preserve by
+          # deferring to it. We supply the invocation, and hand-edited
+          # TOMLs are safe because nothing rewrites them on boot.
+          command: ["/bin-vol/chain-maind"]
+          args:
+            - "start"
+            - "--home"
+            - "/chain-home"
+            # Redundant with the config.toml patch, and deliberately
+            # so: the flag wins, so the RPC still binds correctly even
+            # if a future config format breaks the sed. configure.sh
+            # prints the rendered TOML either way, so a silent no-op
+            # is still visible in the logs.
+            - "--rpc.laddr"
+            - "tcp://0.0.0.0:26657"
+
+          env:
+            - { name: HOME, value: "/chain-home" }
+
+          ports:
+            - { name: p2p,     containerPort: 26656, protocol: TCP }
+            - { name: rpc,     containerPort: 26657, protocol: TCP }
+            - { name: rest,    containerPort: 1317,  protocol: TCP }
+            - { name: grpc,    containerPort: 9090,  protocol: TCP }
+            - { name: metrics, containerPort: 26660, protocol: TCP }
+
+          securityContext:
+            runAsUser: 1025
+            runAsGroup: 1025
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities: { drop: ["ALL"] }
+
+          # MINIMUM VIABLE, as asked -- but honest about the floor.
+          #
+          # Cronos POS is a light chain (5s blocks, modest tx volume)
+          # and a pruned node's steady state measures ~1.5-2.5 GB RSS.
+          # 2Gi request / 4Gi limit is the smallest pair that leaves
+          # headroom for IAVL commit spikes. A 1Gi limit WILL OOMKill.
+          #
+          # NO CPU LIMIT, on purpose. CFS throttling on a CometBFT
+          # node delays block execution past consensus timeouts and is
+          # the classic cause of a node that "runs but falls behind".
+          # 500m is a scheduling reservation, not a cap -- the node
+          # bursts into whatever the node has idle during catch-up.
+          #
+          # Fits a Standard_D4ads_v5 (4 vCPU / 16 GiB, ~3.5 CPU and
+          # ~11 GiB usable after AKS reservations) with room to spare.
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              memory: "4Gi"
+
+          # All three probes hit CometBFT's own endpoints. Probing the
+          # TCP port instead would report healthy through a total
+          # freeze, because the listener never closes.
+          startupProbe:
+            httpGet: { path: /health, port: rpc }
+            periodSeconds: 15
+            failureThreshold: 120      # up to 30 min to open the store
+          readinessProbe:
+            httpGet: { path: /health, port: rpc }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          # HEIGHT-PROGRESS liveness.
+          #
+          # Restarting a node that is merely BEHIND does not help it
+          # catch up -- but a node that is STALLED has nothing else to
+          # recover it, and CometBFT's blocksync reactor does stall in
+          # practice, with healthy peers and idle CPU.
+          #
+          # So this tests PROGRESS, not socket liveness. It fires only
+          # after the height fails to move across three consecutive
+          # 10-minute checks -- a 30-minute stall. At ~5s blocks a
+          # syncing node does >100 blocks/min, so a false positive is
+          # not plausible. If a long LevelDB compaction ever trips it,
+          # raise failureThreshold rather than deleting the probe.
+          #
+          # No jq and no curl in alpine, so this uses busybox wget and
+          # sed. /tmp is container-local, so the counter resets on
+          # restart, which is what we want.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  H=$(wget -q -T 10 -O - http://localhost:26657/status \
+                      | sed -n 's/.*"latest_block_height": *"\([0-9]*\)".*/\1/p')
+                  P=$(cat /tmp/last_height 2>/dev/null || echo 0)
+                  echo "$H" > /tmp/last_height
+                  [ -n "$H" ] && [ "$H" -gt "$P" ]
+            initialDelaySeconds: 1800
+            periodSeconds: 600
+            timeoutSeconds: 20
+            failureThreshold: 3
+
+          volumeMounts:
+            - { name: chain-home, mountPath: /chain-home }
+            - { name: bin-vol,    mountPath: /bin-vol,   readOnly: true }
+            - { name: passwd-vol, mountPath: /etc/passwd, subPath: passwd }
+
+      volumes:
+        - name: chain-home
+          persistentVolumeClaim:
+            claimName: chain-maind-data
+        # The binary lives OFF the chain disk. emptyDir is node-local
+        # ephemeral storage, re-populated by init-bootstrap on every
+        # pod (re)schedule -- a 56 MB download, not a 8.7 GB one,
+        # because the sentinel keeps the snapshot from re-running.
+        - name: bin-vol
+          emptyDir:
+            sizeLimit: 512Mi
+        - name: passwd-vol
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: chain-maind-scripts
+            defaultMode: 0755

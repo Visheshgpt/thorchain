@@ -1,0 +1,39 @@
+# ============================================================
+# Azure Disk StorageClass for Cronos POS chain data.
+#
+# cachingMode: None
+#   The store is LevelDB/IAVL -- write-heavy random IO with its
+#   own fsync discipline. Azure host ReadWrite caching in front
+#   of that adds latency spikes and is explicitly not
+#   recommended for write-heavy DB disks.
+#
+# reclaimPolicy: Retain
+#   Deleting the PVC must NOT delete the disk. Chain data costs
+#   hours to rebuild. Retain leaves the disk Released, to be
+#   reclaimed deliberately.
+#
+# Premium_LRS at 128Gi lands on P10 = 500 IOPS / 100 MB/s.
+# That is the practical floor for a Cosmos node: the smaller
+# P6 tier (64Gi) is capped at 240 IOPS, and IOPS -- not
+# capacity -- is what makes a node fall behind during catch-up.
+# See 02-pvc.yaml for the sizing math.
+#
+# StandardSSD_LRS E10 is the same 128Gi/500 IOPS for roughly
+# half the price, but with far looser latency guarantees. That
+# variance shows up as slow catch-up, so Premium is the default
+# here. Switch skuName if cost matters more than sync speed.
+# ============================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cronospos-storage
+  labels:
+    app.kubernetes.io/part-of: cronospos-fullnode
+    app.kubernetes.io/managed-by: kubectl
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+  cachingMode: None
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
