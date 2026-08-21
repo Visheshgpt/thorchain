@@ -45,21 +45,26 @@ kubectl exec -n nervos ckb-0 -c ckb -- cat /var/lib/ckb/ckb.toml
 
 If that does not show the 15 bootnodes, it is the generated file.
 
-### Cause B — outbound TCP 8114 is almost certainly blocked
+### Cause B — egress is blocked. CONFIRMED, and it is now the blocker.
 
 You already found this on Docker: the VM only started syncing once outbound
-8114 was opened. Nobody has opened it on the AKS node subnet, and this
-cluster is documented as restricting exactly this:
+8114 was opened. The same is true here, and the test in section 2 has now
+**confirmed** it — every CKB bootnode is unreachable from a pod in `nervos`
+on both 8114 and 8115.
+
+This cluster is documented as restricting exactly this:
 
 | Source | What it says |
 |---|---|
 | `AKS_SETUP/SETUP-WIKI.md:83` | "**AKS blocks outbound TCP on random ports.**" |
 | `AKS_SETUP/manifests/03-statefulset.yaml:195` | "Port 27147 direct to validator IPs is blocked by AKS NSG — do NOT use." |
 
-THORChain hit the identical wall on 27147 and had to route around it over
-443. CKB's bootnodes are on 8114. Same subnet, same NSG.
+THORChain hit the identical wall on 27147 and had to route genesis over 443
+instead. **CKB has no such escape hatch** — P2P is a continuous binary
+protocol to many peers, not a one-time file fetch.
 
-**No manifest change can fix an NSG rule.** Test it first — section 2.
+**No manifest change fixes this.** Section 2 works out which *kind* of block
+it is and gives you the exact wording to request.
 
 ### Your port observation is correct, and now it's written down
 
@@ -91,26 +96,152 @@ It has been replaced with the proven config. The old one is kept as
 
 ---
 
-## 2. Do this FIRST — the egress test
+## 2. Egress — CONFIRMED BLOCKED. This is now the blocker.
+
+The v1 test came back with **every** destination blocked, including
+`1.1.1.1:443`, with cluster DNS working.
+
+> **Correction to what v1 printed.** It labelled that "general egress
+> failure, not CKB". That verdict was wrong and has been removed. *Raw IP
+> blocked + DNS working* is the signature of an **FQDN-allowlisted egress
+> path**, not a dead one — and we know named-443 egress works on this
+> cluster, because THORChain pulls genesis from `gateway.liquify.com` and
+> Cronos streams an 8.7 GB snapshot from `snapshots.polkachu.com`.
+
+### Why the distinction decides your next move
+
+Azure Firewall has two rule types, and only one of them can help you:
+
+| Rule type | Matches on | Can it allow CKB P2P? |
+|---|---|---|
+| **Application rule** | FQDN, via TLS SNI or HTTP `Host` | **No. Ever.** |
+| **Network rule** | destination IP + port (L4) | Yes |
+
+**CKB P2P dials raw IPs and speaks its own binary protocol — no hostname, no
+SNI, no `Host` header.** There is nothing for an application rule to match.
+If you ask for "allow the CKB bootnodes" against an FQDN allowlist, you will
+get a rule that silently does nothing and a week of confusion.
+
+The ask has to be an **L4 network rule** (or an NSG rule). Section 2c has the
+wording.
+
+### 2a. Re-run the test — v2 tells the cases apart
 
 ```powershell
-kubectl apply -f manifest/99-egress-test.yaml
+kubectl delete -f manifest/99-egress-test.yaml --ignore-not-found
+kubectl apply  -f manifest/99-egress-test.yaml
 kubectl logs -n nervos ckb-egress-test -f
 kubectl delete -f manifest/99-egress-test.yaml
 ```
 
-| Result | Meaning | Next step |
-|---|---|---|
-| any `OPEN ...:8114` | Egress is fine | Deploy section 3. Should sync. |
-| all `BLOCKED` on 8114, `OPEN 1.1.1.1:443` | NSG / Azure Firewall | **Get outbound TCP 8114 + 8115 opened on the AKS node subnet.** Same rule that fixed the VM. Then deploy section 3. |
-| `BLOCKED 1.1.1.1:443` too | General egress failure | Not a CKB problem. Escalate to whoever owns the cluster network. |
+v2 probes named hosts on 443, raw IPs on 443, a named host on a non-443 port,
+the CKB bootnodes, and Azure-local endpoints — and times each one, because a
+fast fail means *rejected* (something on-path answered) while a slow fail
+means *silently dropped* (the Azure Firewall / NSG signature).
 
-If you need to hand the network team a concrete ask:
+| Section 1 (named:443) | Section 2 (raw IP:443) | Section 4 (bootnode:8114) | Case | Who fixes it |
+|---|---|---|---|---|
+| OPEN | BLOCKED | BLOCKED | **A** — FQDN allowlist | Network team, **L4 network rule** |
+| OPEN | OPEN | BLOCKED | **B** — port block (NSG) | Network team, NSG rule |
+| BLOCKED | BLOCKED | BLOCKED, *and* section 5 partly blocked | **C** — NetworkPolicy | **You. See 2b.** |
+| BLOCKED everywhere, other chains also broken | | | **D** — no egress at all | Cluster owner |
 
-> Allow outbound TCP 8114 and 8115 from the AKS node subnet
-> (`10.202.17.192/27`) to the internet. Nervos CKB mainnet peer discovery
-> dials bootnodes on those ports; without it the node holds 0 peers and
-> never syncs.
+### 2b. Three commands that find the cause, not the symptom
+
+**The control that matters most — are the other chains still syncing?** If
+Cronos and THORChain are fine, egress works for *them*, and the difference is
+either the port or the node pool:
+
+```powershell
+kubectl get pods -A -o wide | Select-String "chain-maind|thornode|ckb"
+
+kubectl exec -n cronospos chain-maind-0 -c chain-maind -- `
+  wget -q -T 10 -O - http://localhost:26657/status
+```
+
+Look at `catching_up` and whether `latest_block_height` moves between two
+runs a minute apart. Note the **NODE column** — if `ckb-0` is on a different
+node than `chain-maind-0`, the two may sit in different subnets with
+different rules, and that alone would explain everything.
+
+**Is it a NetworkPolicy?** This is the one case you can fix yourself, so rule
+it out first — it costs one command:
+
+```powershell
+kubectl get netpol -A
+kubectl describe netpol -n nervos
+```
+
+A default-deny egress policy with a DNS carve-out produces *exactly* the
+symptom you saw. If one exists in `nervos`, that is your answer.
+
+**What is the cluster's egress architecture?**
+
+```powershell
+az aks show -g azrg-cus-coinia-aks-dev -n cuscoiniadevaks `
+  --query "networkProfile.{outboundType:outboundType,plugin:networkPlugin,policy:networkPolicy,lbSku:loadBalancerSku}" -o table
+
+# node resource group, then the NSG rules on it
+az aks show -g azrg-cus-coinia-aks-dev -n cuscoiniadevaks --query nodeResourceGroup -o tsv
+az network nsg list -g <that-node-RG> -o table
+az network nsg rule list -g <that-node-RG> --nsg-name <nsg-name> -o table
+```
+
+Read `outboundType`:
+
+- **`userDefinedRouting`** → all egress is forced through an Azure Firewall
+  or NVA. Case A. Nothing leaves without an explicit rule.
+- **`loadBalancer`** (the default) → egress is *not* forced through a
+  firewall, so a blanket block points at an **NSG** on the node subnet or a
+  NetworkPolicy. Case B or C.
+- **`networkPolicy: azure` / `calico` / `cilium`** → NetworkPolicy is
+  actually enforced here, which makes case C live. `null` rules it out.
+
+### 2c. The exact ask for the network team
+
+Send this as written. The specificity is the point — "open 8114" against an
+FQDN allowlist produces a rule that does nothing.
+
+> **Request: L4 outbound network rule for the AKS node subnet**
+>
+> Source: AKS node subnet `10.202.17.192/27` (cluster `cuscoiniadevaks`,
+> RG `azrg-cus-coinia-aks-dev`)
+> Protocol: TCP
+> Destination ports: **8114 and 8115**
+> Destination: internet (or the 15 IPs listed below, if a narrow rule is
+> preferred)
+>
+> This must be an **Azure Firewall NETWORK rule (or an NSG rule)** — *not*
+> an application/FQDN rule. Nervos CKB peer-to-peer dials bootnodes by raw
+> IP using a binary protocol with no TLS SNI and no HTTP Host header, so
+> there is no FQDN for an application rule to match. An application rule
+> will not work here.
+>
+> Without it the node holds 0 peers and never syncs. The same rule on the
+> standalone VM is what made that node start syncing.
+>
+> Bootnode IPs, all TCP/8114:
+> `16.163.82.218`, `35.79.196.111`, `13.234.144.148`, `34.64.120.143`,
+> `3.218.170.86`, `35.236.107.161`, `23.101.191.12`, `20.151.143.237`,
+> `52.59.155.249`, `3.10.216.39`, `13.37.172.80`, `34.118.49.255`,
+> `40.115.75.216`, `34.176.239.95`, `13.245.217.98`
+>
+> Note: a narrow 15-IP rule gets the node *started*, but CKB discovers and
+> dials further peers on its own after that, so a node restricted to only
+> these 15 will have permanently poor peer quality. Internet-destination on
+> TCP 8114/8115 is strongly preferred.
+
+### 2d. Meanwhile
+
+Everything in section 3 onward is still worth applying now — the unmounted
+`ckb.toml` was a genuine, separate defect and the node cannot sync with it
+either. Fixing config now means that the moment the firewall rule lands, the
+node starts syncing with no further work. Just do not expect blocks before
+the rule exists.
+
+There is no way to route CKB P2P over 443 the way THORChain routed genesis
+over Liquify's HTTPS gateway. Genesis is a one-time file fetch; P2P is a
+continuous binary protocol to many peers. No HTTPS gateway substitutes for it.
 
 ---
 

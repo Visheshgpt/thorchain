@@ -1,48 +1,60 @@
 # ============================================================
-# THROWAWAY DIAGNOSTIC POD -- run this BEFORE debugging anything
-# else. It answers the one question the manifests cannot:
+# EGRESS DIAGNOSTIC v2 -- distinguishes WHICH kind of egress
+# restriction this cluster has.
 #
-#   Can a pod on this cluster open an OUTBOUND TCP connection to
-#   a CKB mainnet bootnode on port 8114?
+# v1 of this pod returned:
+#     BLOCKED all bootnodes :8114
+#     BLOCKED all bootnodes :8115
+#     BLOCKED 1.1.1.1:443
+#     OK      cluster DNS
 #
-# On the Docker VM the answer was NO until outbound 8114 was
-# opened, and opening it is what made that node start syncing.
-# Nobody has confirmed the answer for the AKS node subnet, and
-# this cluster's own docs say outbound is restricted:
-#   AKS_SETUP/SETUP-WIKI.md        "AKS blocks outbound TCP on
-#                                   random ports"
-#   AKS_SETUP/manifests/03-statefulset.yaml:195
-#                                  "Port 27147 direct to
-#                                   validator IPs is blocked by
-#                                   AKS NSG -- do NOT use"
+# v1 called that "general egress failure". THAT VERDICT WAS
+# WRONG and this file replaces it. "Raw IP blocked + DNS OK" is
+# the signature of an FQDN-ALLOWLISTED egress path, not a dead
+# one -- and we already know named-443 egress works on this
+# cluster, because THORChain pulls genesis from
+# gateway.liquify.com and Cronos streams an 8.7 GB snapshot
+# from snapshots.polkachu.com, both over 443.
 #
-# It probes FOUR bootnodes on 8114, not one -- individual
-# bootnodes go down and a single BLOCKED result would be
-# ambiguous. It also probes 443 as a control: if 443 is blocked
-# too, egress is broken generally and this is not a CKB problem.
+# WHY THE DISTINCTION DECIDES EVERYTHING
 #
-# Runs as UID 1000 non-root with all capabilities dropped, so
-# Gatekeeper on this cluster admits it.
+#   Azure Firewall has two rule types:
+#     APPLICATION rule -- matches on FQDN, via TLS SNI or the
+#                         HTTP Host header
+#     NETWORK rule     -- matches on destination IP + port (L4)
 #
-# Apply, read the logs, delete:
+#   CKB P2P dials raw IPs and speaks its own binary protocol.
+#   No hostname. No SNI. No Host header. So an APPLICATION rule
+#   CAN NEVER ALLOW IT, no matter what FQDN is added to it.
+#
+#   The ask therefore has to be a NETWORK rule (or an NSG rule).
+#   Asking for "please allow ckb bootnodes" against an FQDN
+#   allowlist gets you a rule that silently does nothing.
+#
+# THE FOUR CASES THIS TELLS APART
+#
+#   A. FQDN-allowlist firewall   443-by-name OPEN, raw IP BLOCKED
+#                                -> need an L4 NETWORK rule for
+#                                   the 15 bootnode IPs on 8114
+#   B. NSG port block            443 OPEN both by name and by raw
+#                                   IP, only 8114/8115 BLOCKED
+#                                -> need an NSG outbound rule
+#   C. NetworkPolicy             everything BLOCKED except DNS,
+#                                   and `kubectl get netpol -A`
+#                                   shows a policy in `nervos`
+#                                -> WE can fix this ourselves
+#   D. Truly no egress           even 443-by-name BLOCKED, and
+#                                   Cronos/THORChain are also
+#                                   broken -> cluster-wide, and
+#                                   not a CKB question
+#
+# Apply, read, delete:
 #   kubectl apply -f 99-egress-test.yaml
 #   kubectl logs -n nervos ckb-egress-test -f
 #   kubectl delete -f 99-egress-test.yaml
 #
-# READING THE RESULT
-#   8114 OPEN on any bootnode     -> egress is fine. The problem
-#                                    was the unmounted config;
-#                                    the fix in this directory
-#                                    covers it.
-#   8114 BLOCKED on all four,
-#     443 OPEN                    -> NSG / Azure Firewall. NO
-#                                    manifest change fixes this.
-#                                    Get outbound TCP 8114 (and
-#                                    8115) opened on the AKS node
-#                                    subnet -- the same rule that
-#                                    fixed the VM.
-#   443 BLOCKED too               -> general egress failure, not
-#                                    a CKB issue at all.
+# ALSO RUN THE THREE COMMANDS IN README-AKS.md SECTION 2b.
+# This pod sees symptoms; those commands see the cause.
 # ============================================================
 apiVersion: v1
 kind: Pod
@@ -53,10 +65,6 @@ metadata:
     app: ckb-egress-test
 spec:
   restartPolicy: Never
-  # Schedule where the real node runs. If you later pin ckb to a
-  # node pool, copy the same nodeSelector/tolerations here --
-  # egress rules can differ per subnet, and testing from the
-  # wrong pool gives you a confident wrong answer.
   containers:
     - name: probe
       image: alpine:3.19
@@ -72,46 +80,96 @@ spec:
       command: ["/bin/sh", "-c"]
       args:
         - |
-          echo "=== CKB mainnet bootnodes, OUTBOUND TCP 8114 ==="
-          echo "    (8114 is the port the bootnodes LISTEN on;"
-          echo "     8115 is what our own node listens on)"
-          for ip in 16.163.82.218 35.79.196.111 3.218.170.86 13.37.172.80; do
-            if nc -z -w 8 "$ip" 8114 2>/dev/null; then
-              echo "  OPEN    $ip:8114"
-            else
-              echo "  BLOCKED $ip:8114"
-            fi
-          done
+          # Timed probe. The DURATION matters as much as the result:
+          #   fast fail (<2s)  = actively REJECTED (RST) -- something
+          #                      on-path answered. NetworkPolicy or a
+          #                      firewall configured to reject.
+          #   slow fail (=to)  = silently DROPPED -- classic Azure
+          #                      Firewall / NSG deny.
+          try() {
+            label="$1"; host="$2"; port="$3"
+            s=$(date +%s)
+            if nc -z -w 8 "$host" "$port" 2>/dev/null; then r="OPEN   "; else r="BLOCKED"; fi
+            e=$(date +%s)
+            printf '  %s  %-34s %ss   %s\n' "$r" "$host:$port" "$((e-s))" "$label"
+          }
+
+          echo "############ 1. NAMED HOSTS ON 443 ############"
+          echo "# The decisive test. These are the exact FQDNs the other"
+          echo "# chains on this cluster already reach successfully."
+          try "docker hub (image pulls)"      registry-1.docker.io      443
+          try "THORChain uses this"           gateway.liquify.com       443
+          try "Cronos snapshot source"        snapshots.polkachu.com    443
+          try "microsoft"                     mcr.microsoft.com         443
 
           echo ""
-          echo "=== same hosts on 8115 (secondary; some peers use it) ==="
-          for ip in 16.163.82.218 35.79.196.111 3.218.170.86 13.37.172.80; do
-            if nc -z -w 8 "$ip" 8115 2>/dev/null; then
-              echo "  OPEN    $ip:8115"
-            else
-              echo "  BLOCKED $ip:8115"
-            fi
-          done
+          echo "############ 2. RAW IPs ON 443 ############"
+          echo "# Same port, no hostname. If section 1 is OPEN and this"
+          echo "# is BLOCKED, the egress path filters on FQDN/SNI."
+          try "cloudflare dns"                1.1.1.1                   443
+          try "google dns"                    8.8.8.8                   443
 
           echo ""
-          echo "=== control: 443 and DNS ==="
-          if nc -z -w 8 1.1.1.1 443 2>/dev/null; then
-            echo "  OPEN    1.1.1.1:443"
-          else
-            echo "  BLOCKED 1.1.1.1:443   <-- general egress failure, not CKB"
-          fi
+          echo "############ 3. NAMED HOST, NON-443 PORT ############"
+          echo "# Cronos POS seed on its p2p port, BY NAME. Separates"
+          echo "# 'only 443 is allowed' from 'only FQDNs are allowed'."
+          try "cronos seed p2p"               seed-0.crypto.org         26656
+          try "cronos seed p2p"               seed-1.crypto.org         26656
+
+          echo ""
+          echo "############ 4. CKB BOOTNODES (raw IP, 8114) ############"
+          echo "# What we actually need. Raw IP + odd port = the hardest"
+          echo "# case for any allowlist to permit."
+          try "ckb bootnode"                  16.163.82.218             8114
+          try "ckb bootnode"                  35.79.196.111             8114
+          try "ckb bootnode"                  3.218.170.86              8114
+
+          echo ""
+          echo "############ 5. IN-CLUSTER / AZURE-LOCAL ############"
+          echo "# These must work regardless of internet egress. If they"
+          echo "# fail, the problem is a NetworkPolicy, not a firewall."
+          try "kube-dns service"              kube-dns.kube-system      53
+          try "azure wireserver"              168.63.129.16             80
           if nslookup github.com >/dev/null 2>&1; then
-            echo "  OK      cluster DNS"
+            echo "  OK       cluster DNS resolution"
           else
-            echo "  FAIL    cluster DNS"
+            echo "  FAIL     cluster DNS resolution"
           fi
 
           echo ""
-          echo "=== verdict ==="
-          echo "  any 8114 OPEN            -> egress fine; the unmounted"
-          echo "                              ckb.toml was the problem"
-          echo "  all 8114 BLOCKED, 443 OK -> NSG/Azure Firewall. Open"
-          echo "                              outbound TCP 8114 + 8115 on"
-          echo "                              the AKS node subnet. No"
-          echo "                              manifest change fixes this."
+          echo "############ 6. WHAT IS OUR EGRESS IP ############"
+          echo "# If this returns an address, real internet egress works"
+          echo "# and we can see which SNAT path we take."
+          wget -q -T 10 -O - https://api.ipify.org 2>/dev/null \
+            && echo "   <- our public egress IP" \
+            || echo "  (no answer -- either no 443 egress, or busybox wget lacks TLS)"
+
+          echo ""
+          echo "############################################"
+          echo "#                 VERDICT                  #"
+          echo "############################################"
+          echo "# Read sections 1 vs 2 first, then 4:"
+          echo "#"
+          echo "#  1 OPEN, 2 BLOCKED, 4 BLOCKED"
+          echo "#     -> CASE A: FQDN-allowlist firewall."
+          echo "#        Azure Firewall APPLICATION rules cannot ever"
+          echo "#        allow CKB p2p -- it has no SNI to match on."
+          echo "#        ASK FOR AN L4 NETWORK RULE. Exact wording is"
+          echo "#        in README-AKS.md section 2c."
+          echo "#"
+          echo "#  1 OPEN, 2 OPEN, 4 BLOCKED"
+          echo "#     -> CASE B: plain port block (NSG)."
+          echo "#        Ask for outbound TCP 8114+8115 on the node"
+          echo "#        subnet. Simplest case."
+          echo "#"
+          echo "#  5 partly BLOCKED, everything else BLOCKED"
+          echo "#     -> CASE C: NetworkPolicy inside the cluster."
+          echo "#        Run 'kubectl get netpol -A'. WE CAN FIX THIS."
+          echo "#"
+          echo "#  1 BLOCKED as well"
+          echo "#     -> CASE D: no egress at all. Confirm by checking"
+          echo "#        whether Cronos/THORChain still sync. If they"
+          echo "#        do, this pod is on a different node pool with"
+          echo "#        different rules -- see README-AKS.md 2b."
+          echo "############################################"
           sleep 5
