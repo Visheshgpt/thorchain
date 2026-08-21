@@ -96,141 +96,146 @@ It has been replaced with the proven config. The old one is kept as
 
 ---
 
-## 2. Egress — CONFIRMED BLOCKED, and the bootnodes are confirmed alive
+## 2. Egress — SOLVED: outbound TCP 8114 is blocked, and nothing else
 
-### 2a. What the tests established
+### 2a. The finding
 
-| Probe | Result |
-|---|---|
-| `registry-1.docker.io:443`, `gateway.liquify.com:443`, `snapshots.polkachu.com:443`, `mcr.microsoft.com:443` | **OPEN**, 0s |
-| `8.8.8.8:443` (raw IP) | **OPEN**, 0s |
-| `1.1.1.1:443` (raw IP) | BLOCKED, 8s drop |
-| `seed-0.crypto.org:26656` (name, non-443 port) | **OPEN**, 1s |
-| CKB bootnodes, raw IP `:8114` | BLOCKED, 8s drop |
-| Pod egress IP | `13.86.34.113` — real internet egress exists |
+Three tests, each holding one variable fixed:
 
-**Independently verified from an unrestricted network**, all in under a
-second:
-
-```
-OPEN  16.163.82.218:8114     OPEN  35.79.196.111:8114     OPEN  3.218.170.86:8114
-OPEN  13.37.172.80:8114      OPEN  13.234.144.148:8114
-```
-
-Two things follow, and both matter:
-
-1. **The bootnode list is not stale.** Those hosts are up and answering on
-   8114. Something between the pod and them is dropping the connection. The
-   network team's first question will be "are you sure they're up?" — the
-   answer is yes, verified.
-2. **The bootnodes listen on 8114 only** — `:8115` is closed on all five.
-   8115 matters for *discovered* peers, not for the cold start.
-
-Two corrections to what the earlier tests printed:
-
-> **`168.63.129.16:80 BLOCKED` is normal.** AKS deliberately blocks pods from
-> the Azure wireserver/IMDS to prevent credential theft. The v2 test called
-> it "must work regardless" — wrong. It is not evidence of a NetworkPolicy.
-
-> **`BLOCKED 1.1.1.1:443` did not mean "general egress failure."** `8.8.8.8:443`
-> is open, and so is every named host. That verdict from v1 is withdrawn.
-
-### 2b. One question left, two very different asks
-
-`seed-0.crypto.org:26656` being OPEN proves **arbitrary outbound ports are
-not blocked wholesale**. So the discriminator is either the port or
-raw-IP-vs-name:
-
-| | What it means | The ask |
+| Test | Result | Rules out |
 |---|---|---|
-| **H-PORT** | TCP 8114 specifically is blocked; raw IPs are otherwise fine. 26656 works because someone opened it for Cronos. | "Allow outbound TCP 8114+8115." **Easy.** |
-| **H-IP** | Raw-IP egress is denied. The firewall proxies DNS and allows only addresses *it* resolved — dial by name, allowed; dial a raw IP, denied. (Azure Firewall's FQDN-in-network-rules / DNS-proxy mode.) | L4 network rule to an **Internet** destination. Much bigger, and no FQDN rule can ever substitute. |
+| **A** — `portquiz.net` (one name, many ports) | 443 OPEN · 80 OPEN · 26656 OPEN · **8115 OPEN** · **8114 BLOCKED** | a broad port block |
+| **B** — same host+port, name vs raw IP | `34.143.175.3:26656` OPEN · `35.180.139.74:443` OPEN | FQDN/DNS-proxy filtering |
+| **C** — same bootnode IP, two ports | `:443` OPEN · `:8114` BLOCKED (×3 IPs) | the remote host being down |
 
-Everything observed so far is consistent with *both*. Run v3 — it holds one
-variable fixed and moves the other:
+**Outbound TCP 8114 is blocked. Every other port tested is open, including
+8115. Raw IPs are fine.** That matches the VM exactly — opening outbound 8114
+there is what made it sync.
 
-```powershell
-kubectl delete -f manifest/99-egress-test.yaml --ignore-not-found
-kubectl apply  -f manifest/99-egress-test.yaml
-kubectl logs -n nervos ckb-egress-test -f
-kubectl delete -f manifest/99-egress-test.yaml
-```
+Supporting facts, verified from an unrestricted network:
 
-**Block C is decisive.** `16.163.82.218` answers on *both* 443 and 8114 from
-an unrestricted network, so from the pod:
+- All 15 bootnodes are **up and answering on 8114** — the list is not stale.
+  Expect this to be the network team's first question.
+- The bootnodes listen on **8114 only**; `:8115` is closed on all of them.
 
-- `:443` OPEN + `:8114` BLOCKED → **H-PORT**. The easy case.
-- both BLOCKED → **H-IP**. Block B confirms it: name OPEN + raw IP BLOCKED on
-  the same host and port.
+Three earlier verdicts are withdrawn: `1.1.1.1:443 BLOCKED` did not mean
+general egress failure (`8.8.8.8:443` is open); `168.63.129.16:80 BLOCKED` is
+normal AKS pod hardening against IMDS credential theft, not a NetworkPolicy;
+and the v3 pod's `node:` line printed the *pod* name, since `cat /etc/hostname`
+in a container is not the node — the `nodeName` pin itself is a hard
+assignment and did place it on `...vmss00000p`.
 
-v3 is pinned with `nodeName` to `aks-aksnodepool-15306923-vmss00000p`, the
-node `ckb-0` actually runs on. v2 ran on `...vmss00000m`. Same pool, so
-almost certainly the same rules — but "almost certainly" is how you lose a
-day. If `ckb-0` moves, update `nodeName` (`kubectl get pod ckb-0 -n nervos -o wide`).
+### 2b. The ask — one port
 
-### 2c. The ask for the network team
-
-Send whichever matches the v3 verdict. The specificity is the point.
-
-**If H-PORT:**
-
-> Please allow **outbound TCP 8114 and 8115** from the AKS node subnet
+> Please allow **outbound TCP 8114** from the AKS node subnet
 > `10.202.17.192/27` (cluster `cuscoiniadevaks`, RG `azrg-cus-coinia-aks-dev`)
 > to the internet.
 >
-> Nervos CKB peer-to-peer dials bootnodes on TCP 8114. We have verified the
-> destination hosts are up and answering from an unrestricted network, and
-> that outbound TCP 26656 already works from this subnet — so this is a
-> port-specific block. Without the rule the node holds 0 peers and never
-> syncs. The equivalent rule on the standalone VM is what made that node
-> start syncing.
-
-**If H-IP:**
-
-> Please add an **Azure Firewall L4 NETWORK rule** (not an application/FQDN
-> rule) allowing the AKS node subnet `10.202.17.192/27` outbound **TCP 8114
-> and 8115 to destination `Internet`**.
+> Nervos CKB peer-to-peer dials its bootnodes on TCP 8114. We have isolated
+> this to that single port: from this subnet, outbound TCP 80, 443, 8115 and
+> 26656 all succeed, to both named hosts and raw IPs, while 8114 is dropped
+> (8s timeout) to every destination tested — including the *same IP* that
+> accepts a connection on 443. The destination hosts are confirmed up and
+> answering on 8114 from an unrestricted network.
 >
-> This cannot be done with an application/FQDN rule. Nervos CKB
-> peer-to-peer dials peers **by raw IP** using a binary protocol with no TLS
-> SNI and no HTTP `Host` header, so there is no FQDN for an application rule
-> to match. We have confirmed from this subnet that named destinations on
-> non-standard ports succeed while the same class of raw-IP destination is
-> dropped.
->
-> A narrow 15-IP allowlist would get the node *started*, but CKB's discovery
-> protocol then hands it hundreds of new peer IPs to dial, all of which
-> would be denied — leaving the node permanently peer-starved. An Internet
-> destination on TCP 8114/8115 is what actually works.
->
-> Bootnode IPs, verified live on TCP/8114:
-> `16.163.82.218`, `35.79.196.111`, `13.234.144.148`, `34.64.120.143`,
-> `3.218.170.86`, `35.236.107.161`, `23.101.191.12`, `20.151.143.237`,
-> `52.59.155.249`, `3.10.216.39`, `13.37.172.80`, `34.118.49.255`,
-> `40.115.75.216`, `34.176.239.95`, `13.245.217.98`
+> Without it the node holds 0 peers and never syncs. The equivalent rule on
+> the standalone VM is what made that node start syncing.
 
-Useful supporting detail either way:
+**8115 does not need to be requested — it is already open.**
+
+Useful context to attach:
 
 ```powershell
 az aks show -g azrg-cus-coinia-aks-dev -n cuscoiniadevaks `
   --query "networkProfile.{outboundType:outboundType,plugin:networkPlugin,policy:networkPolicy}" -o table
-kubectl get netpol -A
 ```
 
-`outboundType: userDefinedRouting` → egress is forced through a firewall,
-which favours H-IP. `loadBalancer` → points at an NSG instead, favouring
-H-PORT. `networkPolicy: null` rules out an in-cluster policy entirely.
+### 2c. Workaround that needs no firewall change at all
 
-### 2d. Meanwhile
+You may not have to wait for the ticket.
 
-Everything from section 3 onward is still worth applying now. The unmounted
-`ckb.toml` was a genuine, separate defect — the node cannot sync with it
-either. Fix config now and the node starts syncing the moment the firewall
-rule lands, with no further work. Just do not expect blocks before then.
+**CKB's default P2P port is 8115** — that is why our own node listens there.
+Only the official *bootnodes* use 8114. Most ordinary nodes on the network
+are on 8115, and **8115 is already open outbound from this cluster.**
 
-There is no way to route CKB P2P over 443 the way THORChain routed genesis
+So the node does not need 8114 to sync. It needs *one reachable peer* to
+bootstrap discovery, and any live 8115 peer will do. Your VM is syncing right
+now and is holding a list of exactly those.
+
+**Step 1 — harvest live 8115 peers from the VM** (run on the VM, not Windows):
+
+```bash
+curl -s -X POST http://127.0.0.1:8114 \
+  -H 'Content-Type: application/json' \
+  -d '{"id":1,"jsonrpc":"2.0","method":"get_peers","params":[]}' \
+| python3 -c '
+import sys, json, ipaddress, re
+peers = json.load(sys.stdin)["result"]
+seen, out = set(), []
+for p in peers:
+    nid = p.get("node_id")
+    cands = [a["address"] for a in p.get("addresses", [])]
+    if p.get("connected_addr"): cands.append(p["connected_addr"])
+    for addr in cands:
+        if "/tcp/8115" not in addr: continue
+        m = re.search(r"/ip4/([0-9.]+)/", addr)
+        if not m: continue
+        try:
+            if not ipaddress.ip_address(m.group(1)).is_global: continue
+        except ValueError: continue
+        if "/p2p/" not in addr and nid: addr = addr.rstrip("/") + "/p2p/" + nid
+        if "/p2p/" not in addr: continue
+        if addr in seen: continue
+        seen.add(addr); out.append(addr)
+for a in out[:25]: print(f'      "{a}",')
+print(f"# {len(out)} distinct 8115 peers found", file=sys.stderr)
+'
+```
+
+**Step 2 — paste them into the `bootnodes = [` list** in
+`manifest/03-configmap-ckb.yaml`, *above* the existing 15 entries. Keep the
+8114 ones: they cost only a timed-out dial each, and the moment the firewall
+rule lands they start working with no config change.
+
+**Step 3 — apply and restart:**
+
+```powershell
+kubectl apply -f manifest/03-configmap-ckb.yaml
+kubectl rollout restart statefulset/ckb -n nervos
+```
+
+Then check `get_peers` per section 6. Once *any* peer connects, CKB's
+Discovery protocol supplies more, and it writes them to its own peer store on
+the PVC (`data/network/peer_store`) — so the node becomes self-sustaining and
+these seed entries stop mattering. Harvested IPs go stale, so treat them as
+a bootstrap aid, not permanent config.
+
+**Honest limits of the workaround.** Peer quality will be thinner than a
+node that can also reach the 8114 bootnodes, and if a cold start ever happens
+when every seeded peer has churned, it will not bootstrap. Keep pursuing 2b —
+this buys you the sync time while the ticket moves, it is not a substitute.
+
+**A second option, if the harvest comes back short:** your VM can be the
+bridge peer directly. It is not currently reachable from the internet
+(`20.118.15.24:8115` is closed inbound, checked externally), but that is a VM
+NSG rule *you* control, and it can be scoped to a single source — the AKS
+egress IP `13.86.34.113`. Then add the VM to `bootnodes` as
+`/ip4/20.118.15.24/tcp/8115/p2p/<VM node id>`, where the node id comes from:
+
+```bash
+curl -s -X POST http://127.0.0.1:8114 -H 'Content-Type: application/json' \
+  -d '{"id":1,"jsonrpc":"2.0","method":"local_node_info","params":[]}'
+```
+
+### 2d. Either way, apply the config fix now
+
+Section 3 onward stands on its own. The unmounted `ckb.toml` was a genuine,
+separate defect — the node cannot sync with it regardless of the firewall.
+Fix config now and the node starts syncing the moment either 2b or 2c lands.
+
+There is no way to tunnel CKB P2P over 443 the way THORChain routed genesis
 over Liquify's HTTPS gateway. Genesis is a one-time file fetch; P2P is a
-continuous binary protocol to many peers. No HTTPS gateway substitutes.
+continuous binary protocol to many peers.
 
 ---
 
