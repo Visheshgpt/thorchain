@@ -124,6 +124,7 @@ spec:
               set -eu
               HOME_DIR=/chain-home
               SENTINEL="$HOME_DIR/.snapshot-restored"
+              INPROGRESS="$HOME_DIR/.restore-in-progress"
               SNAP_PAGE="https://polkachu.com/tendermint_snapshots/cryptocom"
               SNAP_BASE="https://snapshots.polkachu.com/snapshots/cryptocom"
 
@@ -134,12 +135,25 @@ spec:
 
               # DO NOT DELETE DATA WE DID NOT PUT THERE. An unguarded
               # rm -rf in an init container is one bad boot away from
-              # destroying a migrated chain dir. Fail loudly instead.
+              # destroying a migrated chain dir.
+              #
+              # But a partial extract from OUR OWN interrupted attempt
+              # is not foreign data, and refusing to clean it up would
+              # deadlock every restart after a failure. INPROGRESS is
+              # how we tell the two apart: written before extraction,
+              # removed on success. Populated data + no marker means
+              # someone else's chain dir -> refuse. Populated data +
+              # marker means our own wreckage -> safe to clear.
               if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
-                echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
-                echo "[restore] Refusing to overwrite data this script did not create."
-                echo "[restore] If this data IS good, run:  touch $SENTINEL"
-                exit 1
+                if [ -f "$INPROGRESS" ]; then
+                  echo "[restore] partial extract from a previous attempt -- clearing"
+                  rm -rf "$HOME_DIR/data"
+                else
+                  echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
+                  echo "[restore] Refusing to overwrite data this script did not create."
+                  echo "[restore] If this data IS good, run:  touch $SENTINEL"
+                  exit 1
+                fi
               fi
 
               echo "[restore] installing curl + lz4"
@@ -161,6 +175,7 @@ spec:
               echo "[restore] selected $FILE (height $HEIGHT, ~8.7 GB)"
 
               mkdir -p "$HOME_DIR"
+              touch "$INPROGRESS"
               ATTEMPT=0
               while : ; do
                 ATTEMPT=$((ATTEMPT + 1))
@@ -172,8 +187,23 @@ spec:
                 # Streamed, never staged: the 8.7 GB tarball is never
                 # written down, so the PVC needs no download+extract
                 # peak. Cost of streaming is no resume -- hence retries.
+                # --no-same-owner is REQUIRED, not tidiness.
+                # The tarball's files are owned by the producer's uid
+                # (Polkachu uses 1001). tar running as root defaults to
+                # --same-owner and tries to chown each one back; this
+                # container has ALL capabilities dropped, so it has no
+                # CAP_CHOWN and every chown fails. GNU tar treats that
+                # as an ERROR, not a warning -- it finishes extracting
+                # but exits 2, which sends this `if` down the failure
+                # branch, deletes the 8.7 GB it just wrote, and retries
+                # until the attempt limit. Symptom in the logs:
+                #   tar: data/application.db/NNNN.ldb: Cannot change
+                #        ownership to uid 1001, gid 1001
+                # With --no-same-owner the files land owned by root,
+                # which is what we want -- the chmod below is what
+                # hands them to UID 1025.
                 if curl -fL --retry 3 --retry-delay 10 "$SNAP_BASE/$FILE" \
-                     | lz4 -dc - | tar -x -C "$HOME_DIR" ; then
+                     | lz4 -dc - | tar -x --no-same-owner -C "$HOME_DIR" ; then
                   # POSIX sh has no pipefail, so tar can exit 0 on a
                   # truncated stream. Verify the stores actually landed.
                   OK=1
@@ -194,6 +224,7 @@ spec:
               done
 
               echo "$HEIGHT" > "$SENTINEL"
+              rm -f "$INPROGRESS"
               # Extracted as root; everything after this runs as 1025.
               # CAP_CHOWN is dropped so chown is unavailable, but root
               # can chmod its OWN files. This runs only inside the

@@ -87,6 +87,7 @@ node replays several hundred blocks/min, so expect **tip within 1–3 hours**.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `install-chain-maind`: `sha256 mismatch` | upstream re-cut the release, or a corrupt transfer | re-hash upstream `checksums.txt`; update `SHA` in `03-statefulset.yaml` |
+| `restore-snapshot`: `tar: ...: Cannot change ownership to uid 1001, gid 1001` | the tarball carries the producer's uid; tar as root defaults to `--same-owner` and this container has no `CAP_CHOWN`. **Not cosmetic** — GNU tar exits 2, so the script deletes the extract and retries until it gives up | fixed by `--no-same-owner` in `03-statefulset.yaml`. If you see it, you are running an older copy of the manifest — re-apply and restart |
 | `restore-snapshot`: `could not discover a snapshot filename` | Polkachu page markup changed, or egress to `polkachu.com:443` blocked | open the page by hand, then §7 |
 | `FATAL: data is populated but has no sentinel` | working as designed — refusing to delete data it did not create | if the data is good: `touch /chain-home/.snapshot-restored`. If not, delete the PVC. |
 | PVC stuck `Pending` | `WaitForFirstConsumer` — normal until the pod schedules | if it persists, `kubectl describe pod` — it is a CPU/memory fit problem, not a disk one |
@@ -118,6 +119,51 @@ kubectl scale statefulset chain-maind -n cronospos --replicas=1
 To force a fresh snapshot, delete the sentinel **and** the data dir first — from a throwaway
 pod mounting the PVC, not from the node pod. Deleting the sentinel alone is not enough:
 `bootstrap.sh` will refuse to overwrite a populated data dir, by design.
+
+## 7b. Recover from an interrupted restore
+
+A restore that dies part-way leaves a populated `data/` with no sentinel. From the
+`--no-same-owner` fix onward the restore marks its own work with
+`/chain-home/.restore-in-progress` and clears it automatically on the next start.
+
+If the partial extract predates that fix it has no marker, so the guard refuses it (correctly
+— it cannot tell your half-download from migrated prod data). Place the marker once:
+
+```bash
+NS=cronospos
+kubectl scale statefulset chain-maind -n $NS --replicas=0
+kubectl wait --for=delete pod/chain-maind-0 -n $NS --timeout=700s
+
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: mark-partial, namespace: cronospos }
+spec:
+  restartPolicy: Never
+  securityContext: { runAsUser: 0, runAsGroup: 0, fsGroup: 1025 }
+  containers:
+    - name: mark
+      image: alpine:3.19
+      command: ["sh","-c","touch /chain-home/.restore-in-progress && ls -la /chain-home"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      volumeMounts: [{ name: d, mountPath: /chain-home }]
+  volumes:
+    - name: d
+      persistentVolumeClaim: { claimName: chain-maind-data }
+EOF
+
+kubectl logs -n $NS mark-partial
+kubectl delete pod mark-partial -n $NS
+
+kubectl apply -f 03-statefulset.yaml          # picks up --no-same-owner
+kubectl scale statefulset chain-maind -n $NS --replicas=1
+kubectl logs -n $NS chain-maind-0 -c restore-snapshot -f
+```
+
+Expect `[restore] partial extract from a previous attempt -- clearing`, then a clean
+download.
 
 ## 8. Teardown
 
