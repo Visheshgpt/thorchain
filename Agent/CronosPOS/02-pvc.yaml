@@ -1,30 +1,28 @@
 # ============================================================
 # PVC for the chain home (/chain-home).
 #
-# SIZING -- the number people get wrong most often.
-#
-#   Polkachu pruned snapshot, compressed .....  8.7 GB
+# SIZING
+#   Polkachu pruned snapshot, compressed ....  8.7 GB
 #     (measured: content-length 8,714,727,213)
-#   Extracted pruned state ...................  ~18-22 GB
+#   Extracted pruned state ..................  ~18-22 GB
 #     (lz4 on Cosmos state runs ~2-2.5x)
-#   Growth, pruning="custom" keep-recent=100 ..  ~2-5 GB / month
+#   chain-maind binary ......................  ~192 MB
+#   Growth, pruning="custom" keep-recent=100    ~2-5 GB / month
 #     (17,000 blocks/day; blockstore dominates)
 #
-#   12-month working set  ~=  22 + 48  =  ~70 GB
+#   12-month working set  ~=  22 + 48  =  ~70 GB   ->  128Gi
 #
-#   => 128Gi.
+# The 8.7 GB tarball is NEVER written to this disk -- the
+# restore streams curl | lz4 -d | tar -x straight into the
+# volume. That is why 128Gi is enough where a staged
+# download-then-extract would need ~200Gi.
 #
-# The tarball is NEVER written to this disk -- the restore
-# streams curl | lz4 -d | tar -x straight into the volume, so
-# there is no download+extract peak to budget for. That is why
-# 128Gi is enough where a staged restore would need ~200Gi.
-#
-# Premium_LRS bills by tier, and anything from 65Gi to 128Gi
-# bills as P10. Asking for less than 128Gi therefore saves
-# nothing and throws away headroom you already paid for.
+# On StandardSSD_LRS, IOPS are FLAT (~500) regardless of size,
+# so unlike Premium there is no performance reason to size up.
+# 128Gi is a pure capacity decision.
 #
 # Online expansion is available (allowVolumeExpansion: true).
-# See RUNBOOK section 6.
+# Never shrink -- Azure disks cannot.
 # ============================================================
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -33,7 +31,7 @@ metadata:
   namespace: cronospos
   labels:
     app: chain-maind
-    app.kubernetes.io/part-of: cronospos-fullnode
+    blockchain: cronospos
 spec:
   accessModes:
     - ReadWriteOnce

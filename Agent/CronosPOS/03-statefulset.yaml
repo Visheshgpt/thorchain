@@ -1,0 +1,485 @@
+# ============================================================
+# Cronos POS (Crypto.org Chain) mainnet FULL NODE.
+#
+# WHAT THE COMPOSE FILE SAID, AND WHERE WE DEVIATED
+#
+#  compose                        here                  evidence
+#  ----------------------------   -------------------   ------------------
+#  image cryptocom/chain-main     alpine + upstream     that image is not
+#        :v8.0.0                  release binary        publicly pullable:
+#                                                       401 on Docker Hub
+#                                                       (4 namespaces) and
+#                                                       GHCR, while
+#                                                       library/alpine
+#                                                       returns 200 on the
+#                                                       identical probe.
+#                                                       Upstream's own
+#                                                       Dockerfile says
+#                                                       "docker build -t
+#                                                       cryptocom/chain-main ."
+#                                                       -- it is a LOCAL
+#                                                       BUILD TAG. The prod
+#                                                       VM built it on the
+#                                                       box; nothing was
+#                                                       ever published.
+#  ports 1332/2332/3332           26657/1317/9090       those are HOST
+#                                                       ports; the container
+#                                                       side is what counts
+#  volume /1Disk121/... :         PVC at /chain-home    same container path
+#        /chain-home
+#  command chain-maind start      kept verbatim, plus   as given
+#        --home /chain-home         the binary path
+#        --rpc.laddr ...
+#  restart: unless-stopped        StatefulSet           stable identity+PVC
+#
+# Everything else came from the compose file unchanged.
+#
+# VERIFIED AGAINST THE LIVE NETWORK:
+#   chain-id  crypto-org-chain-mainnet-1
+#   app       chain-maind v8.0.0        <- matches the compose tag
+#   cometbft  0.38.22
+#   block     ~5.08s, ~17,000/day
+#
+# TRAP if you ever build the image instead: upstream's
+# Dockerfile declares ARG NETWORK=testnet, overriding the
+# Makefile's own NETWORK ?= mainnet. Building with defaults
+# yields a TESTNET binary that will never join mainnet. Use
+# --build-arg NETWORK=mainnet.
+#
+# INIT ORDER -- restore MUST come before the two UID-1025
+# containers. restore-snapshot is root with ALL capabilities
+# dropped, so it has neither CAP_DAC_OVERRIDE nor CAP_FOWNER:
+# it cannot write into, nor chmod, a file owned by 1025.
+# Running it first means everything it touches is root-owned,
+# and its closing `chmod -R a+rwX` hands write access to 1025.
+# Put install-chain-maind first instead and that chmod fails on
+# the 1025-owned bin/ directory, killing the script under set -e.
+# ============================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: chain-maind
+  namespace: cronospos
+  labels:
+    app: chain-maind
+    blockchain: cronospos
+    component: blockchain-node
+spec:
+  serviceName: chain-maind-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chain-maind
+  template:
+    metadata:
+      labels:
+        app: chain-maind
+        blockchain: cronospos
+        component: blockchain-node
+    spec:
+      # Kubernetes' auto-injected <SVC>_PORT vars have collided with
+      # cosmos/viper key lookups before. Turn them off.
+      enableServiceLinks: false
+
+      # chain-maind must flush LevelDB cleanly. SIGKILL mid-write
+      # corrupts the store and costs a full 8.7 GB re-restore. The
+      # compose file's `restart: unless-stopped` gives Docker's
+      # default 10s grace, which is nowhere near enough.
+      terminationGracePeriodSeconds: 600
+
+      securityContext:
+        runAsUser: 1025
+        runAsGroup: 1025
+        runAsNonRoot: true
+        fsGroup: 1025
+        # Only relabel when the volume's top-level owner is wrong.
+        # The default "Always" re-chowns the whole tree on EVERY
+        # start; on a pruned Cosmos store that is minutes per restart.
+        fsGroupChangePolicy: OnRootMismatch
+
+      initContainers:
+
+        # -- 1. snapshot restore -------------------------------
+        # The ONLY container that overrides the pod's non-root
+        # default, and only because busybox has no lz4 and `apk add`
+        # needs root. Capabilities are fully dropped, so this root
+        # cannot read, write or chmod anything it does not own.
+        - name: restore-snapshot
+          image: alpine:3.19
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          # MUST NOT exceed the main container's requests: a pod's
+          # effective request is max(init, sum(app containers)), so a
+          # greedy init container makes the whole pod unschedulable.
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { memory: "1Gi" }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/chain-home
+              SENTINEL="$HOME_DIR/.snapshot-restored"
+              SNAP_PAGE="https://polkachu.com/tendermint_snapshots/cryptocom"
+              SNAP_BASE="https://snapshots.polkachu.com/snapshots/cryptocom"
+
+              if [ -f "$SENTINEL" ]; then
+                echo "[restore] already restored at height $(cat "$SENTINEL")"
+                exit 0
+              fi
+
+              # DO NOT DELETE DATA WE DID NOT PUT THERE. An unguarded
+              # rm -rf in an init container is one bad boot away from
+              # destroying a migrated chain dir. Fail loudly instead.
+              if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
+                echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
+                echo "[restore] Refusing to overwrite data this script did not create."
+                echo "[restore] If this data IS good, run:  touch $SENTINEL"
+                exit 1
+              fi
+
+              echo "[restore] installing curl + lz4"
+              apk add --no-cache curl ca-certificates lz4 tar >/dev/null
+
+              # Polkachu keeps ONE snapshot and deletes yesterday's, so
+              # the filename changes daily and a hardcoded URL 404s
+              # within 24h. Their v2 API now needs a secret header, so
+              # the filename is scraped from the public page instead.
+              echo "[restore] discovering current snapshot"
+              FILE=$(curl -fsSL --retry 5 --max-time 120 "$SNAP_PAGE" \
+                     | grep -oE 'cryptocom_[0-9]+\.tar\.lz4' | head -1)
+              if [ -z "$FILE" ]; then
+                echo "[restore] FATAL: could not discover a snapshot filename."
+                echo "[restore] Check $SNAP_PAGE by hand; see RUNBOOK section 7."
+                exit 1
+              fi
+              HEIGHT=$(echo "$FILE" | sed -n 's/cryptocom_\([0-9]*\)\.tar\.lz4/\1/p')
+              echo "[restore] selected $FILE (height $HEIGHT, ~8.7 GB)"
+
+              mkdir -p "$HOME_DIR"
+              ATTEMPT=0
+              while : ; do
+                ATTEMPT=$((ATTEMPT + 1))
+                if [ "$ATTEMPT" -gt 5 ]; then
+                  echo "[restore] FATAL: failed after 5 attempts"
+                  exit 1
+                fi
+                echo "[restore] streaming attempt $ATTEMPT (15-40 min)"
+                # Streamed, never staged: the 8.7 GB tarball is never
+                # written down, so the PVC needs no download+extract
+                # peak. Cost of streaming is no resume -- hence retries.
+                if curl -fL --retry 3 --retry-delay 10 "$SNAP_BASE/$FILE" \
+                     | lz4 -dc - | tar -x -C "$HOME_DIR" ; then
+                  # POSIX sh has no pipefail, so tar can exit 0 on a
+                  # truncated stream. Verify the stores actually landed.
+                  OK=1
+                  for d in blockstore.db state.db application.db; do
+                    if [ ! -d "$HOME_DIR/data/$d" ]; then
+                      echo "[restore] missing data/$d after extract"
+                      OK=0
+                    fi
+                  done
+                  if [ "$OK" = "1" ]; then
+                    echo "[restore] extract verified"
+                    break
+                  fi
+                fi
+                echo "[restore] attempt $ATTEMPT failed -- retrying"
+                rm -rf "$HOME_DIR/data"
+                sleep 15
+              done
+
+              echo "$HEIGHT" > "$SENTINEL"
+              # Extracted as root; everything after this runs as 1025.
+              # CAP_CHOWN is dropped so chown is unavailable, but root
+              # can chmod its OWN files. This runs only inside the
+              # restore branch -- on a restart the sentinel short-
+              # circuits above, because by then bin/ is owned by 1025
+              # and a recursive chmod would fail without CAP_FOWNER.
+              echo "[restore] chmod -R a+rwX"
+              chmod -R a+rwX "$HOME_DIR"
+              df -h "$HOME_DIR"
+              echo "[restore] DONE at height $HEIGHT"
+          volumeMounts:
+            - { name: chain-maind-data, mountPath: /chain-home }
+
+        # -- 2. binary + genesis + passwd shim ------------------
+        # Runs as 1025 (the pod default). No root and no apk needed:
+        # busybox wget and sha256sum cover download and verification,
+        # the same pattern as the Arweave validator profile.
+        - name: install-chain-maind
+          image: alpine:3.19
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { memory: "512Mi" }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/chain-home
+              BIN_DIR="$HOME_DIR/bin"
+              VERSION="8.0.0"
+              ASSET="chain-main_${VERSION}_Linux_x86_64.tar.gz"
+              # Upstream checksums.txt for v8.0.0, re-hashed locally.
+              SHA="61c39edd0216455a2c7a59b429c07d917d92c117cc96ee554484e4f3f8beb0fc"
+              REL="https://github.com/crypto-org-chain/chain-main/releases/download/v${VERSION}"
+              GENESIS_URL="https://github.com/crypto-org-chain/mainnet/raw/main/crypto-org-chain-mainnet-1/genesis.json"
+
+              mkdir -p "$BIN_DIR"
+
+              # /etc/passwd shim: the binary is static Go and some
+              # cosmos paths consult os/user, which fails for a UID
+              # with no passwd entry. Mounted over /etc/passwd via
+              # subPath in the containers that need it.
+              cat > /passwd-vol/passwd <<'PASSWD'
+              root:x:0:0:root:/root:/bin/sh
+              nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
+              chainmain:x:1025:1025:chainmain:/chain-home:/bin/sh
+              PASSWD
+              echo "[install] passwd shim written"
+
+              # The release binary is FULLY STATIC (no PT_INTERP, no
+              # PT_DYNAMIC -- verified on the artifact), so it runs on
+              # any Linux base. That is what removes the need for ACR.
+              if [ -x "$BIN_DIR/chain-maind" ]; then
+                echo "[install] chain-maind already present -- skipping"
+              else
+                echo "[install] downloading $ASSET (56 MB)"
+                wget -q -O "/tmp/$ASSET" "$REL/$ASSET"
+                echo "[install] verifying sha256"
+                echo "$SHA  /tmp/$ASSET" | sha256sum -c -
+                tar -xzf "/tmp/$ASSET" -C /tmp
+                mv /tmp/bin/chain-maind "$BIN_DIR/chain-maind"
+                chmod 0755 "$BIN_DIR/chain-maind"
+                rm -f "/tmp/$ASSET"
+                echo "[install] installed chain-maind v$VERSION"
+              fi
+
+              if [ -f "$BIN_DIR/genesis.json" ]; then
+                echo "[install] genesis already present -- skipping"
+              else
+                echo "[install] downloading mainnet genesis"
+                wget -q -O "$BIN_DIR/genesis.json" "$GENESIS_URL"
+                echo "[install] genesis $(wc -c < "$BIN_DIR/genesis.json") bytes"
+              fi
+              ls -la "$BIN_DIR/"
+          volumeMounts:
+            - { name: chain-maind-data, mountPath: /chain-home }
+            - { name: passwd-vol,       mountPath: /passwd-vol }
+
+        # -- 3. config init + TOML patch ------------------------
+        # Runs as 1025, the same identity as the main container, so
+        # everything it writes is readable by it with no chown.
+        #
+        # Hand-editing the TOMLs is SAFE for this chain, which is not
+        # true everywhere. chain-main's image CMD is just
+        # ["chain-maind"] -- there is no entrypoint that re-renders
+        # config on boot, so nothing overwrites what we write here.
+        - name: configure
+          image: alpine:3.19
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "512Mi" }
+          env:
+            - { name: HOME,    value: "/chain-home" }
+            - { name: MONIKER, value: "cronospos-aks" }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/chain-home
+              CM="$HOME_DIR/bin/chain-maind"
+              CFG="$HOME_DIR/config"
+              CHAIN_ID="crypto-org-chain-mainnet-1"
+
+              # Seeds from the cosmos chain-registry, DNS-verified.
+              SEEDS="87c3adb7d8f649c51eebe0d3335d8f9e28c362f2@seed-0.crypto.org:26656,e1d7ff02b78044795371beb1cd5fb803f9389256@seed-1.crypto.org:26656,2c55809558a4e491e9995962e10c026eb9014655@seed-2.crypto.org:26656,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656,ade4d8bc8cbe014af6ebdf3cb7b1e9ad36f412c0@seeds.polkachu.com:20256"
+
+              if [ ! -f "$CFG/config.toml" ]; then
+                echo "[configure] chain-maind init"
+                "$CM" init "$MONIKER" --chain-id "$CHAIN_ID" --home "$HOME_DIR"
+              else
+                echo "[configure] config.toml present -- reconfiguring in place"
+              fi
+
+              # The genesis init just generated is a throwaway. Replace
+              # it every time -- cheap, and makes a corrupt copy
+              # self-healing.
+              cp "$HOME_DIR/bin/genesis.json" "$CFG/genesis.json"
+              echo "[configure] genesis installed ($(wc -c < "$CFG/genesis.json") bytes)"
+
+              # Section-aware TOML setter. `enable` appears under [api],
+              # [grpc], [grpc-web] AND [state-sync]; a bare sed would
+              # hit all four. This tracks the current [section] header.
+              set_sec() {
+                f="$1"; sec="$2"; key="$3"; val="$4"
+                awk -v sec="[$sec]" -v key="$key" -v val="$val" '
+                  /^\[/ { cur = $1 }
+                  { if (cur == sec && $0 ~ "^"key"[ ]*=") { print key " = " val; next } print }
+                ' "$f" > "$f.tmp"
+                mv "$f.tmp" "$f"
+              }
+
+              # ---- config.toml --------------------------------
+              # Bind RPC to all interfaces; the default 127.0.0.1 is
+              # unreachable from a Service. The [p2p] laddr also ends
+              # in "laddr", so match the port to stay unambiguous.
+              sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CFG/config.toml"
+              sed -i "s|^seeds = .*|seeds = \"$SEEDS\"|"                                 "$CFG/config.toml"
+              # 20 out / 10 in. Outbound is what a full node syncs
+              # from; inbound is capped low because no LB fronts p2p
+              # (see 04-service.yaml) so inbound dials rarely arrive.
+              sed -i 's|^max_num_outbound_peers = .*|max_num_outbound_peers = 20|'        "$CFG/config.toml"
+              sed -i 's|^max_num_inbound_peers = .*|max_num_inbound_peers = 10|'          "$CFG/config.toml"
+              sed -i 's|^prometheus = false|prometheus = true|'                           "$CFG/config.toml"
+
+              # ---- app.toml -----------------------------------
+              # pruning=custom keep-recent=100 interval=10 is the
+              # smallest safe footprint: last 100 states, swept every
+              # 10 blocks. "nothing" (archive) is multi-TB and is
+              # explicitly NOT what this node is for.
+              sed -i 's|^minimum-gas-prices = .*|minimum-gas-prices = "0.025basecro"|'    "$CFG/app.toml"
+              sed -i 's|^pruning = .*|pruning = "custom"|'                                "$CFG/app.toml"
+              sed -i 's|^pruning-keep-recent = .*|pruning-keep-recent = "100"|'           "$CFG/app.toml"
+              sed -i 's|^pruning-interval = .*|pruning-interval = "10"|'                  "$CFG/app.toml"
+
+              set_sec "$CFG/app.toml" api      enable  true
+              set_sec "$CFG/app.toml" api      address '"tcp://0.0.0.0:1317"'
+              set_sec "$CFG/app.toml" grpc     enable  true
+              set_sec "$CFG/app.toml" grpc     address '"0.0.0.0:9090"'
+              # grpc-web off: nothing consumes it, one less listener.
+              set_sec "$CFG/app.toml" grpc-web enable  false
+              # snapshot-interval 0: do NOT serve state-sync snapshots
+              # to other nodes. Producing them costs disk and CPU, and
+              # this node is a consumer, not a provider.
+              set_sec "$CFG/app.toml" state-sync snapshot-interval 0
+
+              echo "[configure] ---- config.toml ----"
+              grep -E '^(laddr|seeds|external_address|max_num_(out|in)bound_peers|prometheus) ' "$CFG/config.toml" || true
+              echo "[configure] ---- app.toml ----"
+              grep -E '^(minimum-gas-prices|pruning)' "$CFG/app.toml" || true
+              echo "[configure] DONE"
+          volumeMounts:
+            - { name: chain-maind-data, mountPath: /chain-home }
+            - { name: passwd-vol,       mountPath: /etc/passwd, subPath: passwd }
+
+      containers:
+        - name: chain-maind
+          image: alpine:3.19
+          imagePullPolicy: IfNotPresent
+
+          # The compose command, verbatim, with the binary path added.
+          # The upstream image's CMD is just ["chain-maind"] -- there
+          # is no entrypoint that renders config or resolves seeds, so
+          # unlike most chain images there is nothing to preserve by
+          # deferring to it.
+          command: ["/chain-home/bin/chain-maind"]
+          args:
+            - "start"
+            - "--home"
+            - "/chain-home"
+            - "--rpc.laddr"
+            - "tcp://0.0.0.0:26657"
+
+          env:
+            - { name: HOME, value: "/chain-home" }
+
+          # Container ports -- NOT the compose host ports
+          # (1332/2332/3332), which are one machine's local mappings.
+          ports:
+            - { name: p2p,     containerPort: 26656, protocol: TCP }
+            - { name: rpc,     containerPort: 26657, protocol: TCP }
+            - { name: rest,    containerPort: 1317,  protocol: TCP }
+            - { name: grpc,    containerPort: 9090,  protocol: TCP }
+            - { name: metrics, containerPort: 26660, protocol: TCP }
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+
+          # MINIMUM VIABLE, with the floor stated honestly.
+          #
+          # Cronos POS is a light chain (5s blocks, modest tx volume)
+          # and a pruned node's steady state measures ~1.5-2.5 GB RSS.
+          # 2Gi request / 4Gi limit is the smallest pair that leaves
+          # headroom for IAVL commit spikes. A 1Gi limit WILL OOMKill.
+          #
+          # NO CPU LIMIT, on purpose. CFS throttling on a CometBFT
+          # node delays block execution past consensus timeouts and is
+          # the classic cause of a node that "runs but falls behind".
+          # 500m is a scheduling reservation, not a cap.
+          #
+          # Fits a Standard_D4ads_v5 (4 vCPU / 16 GiB, ~3.5 CPU and
+          # ~11 GiB usable after AKS reservations) with room to spare.
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              memory: "4Gi"
+
+          # All three probes hit CometBFT's own endpoints. Probing the
+          # TCP port instead reports healthy through a total freeze,
+          # because the listener never closes.
+          startupProbe:
+            httpGet: { path: /health, port: rpc }
+            periodSeconds: 15
+            failureThreshold: 120      # up to 30 min to open the store
+          readinessProbe:
+            httpGet: { path: /health, port: rpc }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          # HEIGHT-PROGRESS liveness.
+          #
+          # Restarting a node that is merely BEHIND does not help it
+          # catch up -- but a node that is STALLED has nothing else to
+          # recover it, and CometBFT's blocksync reactor does stall in
+          # practice, with healthy peers and idle CPU.
+          #
+          # Fires only after the height fails to move across three
+          # consecutive 10-minute checks -- a 30-minute stall. At ~5s
+          # blocks a syncing node does >100 blocks/min, so a false
+          # positive is not plausible. If a long LevelDB compaction
+          # ever trips it, raise failureThreshold rather than deleting
+          # the probe.
+          #
+          # No curl and no jq in alpine, so this uses busybox wget and
+          # sed. /tmp is container-local, so the counter resets on
+          # restart, which is what we want.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  H=$(wget -q -T 10 -O - http://localhost:26657/status \
+                      | sed -n 's/.*"latest_block_height": *"\([0-9]*\)".*/\1/p')
+                  P=$(cat /tmp/last_height 2>/dev/null || echo 0)
+                  echo "$H" > /tmp/last_height
+                  [ -n "$H" ] && [ "$H" -gt "$P" ]
+            initialDelaySeconds: 1800
+            periodSeconds: 600
+            timeoutSeconds: 20
+            failureThreshold: 3
+
+          volumeMounts:
+            - { name: chain-maind-data, mountPath: /chain-home }
+            - { name: passwd-vol,       mountPath: /etc/passwd, subPath: passwd }
+
+      volumes:
+        - name: chain-maind-data
+          persistentVolumeClaim:
+            claimName: chain-maind-data
+        - name: passwd-vol
+          emptyDir: {}

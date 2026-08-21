@@ -1,5 +1,6 @@
 # ============================================================
-# Services.
+# Services. THREE, per the generator spec:
+#   headless + ClusterIP + LoadBalancer.
 #
 # NO LOADBALANCER ON P2P (26656), on purpose.
 #
@@ -17,8 +18,6 @@
 # ------------------------------------------------------------
 # SHARING ONE LOAD BALANCER IP ACROSS CHAINS
 #
-# The rule, stated precisely:
-#
 #   AKS runs ONE Azure Standard Load Balancer per cluster.
 #   Each type: LoadBalancer Service gets its own FRONTEND IP
 #   by default.
@@ -32,19 +31,16 @@
 # in SyncLoadBalancerFailed and the chain is silently
 # unreachable.
 #
-# Two workable modes -- pick one and record it:
-#
 #   dedicated-ip  (ACTIVE below)  one IP per chain, standard
-#                 ports unchanged. Costs one VNet address per
-#                 chain. Zero surprise for consumers.
+#                 ports. One VNet address each. No surprise
+#                 for consumers.
 #
 #   shared-ip     one IP for every chain, ports remapped by a
-#                 per-chain offset. Costs one address total.
-#                 Consumers must learn a non-standard port.
-#                 See the commented block at the bottom.
+#                 per-chain offset. One address total. See the
+#                 commented block at the bottom.
 #
-# Whichever you choose, keep a PORT-REGISTRY so the next chain
-# does not collide. See README section 5.
+# Either way keep a port registry, one row per (ip, port) ->
+# chain. A collision is a stop, not a warning.
 # ============================================================
 ---
 # Stable DNS identity for the StatefulSet.
@@ -58,7 +54,7 @@ metadata:
   namespace: cronospos
   labels:
     app: chain-maind
-    app.kubernetes.io/part-of: cronospos-fullnode
+    blockchain: cronospos
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
@@ -81,7 +77,7 @@ metadata:
   namespace: cronospos
   labels:
     app: chain-maind
-    app.kubernetes.io/part-of: cronospos-fullnode
+    blockchain: cronospos
 spec:
   type: ClusterIP
   selector:
@@ -93,7 +89,7 @@ spec:
     - { name: metrics, port: 26660, targetPort: 26660, protocol: TCP }
 ---
 # Private VNet IP for consumers outside the cluster.
-# Delete this whole section if nothing off-cluster needs the node.
+# Delete this whole document if nothing off-cluster needs it.
 apiVersion: v1
 kind: Service
 metadata:
@@ -103,7 +99,7 @@ metadata:
     service.beta.kubernetes.io/azure-load-balancer-internal: "true"
   labels:
     app: chain-maind
-    app.kubernetes.io/part-of: cronospos-fullnode
+    blockchain: cronospos
 spec:
   type: LoadBalancer
   selector:
@@ -131,13 +127,13 @@ spec:
 
 # ------------------------------------------------------------
 # SHARED-IP VARIANT -- use INSTEAD of chain-maind-rpc above if
-# you want one VNet address to serve every chain.
+# one VNet address must serve every chain.
 #
 # Only the LB frontend `port` is offset. `targetPort` stays the
 # chain's real container port, so the node itself is never
 # reconfigured and nothing inside the pod changes.
 #
-# Offsets (keep in PORT-REGISTRY.md, one row per chain):
+# Offsets (keep one row per chain in a port registry):
 #     cronospos  +0     rpc 26657  rest 1317  grpc 9090
 #     <next>     +100   rpc 26757  rest 1417  grpc 9190
 #     <next>     +200   rpc 26857  rest 1517  grpc 9290

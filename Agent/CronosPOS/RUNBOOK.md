@@ -11,9 +11,8 @@ NS=cronospos
 kubectl apply -f 00-namespace.yaml
 kubectl apply -f 01-storageclass.yaml
 kubectl apply -f 02-pvc.yaml
-kubectl apply -f 03-configmap-scripts.yaml
-kubectl apply -f 04-statefulset.yaml
-kubectl apply -f 05-service.yaml
+kubectl apply -f 03-statefulset.yaml
+kubectl apply -f 04-service.yaml
 
 kubectl get pvc -n $NS      # Pending is CORRECT until the pod schedules
 kubectl get pods -n $NS -w
@@ -21,22 +20,24 @@ kubectl get pods -n $NS -w
 
 ## 2. Watch it come up
 
-Expected: `Init:0/2` → `Init:1/2` → `PodInitializing` → `Running`.
+Expected: `Init:0/3` → `Init:2/3` → `PodInitializing` → `Running`.
 First boot is **20–50 min**, almost all of it the streamed snapshot.
 
 ```bash
-kubectl logs -n $NS chain-maind-0 -c init-bootstrap -f    # binary, genesis, snapshot
-kubectl logs -n $NS chain-maind-0 -c init-config          # init + TOML patch
-kubectl logs -n $NS chain-maind-0 -c chain-maind -f       # the node
+kubectl logs -n $NS chain-maind-0 -c restore-snapshot -f     # streamed snapshot (the long one)
+kubectl logs -n $NS chain-maind-0 -c install-chain-maind    # binary + genesis + passwd shim
+kubectl logs -n $NS chain-maind-0 -c configure              # chain-maind init + TOML patch
+kubectl logs -n $NS chain-maind-0 -c chain-maind -f         # the node
 ```
 
-Milestones in `init-bootstrap`:
+Milestones, in order:
 
 ```
-[bootstrap] sha256 OK
-[bootstrap] selected cryptocom_<height>.tar.lz4 (height …, ~8.7 GB)
-[bootstrap] extract verified
-[bootstrap] snapshot restored at height <height>
+[restore] selected cryptocom_<height>.tar.lz4 (height …, ~8.7 GB)
+[restore] extract verified
+[restore] DONE at height <height>
+[install] sha256 OK  ->  [install] installed chain-maind v8.0.0
+[configure] DONE
 ```
 
 ## 3. Acceptance — all five must pass
@@ -85,8 +86,8 @@ node replays several hundred blocks/min, so expect **tip within 1–3 hours**.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `init-bootstrap`: `sha256 mismatch` | upstream re-cut the release, or a corrupt transfer | re-hash upstream `checksums.txt`; update `BIN_SHA` in `03-configmap-scripts.yaml` |
-| `init-bootstrap`: `could not discover a snapshot filename` | Polkachu page markup changed, or egress to `polkachu.com:443` blocked | open the page by hand, then §7 |
+| `install-chain-maind`: `sha256 mismatch` | upstream re-cut the release, or a corrupt transfer | re-hash upstream `checksums.txt`; update `SHA` in `03-statefulset.yaml` |
+| `restore-snapshot`: `could not discover a snapshot filename` | Polkachu page markup changed, or egress to `polkachu.com:443` blocked | open the page by hand, then §7 |
 | `FATAL: data is populated but has no sentinel` | working as designed — refusing to delete data it did not create | if the data is good: `touch /chain-home/.snapshot-restored`. If not, delete the PVC. |
 | PVC stuck `Pending` | `WaitForFirstConsumer` — normal until the pod schedules | if it persists, `kubectl describe pod` — it is a CPU/memory fit problem, not a disk one |
 | Pod `Pending` | 500m/2Gi does not fit | `kubectl describe node` for allocatable; the node pool is undersized |
@@ -121,8 +122,8 @@ pod mounting the PVC, not from the node pod. Deleting the sentinel alone is not 
 ## 8. Teardown
 
 ```bash
-kubectl delete -f 05-service.yaml -f 04-statefulset.yaml \
-               -f 03-configmap-scripts.yaml -f 02-pvc.yaml
+kubectl delete -f 04-service.yaml -f 03-statefulset.yaml \
+                -f 02-pvc.yaml
 ```
 
 `reclaimPolicy: Retain` means the Azure disk **survives** and the PV goes `Released`. To

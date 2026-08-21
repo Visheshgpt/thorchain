@@ -1,39 +1,50 @@
 # ============================================================
 # Azure Disk StorageClass for Cronos POS chain data.
 #
+# skuName: StandardSSD_LRS -- the same class already in use for
+# the Arweave validator on this cluster, and this cluster's
+# default SKU. Flat ~500 IOPS / 60 MB/s across almost all disk
+# sizes, so growing the disk buys capacity, not speed.
+#
+#   Premium_LRS would scale IOPS with size (P10 500 -> P30
+#   5000) and carries a 99.9% single-instance SLA, at roughly
+#   2x the cost. It is the right call only if this node proves
+#   IOPS-bound during catch-up. A pruned Cronos POS node at
+#   ~5s blocks is not a heavy writer, so Standard SSD is not
+#   expected to be the bottleneck.
+#
+# NOTE: StorageClass `parameters` are IMMUTABLE. skuName cannot
+#       be switched in place -- changing it needs a new class,
+#       a new PVC, and a full re-restore.
+#
 # cachingMode: None
-#   The store is LevelDB/IAVL -- write-heavy random IO with its
-#   own fsync discipline. Azure host ReadWrite caching in front
-#   of that adds latency spikes and is explicitly not
-#   recommended for write-heavy DB disks.
+#   The store is LevelDB/IAVL: write-heavy random IO that does
+#   its own fsync. Azure host caching in front of that reorders
+#   writes, adds latency spikes, and buys nothing. Same call as
+#   arweave-datadir and thorchain-storage on this cluster.
 #
 # reclaimPolicy: Retain
-#   Deleting the PVC must NOT delete the disk. Chain data costs
-#   hours to rebuild. Retain leaves the disk Released, to be
-#   reclaimed deliberately.
+#   Deleting the PVC must NOT delete the disk. The cost of that
+#   choice: deleting the PVC does not stop billing -- delete
+#   the disk by hand in the AKS node resource group.
 #
-# Premium_LRS at 128Gi lands on P10 = 500 IOPS / 100 MB/s.
-# That is the practical floor for a Cosmos node: the smaller
-# P6 tier (64Gi) is capped at 240 IOPS, and IOPS -- not
-# capacity -- is what makes a node fall behind during catch-up.
-# See 02-pvc.yaml for the sizing math.
-#
-# StandardSSD_LRS E10 is the same 128Gi/500 IOPS for roughly
-# half the price, but with far looser latency guarantees. That
-# variance shows up as slow catch-up, so Premium is the default
-# here. Switch skuName if cost matters more than sync speed.
+# volumeBindingMode: WaitForFirstConsumer
+#   Provisions the disk in the same AZ as the scheduled pod.
+#   Expect the PVC to sit Pending until the pod schedules; that
+#   is normal, not a storage fault.
 # ============================================================
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: cronospos-storage
   labels:
-    app.kubernetes.io/part-of: cronospos-fullnode
-    app.kubernetes.io/managed-by: kubectl
+    app: chain-maind
+    blockchain: cronospos
+    environment: non-prod
 provisioner: disk.csi.azure.com
 parameters:
-  skuName: Premium_LRS
+  skuName: StandardSSD_LRS             # Standard SSD — default SKU for this cluster
   cachingMode: None
-reclaimPolicy: Retain
+reclaimPolicy: Retain                  # NEVER Delete — blockchain data is irreplaceable
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: true
