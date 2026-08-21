@@ -1,0 +1,180 @@
+# ============================================================
+# ckb.toml as a ConfigMap.
+#
+# WHY THIS FILE EXISTS AT ALL
+#   The StatefulSet used to leave the config mount commented out
+#   ("# TODO: Uncomment after creating the ConfigMap"). With no
+#   ConfigMap the image entrypoint runs `ckb init --chain mainnet`
+#   on first boot and the node runs a config NOBODY IN THIS REPO
+#   WROTE. That is what ckb-0 is running right now, and it is why
+#   its log stops dead after "CKB service started" -- no dials,
+#   no headers, no blocks.
+#
+# WHAT THIS CONFIG IS
+#   It is the config from docker-prod-guide.md -- the one that is
+#   PROVEN to sync on the VM -- copied as close to verbatim as the
+#   move to Kubernetes allows. Three deliberate deviations, each
+#   marked DEVIATION below. Nothing else was invented.
+#
+#   Do not "improve" this file with keys from Nervos/ckb.toml as
+#   it was before this change. That file had:
+#     - ONE bootnode (47.111.169.36) instead of the 15 official
+#       ones, and it was on tcp/8115 where the real mainnet
+#       bootnodes listen on tcp/8114
+#     - public_addresses pointing at 20.118.15.24, which is the
+#       DOCKER VM's public IP. See the note on public_addresses.
+#     - [store] keys (block_cache_capacity, header_cache_capacity,
+#       cell_cache_capacity) that are not CKB StoreConfig fields.
+#
+# THE PORT THING, WRITTEN DOWN ONCE
+#   CKB is not Cosmos. Its ports are the other way round from what
+#   you expect:
+#       8114 = JSON-RPC on THIS node   (rpc.listen_address)
+#       8115 = P2P on THIS node        (network.listen_addresses)
+#   But the official mainnet BOOTNODES publish their P2P on 8114.
+#   So this node LISTENS on 8115 and DIALS OUT to 8114.
+#   => the firewall rule you need is OUTBOUND TCP 8114.
+#   That is exactly the rule that made the Docker VM start syncing,
+#   and it is not open on the AKS node subnet. See README-AKS.md.
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nervos-ckb-config
+  namespace: nervos
+  labels:
+    app: ckb
+    blockchain: nervos-node
+data:
+  ckb.toml: |
+    # Resolves relative to the ckb home (/var/lib/ckb), giving
+    # /var/lib/ckb/data -- which is the PVC. Confirmed by the live
+    # log line: ".../var/lib/ckb/data/network/secret_key".
+    data_dir = "data"
+
+    # "bundled" = read the chain spec out of the binary, not off
+    # disk. This is why no `ckb init` step is needed in the pod:
+    # there is no specs/ directory to generate.
+    [chain]
+    spec = { bundled = "specs/mainnet.toml" }
+
+    [logger]
+    filter        = "info"
+    color         = false
+    # DEVIATION 1 vs the Docker guide: log_to_file = false.
+    # On the VM the log file is on the host disk and logrotate owns
+    # it. Here it would land on the PVC and grow unbounded through a
+    # multi-week genesis sync. stdout is captured and rotated by the
+    # container runtime, and is what `kubectl logs` reads.
+    log_to_file   = false
+    log_to_stdout = true
+
+    [sentry]
+    dsn = ""
+
+    [db]
+    # RocksDB block cache. 1 GiB, matching the guide. This is the
+    # single biggest contributor to the container's RSS -- if you
+    # raise it, raise resources.limits.memory in the StatefulSet by
+    # at least as much.
+    cache_size = 1073741824
+
+    [network]
+    # We listen on 8115. Peers are dialled on 8114 (see header).
+    listen_addresses = ["/ip4/0.0.0.0/tcp/8115"]
+
+    # public_addresses IS DELIBERATELY ABSENT. Read this before
+    # adding it back.
+    #
+    # public_addresses is what this node tells every peer to dial
+    # it back on. Setting it to an address that does not reach this
+    # pod is WORSE than setting nothing: peers spend their outbound
+    # budget on a dial that times out, then deprioritise and drop
+    # you.
+    #
+    # The old value was /ip4/20.118.15.24/tcp/8115 -- the Docker
+    # VM's public IP. From a pod in AKS that is a different machine
+    # entirely.
+    #
+    # Inbound peering is ALL-OR-NOTHING, and it is OPTIONAL: a node
+    # syncing from genesis needs only OUTBOUND p2p. Same call as
+    # Cronos POS (04-service.yaml: "we do neither") and THORChain
+    # (04-statefulset.yaml: "Deliberately NOT set: EXTERNAL_IP").
+    #
+    # To turn inbound peering on later you need BOTH, together:
+    #   1. a PUBLIC type: LoadBalancer Service on 8115, and
+    #   2. public_addresses = ["/ip4/<that LB's public IP>/tcp/8115"]
+    # Doing only one of the two is the failure mode described above.
+
+    # The 15 official mainnet bootnodes, all on tcp/8114.
+    # Straight from docker-prod-guide.md -- the list the VM syncs
+    # against. Do not trim it: bootnodes are the only way this node
+    # learns about the network on a cold start, and dialling 15
+    # gives you tolerance for the handful that are always down.
+    bootnodes = [
+      "/ip4/16.163.82.218/tcp/8114/p2p/QmaZMemLXSsxKUrYNucjEbPxVX3rBKsGhWW2muWtWxUWyh",
+      "/ip4/35.79.196.111/tcp/8114/p2p/QmYCRVonLfP18LSoz2WCHaXDorUYxuUMfhtcXK1TuZ1iwF",
+      "/ip4/13.234.144.148/tcp/8114/p2p/QmbT7QimcrcD5k2znoJiWpxoESxang6z1Gy9wof1rT1LKR",
+      "/ip4/34.64.120.143/tcp/8114/p2p/QmejEJEbDcGGMp4D6WtftMMVLkR1ZuBfMgyLFDMJymkDt6",
+      "/ip4/3.218.170.86/tcp/8114/p2p/QmShw2vtVt49wJagc1zGQXGS6LkQTcHxnEV3xs6y8MAmQN",
+      "/ip4/35.236.107.161/tcp/8114/p2p/QmSRj57aa9sR2AiTvMyrEea8n1sEM1cDTrfb2VHVJxnGuu",
+      "/ip4/23.101.191.12/tcp/8114/p2p/QmexvXVDiRt2FBGptgK4gBJusWyyTEEaHeuCAa35EPNkZS",
+      "/ip4/20.151.143.237/tcp/8114/p2p/QmNsGNQjYA6iP472bNnNE2GR31kCYBifhY1XcaUxRjZ1py",
+      "/ip4/52.59.155.249/tcp/8114/p2p/QmRHqhSGMGm5FtnkW8D6T83X7YwaiMAZXCXJJaKzQEo3rb",
+      "/ip4/3.10.216.39/tcp/8114/p2p/QmagxSv7GNwKXQE7mi1iDjFHghjUpbqjBgqSot7PmMJqHA",
+      "/ip4/13.37.172.80/tcp/8114/p2p/QmXJg4iKbQzMpLhX75RyDn89Mv7N2H8vLePBR7kgZf6hYk",
+      "/ip4/34.118.49.255/tcp/8114/p2p/QmeCzzVmSAU5LNYAeXhdJj8TCq335aJMqUxcvZXERBWdgS",
+      "/ip4/40.115.75.216/tcp/8114/p2p/QmW3P1WYtuz9hitqctKnRZua2deHXhNePNjvtc9Qjnwp4q",
+      "/ip4/34.176.239.95/tcp/8114/p2p/QmQoWrmuFauCn3zZ2mYYKAciG9opTbjzC2wVEfWveZNDt8",
+      "/ip4/13.245.217.98/tcp/8114/p2p/Qmf4t1SzFhRWuGcFcgs7r4pXvkACsz3FcaBMcmMKQMMpn7",
+    ]
+
+    max_peers                      = 125
+    max_outbound_peers             = 8
+    ping_interval_secs             = 120
+    ping_timeout_secs              = 1200
+    connect_outbound_interval_secs = 15
+    # No UPnP: there is no NAT gateway in front of a pod to punch.
+    upnp                           = false
+    # false, NOT true. The old config had this true, which makes the
+    # node advertise its own RFC1918 pod IP (10.x) to the network.
+    # No internet peer can route to that, so it is pure noise that
+    # costs you peer reputation.
+    discovery_local_address        = false
+    bootnode_mode                  = false
+
+    support_protocols = ["Ping","Discovery","Identify","Feeler","DisconnectMessage","Sync","Relay","Time","Alert","LightClient","Filter","HolePunching"]
+
+    [rpc]
+    # 0.0.0.0, not 127.0.0.1 -- a Service cannot reach a loopback
+    # bind. The exposure decision is made in 04-service.yaml, which
+    # only ever puts 8114 behind an INTERNAL (VNet-only) LB.
+    listen_address        = "0.0.0.0:8114"
+    # DEVIATION 2 vs the Docker guide: 10 MiB -> 20 MiB, carried
+    # over from the repo's Nervos/ckb.toml. Batch RPC over a full
+    # archive node is the reason.
+    max_request_body_size = 20971520
+    # RichIndexer is what serves address balances and tx history,
+    # and it backfills from genesis on its own. Note there is no
+    # "Indexer" here and no --indexer flag on the container: this
+    # exact module list is the combination the VM runs. Do not add
+    # Indexer alongside RichIndexer without testing it first.
+    modules = ["Net","Pool","Chain","Stats","Subscription","Experiment","RichIndexer"]
+    reject_ill_transactions = true
+    enable_deprecated_rpc   = false
+
+    [tx_pool]
+    max_tx_pool_size     = 180_000_000
+    min_fee_rate         = 1_000
+    min_rbf_rate         = 1_500
+    max_tx_verify_cycles = 70_000_000
+    max_ancestors_count  = 25
+
+    [indexer_v2]
+    index_tx_pool = true
+
+    # DEVIATION 3 vs the Docker guide: memory_tracker added, at the
+    # repo config's 5-minute interval. On a shared cluster with a
+    # memory limit you want RSS in the log when the OOMKiller fires.
+    [memory_tracker]
+    interval = 300

@@ -1,0 +1,12 @@
+apiVersion: storage.k8s.io/v1           # StorageClass API version
+kind: StorageClass
+metadata:
+  name: nervos-storage                  # pattern: <namespace>-storage
+  labels:
+    blockchain: nervos-node            # node family label
+provisioner: disk.csi.azure.com         # Azure Disk CSI driver — verified provisioner
+parameters:
+  skuName: StandardSSD_LRS             # Standard SSD — default SKU for this cluster
+reclaimPolicy: Retain                   # NEVER Delete — CKB chain data is irreplaceable
+volumeBindingMode: WaitForFirstConsumer # provision disk in same AZ as scheduled pod
+allowVolumeExpansion: true              # required for pvc-watcher auto-expansion

@@ -1,0 +1,7 @@
+apiVersion: v1                          # stable Namespace API
+kind: Namespace
+metadata:
+  name: nervos                          # namespace for Nervos CKB blockchain node
+  labels:
+    blockchain: nervos-node            # identifies this blockchain node family
+    managed-by: manifest-generator      # tooling provenance label

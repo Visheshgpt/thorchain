@@ -1,0 +1,117 @@
+# ============================================================
+# THROWAWAY DIAGNOSTIC POD -- run this BEFORE debugging anything
+# else. It answers the one question the manifests cannot:
+#
+#   Can a pod on this cluster open an OUTBOUND TCP connection to
+#   a CKB mainnet bootnode on port 8114?
+#
+# On the Docker VM the answer was NO until outbound 8114 was
+# opened, and opening it is what made that node start syncing.
+# Nobody has confirmed the answer for the AKS node subnet, and
+# this cluster's own docs say outbound is restricted:
+#   AKS_SETUP/SETUP-WIKI.md        "AKS blocks outbound TCP on
+#                                   random ports"
+#   AKS_SETUP/manifests/03-statefulset.yaml:195
+#                                  "Port 27147 direct to
+#                                   validator IPs is blocked by
+#                                   AKS NSG -- do NOT use"
+#
+# It probes FOUR bootnodes on 8114, not one -- individual
+# bootnodes go down and a single BLOCKED result would be
+# ambiguous. It also probes 443 as a control: if 443 is blocked
+# too, egress is broken generally and this is not a CKB problem.
+#
+# Runs as UID 1000 non-root with all capabilities dropped, so
+# Gatekeeper on this cluster admits it.
+#
+# Apply, read the logs, delete:
+#   kubectl apply -f 99-egress-test.yaml
+#   kubectl logs -n nervos ckb-egress-test -f
+#   kubectl delete -f 99-egress-test.yaml
+#
+# READING THE RESULT
+#   8114 OPEN on any bootnode     -> egress is fine. The problem
+#                                    was the unmounted config;
+#                                    the fix in this directory
+#                                    covers it.
+#   8114 BLOCKED on all four,
+#     443 OPEN                    -> NSG / Azure Firewall. NO
+#                                    manifest change fixes this.
+#                                    Get outbound TCP 8114 (and
+#                                    8115) opened on the AKS node
+#                                    subnet -- the same rule that
+#                                    fixed the VM.
+#   443 BLOCKED too               -> general egress failure, not
+#                                    a CKB issue at all.
+# ============================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ckb-egress-test
+  namespace: nervos
+  labels:
+    app: ckb-egress-test
+spec:
+  restartPolicy: Never
+  # Schedule where the real node runs. If you later pin ckb to a
+  # node pool, copy the same nodeSelector/tolerations here --
+  # egress rules can differ per subnet, and testing from the
+  # wrong pool gives you a confident wrong answer.
+  containers:
+    - name: probe
+      image: alpine:3.19
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      resources:
+        requests: { cpu: "10m", memory: "32Mi" }
+        limits:   { memory: "64Mi" }
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "=== CKB mainnet bootnodes, OUTBOUND TCP 8114 ==="
+          echo "    (8114 is the port the bootnodes LISTEN on;"
+          echo "     8115 is what our own node listens on)"
+          for ip in 16.163.82.218 35.79.196.111 3.218.170.86 13.37.172.80; do
+            if nc -z -w 8 "$ip" 8114 2>/dev/null; then
+              echo "  OPEN    $ip:8114"
+            else
+              echo "  BLOCKED $ip:8114"
+            fi
+          done
+
+          echo ""
+          echo "=== same hosts on 8115 (secondary; some peers use it) ==="
+          for ip in 16.163.82.218 35.79.196.111 3.218.170.86 13.37.172.80; do
+            if nc -z -w 8 "$ip" 8115 2>/dev/null; then
+              echo "  OPEN    $ip:8115"
+            else
+              echo "  BLOCKED $ip:8115"
+            fi
+          done
+
+          echo ""
+          echo "=== control: 443 and DNS ==="
+          if nc -z -w 8 1.1.1.1 443 2>/dev/null; then
+            echo "  OPEN    1.1.1.1:443"
+          else
+            echo "  BLOCKED 1.1.1.1:443   <-- general egress failure, not CKB"
+          fi
+          if nslookup github.com >/dev/null 2>&1; then
+            echo "  OK      cluster DNS"
+          else
+            echo "  FAIL    cluster DNS"
+          fi
+
+          echo ""
+          echo "=== verdict ==="
+          echo "  any 8114 OPEN            -> egress fine; the unmounted"
+          echo "                              ckb.toml was the problem"
+          echo "  all 8114 BLOCKED, 443 OK -> NSG/Azure Firewall. Open"
+          echo "                              outbound TCP 8114 + 8115 on"
+          echo "                              the AKS node subnet. No"
+          echo "                              manifest change fixes this."
+          sleep 5

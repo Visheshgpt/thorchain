@@ -1,0 +1,127 @@
+# =============================================================================
+#  CKB Full Archive Node Configuration
+#  Version: v0.205.0
+#  Purpose: Full historical data — query any block height
+#
+#  IMPORTANT: After editing this file run:
+#    docker compose restart ckb-node
+# =============================================================================
+
+# Data directory inside the container (keep as-is with Docker)
+data_dir = "data"
+
+# =============================================================================
+# RPC
+# =============================================================================
+[rpc]
+# Bind inside container — nginx proxies it to the host
+listen_address = "0.0.0.0:8114"
+
+# ALL modules enabled — required for full historical queries
+# Chain       → get_block_by_number, get_header_by_number, get_transaction
+# Indexer     → get_cells, get_transactions (live cells by script)
+# RichIndexer → get_cells_capacity, get_transactions with filters
+modules = [
+  "Net",
+  "Pool",
+  "Miner",
+  "Chain",
+  "Stats",
+  "Subscription",
+  "Experiment",
+  "Debug",
+  "Indexer",
+  "RichIndexer"
+]
+
+# Max request body — increase for large batch RPC calls
+max_request_body_size = 20971520   # 20 MB
+
+# Batch RPC — allows multiple methods in one HTTP call
+# (reduces round-trips when querying many blocks)
+enable_deprecated_rpc = false
+
+# =============================================================================
+# Network / P2P
+# =============================================================================
+[network]
+listen_addresses  = ["/ip4/0.0.0.0/tcp/8115"]
+
+public_addresses = ["/ip4/20.118.15.24/tcp/8115"]
+
+# All protocols — includes HolePunching needed for NAT traversal on EC2
+support_protocols = [
+  "Ping",
+  "Discovery",
+  "Identify",
+  "Feeler",
+  "DisconnectMessage",
+  "Sync",
+  "Relay",
+  "Time",
+  "Alert",
+  "LightClient",
+  "Filter",
+  "HolePunching"
+]
+
+max_peers               = 125     # max simultaneous peers
+max_outbound_peers      = 8       # outbound connection limit
+connect_outbound_count  = 8       # active outbound dial count
+ping_interval_secs      = 15
+ping_timeout_secs       = 20
+discovery_local_address = true    # include local addrs in discovery
+
+bootnodes = [
+  "/ip4/47.111.169.36/tcp/8115/p2p/QmNQ4jky6uVqLDrPU7snqxARuNGWNLgSrTnssbdn5FJ4HE",
+]
+
+# =============================================================================
+# Store — FULL ARCHIVE (never prune anything)
+# =============================================================================
+[store]
+# Increasing these caches speeds up historical queries (tune to your RAM)
+block_cache_capacity   = 20      # number of full blocks cached in memory
+header_cache_capacity  = 512     # block headers cached
+cell_cache_capacity    = 128     # cell data cached
+
+# =============================================================================
+# Logger
+# =============================================================================
+[logger]
+filter          = "info"
+color           = false          # no ANSI color in log files
+log_to_file     = true
+log_to_stdout   = true           # docker logs captures stdout
+file            = "logs/ckb.log"
+emit_sentry_breadcrumbs = false  # disable telemetry
+
+# =============================================================================
+# Fee Estimator
+# =============================================================================
+[fee_estimator]
+algorithm = "WeightUnitsFlow"
+
+# =============================================================================
+# Memory tracker (logs memory usage periodically)
+# =============================================================================
+[memory_tracker]
+# Log memory stats every 5 minutes (set 0 to disable)
+interval = 300
+
+# =============================================================================
+# Indexer (built-in — enabled via --indexer flag in command)
+# =============================================================================
+# No extra config needed — the --indexer flag in docker-compose command
+# enables both Indexer and RichIndexer automatically.
+# Indexer DB is stored under data/indexer/ inside the container volume.
+
+# =============================================================================
+# Block Assembler (mining — leave commented unless you are mining)
+# =============================================================================
+# [block_assembler]
+# code_hash = "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8"
+# args      = "0x<YOUR_LOCK_ARG>"
+# hash_type = "type"
+# message   = "0x"
+

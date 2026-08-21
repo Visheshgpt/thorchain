@@ -1,0 +1,172 @@
+# =============================================================================
+#  CKB Full Archive Node Configuration  -- mainnet
+#  Binary version: v0.206.0
+#  Purpose: full historical data, RichIndexer, query any block height
+#
+#  This is the SINGLE SOURCE OF TRUTH for both deployments:
+#    Docker  -> mounted directly (docker-prod-guide.md step 3c)
+#    AKS     -> embedded in manifest/03-configmap-ckb.yaml
+#  Change it here, then mirror it there. They are kept in sync by hand.
+#
+#  The previous version of this file is kept as ckb.toml.orig-broken.
+#  It should not be used. What was wrong with it:
+#    * ONE bootnode (/ip4/47.111.169.36/tcp/8115/...) instead of the 15
+#      official ones -- and on tcp/8115, where the real mainnet bootnodes
+#      publish P2P on tcp/8114. One unreachable bootnode = zero peers =
+#      a node that starts cleanly and then does nothing forever.
+#    * public_addresses = 20.118.15.24 hardcoded. See the section below.
+#    * discovery_local_address = true -- advertises private/local addresses
+#      that no internet peer can route to.
+#    * [store] keys block_cache_capacity / header_cache_capacity /
+#      cell_cache_capacity, which are not CKB StoreConfig fields.
+#    * connect_outbound_count, which is not a CKB key
+#      (the real one is connect_outbound_interval_secs).
+#    * No [chain] section, so nothing pinned the mainnet spec.
+#
+#  After editing, on Docker:  docker compose restart ckb
+#  After editing, on AKS:     update the ConfigMap, then
+#                             kubectl rollout restart statefulset/ckb -n nervos
+# =============================================================================
+#
+#  PORTS -- CKB IS NOT COSMOS, READ THIS ONCE
+#
+#    8114  JSON-RPC on THIS node          (rpc.listen_address)
+#    8115  P2P listener on THIS node      (network.listen_addresses)
+#
+#  But the official mainnet bootnodes publish THEIR P2P on 8114.
+#  So this node LISTENS on 8115 and DIALS OUT to 8114.
+#
+#  => The firewall rule that matters is OUTBOUND TCP 8114.
+#     Opening it is what made the Docker VM start syncing.
+#     If outbound 8114 is blocked: 0 peers, 0 blocks, clean logs.
+#     Outbound 8115 is worth allowing too, for peers discovered via
+#     Discovery that do listen on 8115.
+# =============================================================================
+
+# Relative to the ckb home dir. Docker/K8s home is /var/lib/ckb,
+# so data lands in /var/lib/ckb/data.
+data_dir = "data"
+
+# Reads the chain spec out of the binary rather than off disk, which is
+# why no `ckb init` is needed to generate a specs/ directory.
+[chain]
+spec = { bundled = "specs/mainnet.toml" }
+
+[logger]
+filter        = "info"
+color         = false          # no ANSI escapes in captured logs
+log_to_file   = true           # AKS overrides this to false -- see the
+                               # ConfigMap; on K8s the runtime captures and
+                               # rotates stdout, and a log file on the PVC
+                               # grows unbounded through a multi-week sync.
+log_to_stdout = true
+
+[sentry]
+dsn = ""                       # telemetry off
+
+[db]
+# RocksDB block cache. The single biggest contributor to RSS -- raise this
+# and you must raise the container memory limit by at least as much.
+#   16 GB RAM -> 1073741824  (1 GB)
+#   32 GB RAM -> 2147483648  (2 GB)
+cache_size = 1073741824
+
+[network]
+listen_addresses = ["/ip4/0.0.0.0/tcp/8115"]
+
+# -----------------------------------------------------------------------------
+# public_addresses IS DELIBERATELY COMMENTED OUT. Read this before enabling it.
+#
+# public_addresses is what this node tells every peer to dial it back on.
+# Setting it to an address that does not actually reach this node is WORSE
+# than setting nothing: peers burn their outbound budget on a dial that
+# times out, then deprioritise and drop you.
+#
+# It is ALL-OR-NOTHING and it is OPTIONAL -- a node syncing from genesis
+# needs only OUTBOUND p2p.
+#
+# On DOCKER you may enable it, but only if BOTH are true:
+#   1. the compose file publishes 8115 to the host  (it does), AND
+#   2. inbound TCP 8115 is genuinely open on the VM's NSG to the internet
+# and only with THAT VM's own public IP:
+#   public_addresses = ["/ip4/20.118.15.24/tcp/8115"]
+#
+# On AKS leave it off. A pod's IP is RFC1918 and unroutable, and the
+# manifests deliberately front p2p with no public LoadBalancer -- the same
+# call as Cronos POS and THORChain on this cluster. To turn inbound peering
+# on there you need a PUBLIC LoadBalancer on 8115 *and* this key set to
+# that LB's public IP. Do both or neither.
+# -----------------------------------------------------------------------------
+# public_addresses = ["/ip4/<this node's real reachable public IP>/tcp/8115"]
+
+# The 15 official mainnet bootnodes. All on tcp/8114.
+# Do not trim this list: bootnodes are the ONLY way the node learns about
+# the network on a cold start, and dialling 15 gives tolerance for the
+# handful that are always down.
+bootnodes = [
+  "/ip4/16.163.82.218/tcp/8114/p2p/QmaZMemLXSsxKUrYNucjEbPxVX3rBKsGhWW2muWtWxUWyh",
+  "/ip4/35.79.196.111/tcp/8114/p2p/QmYCRVonLfP18LSoz2WCHaXDorUYxuUMfhtcXK1TuZ1iwF",
+  "/ip4/13.234.144.148/tcp/8114/p2p/QmbT7QimcrcD5k2znoJiWpxoESxang6z1Gy9wof1rT1LKR",
+  "/ip4/34.64.120.143/tcp/8114/p2p/QmejEJEbDcGGMp4D6WtftMMVLkR1ZuBfMgyLFDMJymkDt6",
+  "/ip4/3.218.170.86/tcp/8114/p2p/QmShw2vtVt49wJagc1zGQXGS6LkQTcHxnEV3xs6y8MAmQN",
+  "/ip4/35.236.107.161/tcp/8114/p2p/QmSRj57aa9sR2AiTvMyrEea8n1sEM1cDTrfb2VHVJxnGuu",
+  "/ip4/23.101.191.12/tcp/8114/p2p/QmexvXVDiRt2FBGptgK4gBJusWyyTEEaHeuCAa35EPNkZS",
+  "/ip4/20.151.143.237/tcp/8114/p2p/QmNsGNQjYA6iP472bNnNE2GR31kCYBifhY1XcaUxRjZ1py",
+  "/ip4/52.59.155.249/tcp/8114/p2p/QmRHqhSGMGm5FtnkW8D6T83X7YwaiMAZXCXJJaKzQEo3rb",
+  "/ip4/3.10.216.39/tcp/8114/p2p/QmagxSv7GNwKXQE7mi1iDjFHghjUpbqjBgqSot7PmMJqHA",
+  "/ip4/13.37.172.80/tcp/8114/p2p/QmXJg4iKbQzMpLhX75RyDn89Mv7N2H8vLePBR7kgZf6hYk",
+  "/ip4/34.118.49.255/tcp/8114/p2p/QmeCzzVmSAU5LNYAeXhdJj8TCq335aJMqUxcvZXERBWdgS",
+  "/ip4/40.115.75.216/tcp/8114/p2p/QmW3P1WYtuz9hitqctKnRZua2deHXhNePNjvtc9Qjnwp4q",
+  "/ip4/34.176.239.95/tcp/8114/p2p/QmQoWrmuFauCn3zZ2mYYKAciG9opTbjzC2wVEfWveZNDt8",
+  "/ip4/13.245.217.98/tcp/8114/p2p/Qmf4t1SzFhRWuGcFcgs7r4pXvkACsz3FcaBMcmMKQMMpn7",
+]
+
+max_peers                      = 125
+max_outbound_peers             = 8
+ping_interval_secs             = 120
+ping_timeout_secs              = 1200
+connect_outbound_interval_secs = 15
+upnp                           = false   # nothing to punch: no NAT gateway on a pod
+discovery_local_address        = false   # do NOT advertise private/local addrs
+bootnode_mode                  = false
+
+support_protocols = ["Ping","Discovery","Identify","Feeler","DisconnectMessage","Sync","Relay","Time","Alert","LightClient","Filter","HolePunching"]
+
+[rpc]
+# 0.0.0.0 inside the container. What is actually EXPOSED is decided outside:
+#   Docker -> compose publishes 127.0.0.1:8114 (localhost only)
+#   AKS    -> manifest/04-service.yaml, INTERNAL (VNet-only) LoadBalancer
+# Never put this on a public IP. It is an unauthenticated full-archive
+# RichIndexer endpoint.
+listen_address        = "0.0.0.0:8114"
+max_request_body_size = 20971520          # 20 MB -- headroom for batch RPC
+
+# RichIndexer serves address balances and tx history and backfills from
+# genesis on its own. Note: no "Indexer" alongside it, and no --indexer flag
+# on the process. This exact list is the proven-working combination.
+modules = ["Net","Pool","Chain","Stats","Subscription","Experiment","RichIndexer"]
+
+reject_ill_transactions = true
+enable_deprecated_rpc   = false
+
+[tx_pool]
+max_tx_pool_size     = 180_000_000
+min_fee_rate         = 1_000
+min_rbf_rate         = 1_500
+max_tx_verify_cycles = 70_000_000
+max_ancestors_count  = 25
+
+[indexer_v2]
+index_tx_pool = true
+
+[memory_tracker]
+interval = 300                 # log RSS every 5 min; 0 disables
+
+# =============================================================================
+# Block Assembler (mining) -- leave commented unless you are mining.
+# =============================================================================
+# [block_assembler]
+# code_hash = "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8"
+# args      = "0x<YOUR_LOCK_ARG>"
+# hash_type = "type"
+# message   = "0x"

@@ -1,0 +1,230 @@
+# ============================================================
+# Nervos CKB mainnet FULL ARCHIVE NODE on AKS.
+#
+# THE ONE CHANGE THAT ACTUALLY MATTERS
+#   The ckb.toml mount was left commented out as a "# TODO".
+#   With no config file the image entrypoint runs `ckb init
+#   --chain mainnet` and the node comes up on a stock config
+#   nobody in this repo wrote -- which is precisely why ckb-0's
+#   log stops at "CKB service started ... Waiting exit signal"
+#   and never prints a single block. The ConfigMap now exists
+#   (03-configmap-ckb.yaml) and is mounted below.
+#
+#   Read this honestly: mounting the config is NECESSARY but may
+#   not be SUFFICIENT. CKB mainnet bootnodes are dialled on
+#   OUTBOUND TCP 8114, the same class of port this cluster's own
+#   docs record as blocked (AKS_SETUP/SETUP-WIKI.md: "AKS blocks
+#   outbound TCP on random ports"; manifests/03-statefulset.yaml:
+#   "Port 27147 direct to validator IPs is blocked by AKS NSG").
+#   Opening outbound 8114 is what made the Docker VM sync. No
+#   manifest change substitutes for that NSG rule. Run the egress
+#   test in README-AKS.md section 2 BEFORE debugging anything
+#   else here.
+#
+# OTHER DEFECTS FIXED, IN ORDER OF SEVERITY
+#
+#  1. LIVENESS PROBE ON THE P2P PORT, NO STARTUP PROBE.
+#     livenessProbe tcpSocket:8115, initialDelay 60, period 30,
+#     failureThreshold 3 = the kubelet SIGTERMs this pod 150s
+#     after start if 8115 is not answering. A cold RocksDB open
+#     on a large chain dir takes longer than that, so the node
+#     gets killed mid-open, restarts, and never gets further --
+#     a restart loop that looks exactly like "not syncing".
+#     A startupProbe now holds the liveness/readiness clock off
+#     until the process is genuinely up.
+#
+#     The probes also moved off 8115 onto 8114. Probing the P2P
+#     port makes the KUBELET dial CKB's p2p listener every 30s;
+#     CKB accepts, gets no handshake, and drops it. You are
+#     feeding your own node garbage connections. 8114 is the RPC
+#     port and is the correct thing to health-check.
+#
+#  2. CPU LIMIT. `limits.cpu: "2"` throttles via CFS. CKB genesis
+#     sync is script-verification bound and highly parallel;
+#     throttling it is the classic cause of a node that "runs but
+#     never catches up". Removed -- requests.cpu is a scheduling
+#     reservation, and that is all you want. Same call as Cronos
+#     ("NO CPU LIMIT, on purpose") and THORChain.
+#
+#  3. MEMORY. 4Gi limit against db.cache_size=1GiB RocksDB block
+#     cache + header_map 256MB + tx_pool + the indexer is too
+#     tight; it OOMKills partway through sync. 4Gi request /
+#     10Gi limit.
+#
+#  4. `--indexer` FLAG REMOVED. The VM syncs with `command: run`
+#     and RichIndexer in rpc.modules; that is the proven
+#     combination and this now mirrors it exactly. Mixing the
+#     v1 --indexer flag with the RichIndexer module is an
+#     untested combination and this is not the moment to test it.
+#
+#  5. runAsNonRoot: false. Gatekeeper on this cluster forbids
+#     root (SETUP-WIKI.md section 3.2). The nervos/ckb image
+#     already declares USER 1000, so this was asking for an
+#     exemption it never needed. Now pinned explicitly to 1000.
+#
+#  6. enableServiceLinks. Kubernetes injects CKB_RPC_PORT,
+#     CKB_HEADLESS_PORT etc. into this pod -- CKB_-prefixed env
+#     vars, into a process whose own config env prefix is CKB_.
+#     Off.
+# ============================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ckb
+  namespace: nervos
+  labels:
+    app: ckb
+    blockchain: nervos-node
+    component: blockchain-node
+spec:
+  serviceName: ckb-headless          # must match the headless Service in 04-service.yaml
+  replicas: 1                        # one PVC, one node. Never scale this.
+  selector:
+    matchLabels:
+      app: ckb
+  template:
+    metadata:
+      labels:
+        app: ckb
+        blockchain: nervos-node
+        component: blockchain-node
+    spec:
+      # See defect 6 in the header.
+      enableServiceLinks: false
+
+      # CKB must flush RocksDB cleanly. SIGKILL mid-write on a
+      # chain dir this size means re-syncing from genesis, which
+      # here means weeks. 60s was the compose default carried over
+      # and is not enough.
+      terminationGracePeriodSeconds: 300
+
+      securityContext:
+        # The nervos/ckb image declares USER 1000 (user "ckb").
+        # Pinned explicitly so Gatekeeper can see it and so the
+        # PVC ownership is deterministic across image bumps.
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        # The default "Always" re-chowns the ENTIRE volume on every
+        # single start. On a full CKB archive that is hundreds of
+        # GB and millions of SST files -- many minutes added to
+        # each restart, for nothing.
+        #
+        # It is also the cause of the log line you are seeing:
+        #   WARN  Your network secret file's permission is not less
+        #         than 0o600, path: ".../network/secret_key"
+        # fsGroup relabelling makes that key group-readable on
+        # every boot. OnRootMismatch stops re-applying it, so once
+        # the key is 0600 it stays 0600 and the warning goes away.
+        fsGroupChangePolicy: OnRootMismatch
+
+      containers:
+        - name: ckb
+          image: nervos/ckb:v0.206.0
+          imagePullPolicy: IfNotPresent
+
+          # Mirrors the compose file's `command: run` exactly.
+          # See defect 4 in the header for why --indexer is gone.
+          args: ["run"]
+
+          ports:
+            # 8115 = this node's P2P listener. 8114 = this node's
+            # JSON-RPC. Peers are DIALLED on 8114. Yes, that is
+            # backwards from every Cosmos chain in this repo; it is
+            # correct for CKB. Full explanation in the header of
+            # 03-configmap-ckb.yaml.
+            - { name: p2p, containerPort: 8115, protocol: TCP }
+            - { name: rpc, containerPort: 8114, protocol: TCP }
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+
+          resources:
+            requests:
+              cpu: "1"               # scheduling reservation only
+              memory: "4Gi"
+            limits:
+              # NO cpu limit. See defect 2 in the header.
+              memory: "10Gi"
+
+          # ---- probes ------------------------------------------
+          # All on 8114 (RPC), never 8115 (P2P). See defect 1.
+          #
+          # These are tcpSocket rather than a JSON-RPC call because
+          # the nervos/ckb image is not guaranteed to ship curl or
+          # wget, and a probe that depends on a binary that is not
+          # there fails closed and kills the pod. Confirm what the
+          # image has with README-AKS.md section 5, then upgrade
+          # these if you want a real health signal.
+
+          # Holds readiness AND liveness off entirely until the RPC
+          # port opens. 20 min ceiling for a cold RocksDB open.
+          startupProbe:
+            tcpSocket: { port: 8114 }
+            periodSeconds: 15
+            failureThreshold: 80
+            timeoutSeconds: 5
+
+          readinessProbe:
+            tcpSocket: { port: 8114 }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+
+          # NO LIVENESS PROBE, on purpose, for now.
+          #
+          # A TCP liveness probe reports healthy straight through a
+          # total freeze, because the listener never closes -- so it
+          # buys nothing. And any liveness probe at all during a
+          # multi-week genesis sync is a foot-gun: a false positive
+          # costs you the sync.
+          #
+          # The probe worth having is HEIGHT PROGRESS, the same
+          # shape as Cronos's. Enable it only AFTER the node is
+          # actually syncing and you have confirmed curl exists in
+          # the image (README-AKS.md section 5):
+          #
+          # livenessProbe:
+          #   exec:
+          #     command:
+          #       - /bin/sh
+          #       - -c
+          #       - |
+          #         H=$(curl -s -m 10 -X POST http://localhost:8114 \
+          #              -H 'Content-Type: application/json' \
+          #              -d '{"id":1,"jsonrpc":"2.0","method":"get_tip_block_number","params":[]}' \
+          #             | sed -n 's/.*"result":"\(0x[0-9a-f]*\)".*/\1/p')
+          #         [ -n "$H" ] || exit 1
+          #         H=$(printf '%d' "$H")
+          #         P=$(cat /tmp/last_height 2>/dev/null || echo 0)
+          #         echo "$H" > /tmp/last_height
+          #         [ "$H" -gt "$P" ]
+          #   initialDelaySeconds: 3600
+          #   periodSeconds: 600
+          #   timeoutSeconds: 20
+          #   failureThreshold: 3     # fires after a 30-minute stall
+
+          volumeMounts:
+            - name: ckb-data
+              mountPath: /var/lib/ckb          # chain DB, indexer, network keys
+            # THE FIX. This is the mount that was commented out.
+            #
+            # subPath mounts a single file over one path inside the
+            # PVC mount above, leaving the rest of the volume alone.
+            # The trade-off is that subPath configMap mounts do NOT
+            # hot-reload -- edit the ConfigMap and you must restart
+            # the pod. That is what you want for a chain config.
+            - name: ckb-config
+              mountPath: /var/lib/ckb/ckb.toml
+              subPath: ckb.toml
+              readOnly: true
+
+      volumes:
+        - name: ckb-data
+          persistentVolumeClaim:
+            claimName: nervos-ckb-data
+        - name: ckb-config
+          configMap:
+            name: nervos-ckb-config              # 03-configmap-ckb.yaml

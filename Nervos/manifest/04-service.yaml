@@ -1,0 +1,139 @@
+# ============================================================
+# Services. THREE, matching the Cronos POS / THORChain pattern
+# on this cluster: headless + ClusterIP + internal LoadBalancer.
+#
+# WHAT CHANGED, AND WHY YOU WERE RIGHT TO ASK
+#
+# You asked: "we should not use external ip in the cluster?
+# because in other nodes we also dont use like Cronos."
+# Correct. The public P2P LoadBalancer (`ckb-p2p`) that used to
+# be in this file is DELETED. Three separate reasons:
+#
+#  1. A node syncing from genesis needs only OUTBOUND p2p.
+#     Outbound leaves from the pod IP through the cluster's
+#     egress path. No Service is involved in it AT ALL. Adding
+#     a LoadBalancer does not help a node dial out, and its
+#     absence is not why ckb-0 has zero peers.
+#
+#  2. Inbound peering is ALL-OR-NOTHING. It needs a public IP
+#     *and* `network.public_addresses` in ckb.toml set to that
+#     exact IP. The old setup had the public LB but ckb.toml
+#     was never mounted -- and the ckb.toml it would have
+#     mounted advertised 20.118.15.24, the DOCKER VM. So the
+#     node was paying for a public IP while telling peers to
+#     dial a different machine. Advertising an address you
+#     cannot be reached on gets you deprioritised and dropped,
+#     which is worse than advertising nothing.
+#     Cronos: "We do neither."  THORChain: "Do both or neither."
+#     We do neither. See the public_addresses note in
+#     03-configmap-ckb.yaml for how to turn it on properly.
+#
+#  3. It is a real Azure Public IP on a dev cluster, billed
+#     monthly, for a listener nobody dials.
+#
+# WHAT THE REMAINING LOADBALANCER IS FOR
+# `ckb-rpc` is INTERNAL (VNet-only), 8114 only. RPC is the thing
+# consumers actually want, and it must never be public -- this
+# node runs a full RichIndexer and the compose file bound it to
+# 127.0.0.1 for exactly that reason.
+#
+# P2P 8115 appears ONLY on the headless Service, for in-cluster
+# DNS. It is deliberately not on any LoadBalancer.
+#
+# SHARING ONE LB IP ACROSS CHAINS
+#   AKS runs ONE Azure Standard LB per cluster. Services share a
+#   frontend IP only if their port sets are DISJOINT. CKB's 8114
+#   does not collide with Cronos (26657/1317/9090) or THORChain
+#   (27147/1317/9090), so a dedicated address is clean here.
+#   Keep a port registry: one row per (ip, port) -> chain.
+# ============================================================
+---
+# Stable DNS identity for the StatefulSet:
+#   ckb-0.ckb-headless.nervos.svc.cluster.local
+#
+# publishNotReadyAddresses: true is NOT cosmetic here. A CKB
+# genesis sync takes weeks, readiness fails for all of it, and
+# without this flag the pod is unresolvable by name the entire
+# time -- including for the very RPC calls you use to check on
+# the sync.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ckb-headless
+  namespace: nervos
+  labels:
+    app: ckb
+    blockchain: nervos-node
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: ckb
+  ports:
+    - { name: p2p, port: 8115, targetPort: 8115, protocol: TCP }
+    - { name: rpc, port: 8114, targetPort: 8114, protocol: TCP }
+---
+# In-cluster consumers. Prefer this over the headless Service:
+# traffic only reaches the pod once readiness passes, so a node
+# that is still catching up is not serving stale chain state to
+# an application that thinks it is at tip.
+#
+# RPC only. Nothing in the cluster has any business dialling
+# this node's p2p port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ckb
+  namespace: nervos
+  labels:
+    app: ckb
+    blockchain: nervos-node
+spec:
+  type: ClusterIP
+  selector:
+    app: ckb
+  ports:
+    - { name: rpc, port: 8114, targetPort: 8114, protocol: TCP }
+---
+# Private VNet IP for consumers OUTSIDE the cluster.
+# Delete this whole document if nothing off-cluster needs it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ckb-rpc
+  namespace: nervos
+  annotations:
+    # VNet-only. Without this annotation Azure hands out a PUBLIC
+    # IP and this full-archive RichIndexer RPC is on the open
+    # internet with no auth in front of it.
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  labels:
+    app: ckb
+    blockchain: nervos-node
+spec:
+  type: LoadBalancer
+  selector:
+    app: ckb
+  # nodePort is PINNED, not auto-allocated.
+  #
+  # The AKS subnet on this cluster (10.202.17.192/27) is full, so
+  # the internal LB may not provision and EXTERNAL-IP can sit at
+  # <pending> -- same as thornode-rpc and chain-maind-rpc. That is
+  # survivable: a LoadBalancer Service still allocates a NodePort
+  # and kube-proxy still programs it, so the node is reachable at
+  # <any-node-ip>:30814 immediately, consuming ZERO subnet
+  # addresses.
+  #
+  # Left auto-allocated this number is reassigned at random if the
+  # Service is ever deleted and recreated, breaking every URL
+  # handed to a consumer. Pinned, it survives.
+  #
+  # 30814 is free: Cronos holds 30657/31317/30909, THORChain holds
+  # 30399/32210/30609.
+  #
+  # Type stays LoadBalancer so the IP appears automatically if
+  # subnet capacity is freed. The cost is a SyncLoadBalancerFailed
+  # event every few minutes while it cannot provision; switch to
+  # type: NodePort to silence it, keeping this same number.
+  ports:
+    - { name: rpc, port: 8114, targetPort: 8114, nodePort: 30814, protocol: TCP }

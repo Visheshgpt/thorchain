@@ -1,0 +1,62 @@
+# ============================================================
+# PVC for the CKB home (/var/lib/ckb).
+#
+# ckb.toml sets data_dir = "data", which is relative to the ckb
+# home, so everything lands on THIS volume at /var/lib/ckb/data
+# -- confirmed by the live log line
+#   ".../var/lib/ckb/data/network/secret_key".
+#
+# SIZING -- this is the number most likely to be wrong, so it is
+# written down rather than assumed.
+#
+#   This node is a FULL ARCHIVE node (no pruning configured) with
+#   RichIndexer on, syncing mainnet from genesis. Two stores grow
+#   independently: the chain DB, and the RichIndexer index, which
+#   on CKB is not a rounding error next to the chain.
+#
+#   100Gi was the original value and it is not enough for a full
+#   archive + RichIndexer. Running out mid-sync stalls the node
+#   with RocksDB write errors, and on Azure you can grow a disk
+#   but you can NEVER shrink one -- so the cheap mistake is to
+#   over-provision and the expensive one is to under-provision.
+#
+#   512Gi is the starting point. VERIFY IT AGAINST REALITY rather
+#   than trusting it: once the node is syncing, watch actual
+#   growth per 1M blocks with the `du` command in README-AKS.md
+#   section 6 and expand before you are within ~15% of full.
+#
+# allowVolumeExpansion is true on the StorageClass, so growing
+# this later is an online edit of the number below -- no
+# re-sync, no data loss. Expansion of a BOUND PVC only ever
+# grows; the API server rejects a smaller value.
+#
+# The StorageClass is StandardSSD_LRS (01-storageclass.yaml),
+# matching the cluster convention set by cronospos-storage and
+# arweave-datadir. Be aware of what that costs HERE specifically:
+# Standard SSD IOPS are FLAT (~500) at every size, and a CKB
+# genesis sync is one of the more IO-hungry things in this repo.
+# If the node proves IOPS-bound during catch-up, Premium_LRS
+# scales IOPS with size -- but StorageClass `parameters` are
+# IMMUTABLE, so that means a NEW StorageClass, a NEW PVC and a
+# restart from genesis. The only cheap moment to make that call
+# is now, before the sync has run for weeks.
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nervos-ckb-data
+  namespace: nervos
+  labels:
+    app: ckb
+    blockchain: nervos-node
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: nervos-storage
+  resources:
+    requests:
+      storage: 512Gi
+
+# The compose file's `./ckb.toml:/var/lib/ckb/ckb.toml:ro` mount
+# is NOT a data volume and gets no PVC. It is a ConfigMap:
+# 03-configmap-ckb.yaml, mounted via subPath by the StatefulSet.
