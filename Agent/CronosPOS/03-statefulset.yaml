@@ -118,6 +118,27 @@ spec:
           resources:
             requests: { cpu: "250m", memory: "512Mi" }
             limits:   { memory: "1Gi" }
+          env:
+            # FORCE_RESTORE -- the ONLY supported way to wipe and re-pull
+            # the snapshot. Deliberately a TOKEN, not a boolean: the value
+            # is recorded on the volume after it is honoured, so leaving it
+            # set is harmless and a restart loop cannot re-wipe. To force
+            # again, change the value to anything new.
+            #
+            # Empty = normal operation. This exists so nobody ever has to
+            # mount the PVC from a throwaway pod to fix state by hand --
+            # that habit is how the "populated but no sentinel" guard below
+            # ends up routed around, and that guard is what protects
+            # migrated prod data.
+            - { name: FORCE_RESTORE, value: "" }
+            # ADOPT_EXISTING -- tell the node that chain data ALREADY on
+            # the volume is legitimate and should be used as-is, with no
+            # snapshot pull. This is the switch for a prod-data migration:
+            # restore an Azure disk snapshot into the PVC, set this true,
+            # and the node adopts it instead of refusing.
+            #
+            # It only ever ADDS the sentinel. It never deletes anything.
+            - { name: ADOPT_EXISTING, value: "false" }
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -125,6 +146,19 @@ spec:
               HOME_DIR=/chain-home
               SENTINEL="$HOME_DIR/.snapshot-restored"
               INPROGRESS="$HOME_DIR/.restore-in-progress"
+              TOKENFILE="$HOME_DIR/.force-restore-token"
+
+              # -- forced re-restore, one shot per distinct token --------
+              FORCE="${FORCE_RESTORE:-}"
+              SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
+              if [ -n "$FORCE" ] && [ "$FORCE" != "$SEEN" ]; then
+                echo "[restore] FORCE_RESTORE token '$FORCE' is new -- wiping and re-pulling"
+                rm -rf "$HOME_DIR/data"
+                rm -f "$SENTINEL"
+                printf '%s' "$FORCE" > "$TOKENFILE"
+              elif [ -n "$FORCE" ]; then
+                echo "[restore] FORCE_RESTORE token '$FORCE' already honoured -- ignoring"
+              fi
               SNAP_PAGE="https://polkachu.com/tendermint_snapshots/cryptocom"
               SNAP_BASE="https://snapshots.polkachu.com/snapshots/cryptocom"
 
@@ -145,13 +179,28 @@ spec:
               # someone else's chain dir -> refuse. Populated data +
               # marker means our own wreckage -> safe to clear.
               if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
+                if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
+                  # Adopt data that is already here -- a migrated chain dir.
+                  # Writes the sentinel and nothing else; never deletes.
+                  echo "[restore] ADOPT_EXISTING=true -- adopting the data already on this volume"
+                  echo "adopted" > "$SENTINEL"
+                  rm -f "$INPROGRESS"
+                  ls -la "$HOME_DIR/data" | head -5
+                  exit 0
+                fi
                 if [ -f "$INPROGRESS" ]; then
                   echo "[restore] partial extract from a previous attempt -- clearing"
                   rm -rf "$HOME_DIR/data"
                 else
                   echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
                   echo "[restore] Refusing to overwrite data this script did not create."
-                  echo "[restore] If this data IS good, run:  touch $SENTINEL"
+                  echo "[restore] This is the guard that protects MIGRATED PROD DATA."
+                  echo "[restore]"
+                  echo "[restore] If that data is good and you want the node to adopt it:"
+                  echo "[restore]   set env ADOPT_EXISTING=true on this container."
+                  echo "[restore] If it is junk and you want a fresh snapshot:"
+                  echo "[restore]   set env FORCE_RESTORE to any new value."
+                  echo "[restore] Do NOT mount this PVC from a throwaway pod to fix it by hand."
                   exit 1
                 fi
               fi

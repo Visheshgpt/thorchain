@@ -99,10 +99,10 @@ replays several hundred blocks/min, so expect **tip within 1–3 hours**.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `tar: ...: Cannot change ownership to uid 1001, gid 1001` | tarball carries the producer's uid; tar as root defaults to `--same-owner` and this container has no `CAP_CHOWN`. **Not cosmetic** — GNU tar exits 2, so the script deletes the extract and retries until it gives up | fixed by `--no-same-owner`. Seeing it means an older manifest is deployed — re-apply and use §7b |
+| `tar: ...: Cannot change ownership to uid 1001, gid 1001` | tarball carries the producer's uid; tar as root defaults to `--same-owner` and this container has no `CAP_CHOWN`. **Not cosmetic** — GNU tar exits 2, so the script deletes the extract and retries until it gives up | fixed by `--no-same-owner`. Seeing it means an older manifest is deployed — re-apply; the partial clears itself |
 | `install-chain-maind`: `sha256 mismatch` | upstream re-cut the release, or a corrupt transfer | re-hash upstream `checksums.txt`; update `SHA` in `03-statefulset.yaml` |
 | `restore-snapshot`: `could not discover a snapshot filename` | Polkachu page markup changed, or egress to `polkachu.com:443` blocked | open the page by hand, then §7 |
-| `FATAL: data is populated but has no sentinel` | working as designed — refusing to delete data it did not create | if the data is good: `touch /chain-home/.snapshot-restored`. If it is a dead restore: §7b |
+| `FATAL: data is populated but has no sentinel` | working as designed — refusing to delete data it did not create | working as intended. If the data is good: `ADOPT_EXISTING=true`. If it is junk: a new `FORCE_RESTORE` token. Both in §7b — never a temp pod |
 | PVC stuck `Pending` | `WaitForFirstConsumer` — normal until the pod schedules | if it persists, `kubectl describe pod` — it is a CPU/memory fit problem, not a disk one |
 | Pod `Pending` | 500m/2Gi does not fit | `kubectl describe node` for allocatable; the node pool is undersized |
 | `OOMKilled` | 4Gi limit too low under load | raise the limit — there is no manifest-side fix |
@@ -129,67 +129,45 @@ kubectl wait --for=delete pod/chain-maind-0 -n $NS --timeout=700s   # the 600s g
 kubectl scale statefulset chain-maind -n $NS --replicas=1
 ```
 
-## 7b. Recover from an interrupted restore
+## 7b. Re-restore, or adopt existing data
 
-A restore that dies part-way leaves a populated `data/` with no sentinel. From the
-`--no-same-owner` fix onward the restore marks its own work with
-`/chain-home/.restore-in-progress` and clears it automatically on the next start.
+**No throwaway pod, ever.** Both cases are switches on the StatefulSet itself. Mounting the
+PVC from a temp pod to fix state by hand is how the "populated but no sentinel" guard ends up
+routed around — and that guard is the only thing protecting migrated prod data from an
+init-container `rm -rf`.
 
-A partial extract that predates that fix has no marker, so the guard refuses it — correctly,
-since it cannot tell a half-download from migrated prod data. Place the marker once:
+An interrupted restore needs **nothing**: the restore marks its own work with
+`.restore-in-progress` and clears it automatically on the next start.
+
+### Force a fresh snapshot (throw away what is on the disk)
+
+`FORCE_RESTORE` is a **token, not a boolean**. The value is recorded on the volume once
+honoured, so leaving it set is harmless and a crashloop cannot re-wipe. To force again, give
+it a new value.
 
 ```powershell
-$NS = "cronospos"
-kubectl scale statefulset chain-maind -n $NS --replicas=0
-kubectl wait --for=delete pod/chain-maind-0 -n $NS --timeout=700s
-
-$pod = @'
-apiVersion: v1
-kind: Pod
-metadata:
-  name: mark-partial
-  namespace: cronospos
-spec:
-  restartPolicy: Never
-  securityContext:
-    runAsUser: 0
-    runAsGroup: 0
-    fsGroup: 1025
-  containers:
-    - name: mark
-      image: alpine:3.19
-      command: ["sh","-c","touch /chain-home/.restore-in-progress; ls -la /chain-home"]
-      securityContext:
-        allowPrivilegeEscalation: false
-        capabilities:
-          drop: ["ALL"]
-      volumeMounts:
-        - name: d
-          mountPath: /chain-home
-  volumes:
-    - name: d
-      persistentVolumeClaim:
-        claimName: chain-maind-data
-'@
-
-# -Encoding ascii on purpose: utf8 writes a BOM in PowerShell 5.1 and kubectl rejects it.
-$pod | Out-File -Encoding ascii mark-partial.yaml
-kubectl apply -f mark-partial.yaml
-kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mark-partial -n $NS --timeout=120s
-kubectl logs -n $NS mark-partial
-kubectl delete pod mark-partial -n $NS
-Remove-Item mark-partial.yaml
-
-kubectl apply -f 03-statefulset.yaml          # picks up --no-same-owner
-kubectl scale statefulset chain-maind -n $NS --replicas=1
+kubectl set env statefulset/chain-maind -n $NS -c restore-snapshot FORCE_RESTORE=redo-2026-08-21
+kubectl rollout status statefulset/chain-maind -n $NS --timeout=900s
 kubectl logs -n $NS chain-maind-0 -c restore-snapshot -f
 ```
 
-Expect `[restore] partial extract from a previous attempt -- clearing`, then a clean download.
+Expect `FORCE_RESTORE token 'redo-2026-08-21' is new -- wiping and re-pulling`. On any later
+restart with the same value: `already honoured -- ignoring`.
 
-> The `@'` must end its line and `'@` must start at **column 0** with no indentation, or
-> PowerShell will not close the here-string. Single quotes (not `@"`) stop PowerShell
-> expanding `$` inside the YAML.
+### Adopt chain data already on the volume
+
+This is the switch for a **prod-data migration** — restore an Azure disk snapshot into the
+PVC, then tell the node the data is legitimate. It only ever writes the sentinel; it never
+deletes anything.
+
+```powershell
+kubectl set env statefulset/chain-maind -n $NS -c restore-snapshot ADOPT_EXISTING=true
+kubectl rollout status statefulset/chain-maind -n $NS --timeout=900s
+kubectl logs -n $NS chain-maind-0 -c restore-snapshot
+```
+
+Expect `ADOPT_EXISTING=true -- adopting the data already on this volume`. Set it back to
+`false` afterwards so a genuinely unexpected populated volume still trips the guard.
 
 ## 8. Teardown
 

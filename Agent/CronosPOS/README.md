@@ -167,6 +167,71 @@ p2p is deliberately **not** exposed through any LoadBalancer — see the header 
 
 ---
 
+## 5b. Before you run this in another cluster
+
+A fresh PVC restores from scratch — the skip is gated on `/chain-home/.snapshot-restored`,
+which only exists where a restore already succeeded, and the committed defaults are
+`FORCE_RESTORE=""` / `ADOPT_EXISTING="false"`. Nothing here silently no-ops on a new cluster.
+
+Four things **are** environment- or time-specific. Check them before applying:
+
+### 1. Is the pinned version still the network's consensus version?
+
+This is the check that matters most. `03-statefulset.yaml` pins `chain-maind` **v8.0.0** and
+its SHA256. If the network has since done a coordinated upgrade, a v8.0.0 binary syncs
+happily until the upgrade height and then **halts on a mismatched app hash** — a node that
+looks healthy and is permanently stuck.
+
+```powershell
+(curl.exe -s https://rpc.mainnet.crypto.org/abci_info | ConvertFrom-Json).result.response.version
+# must match the VERSION pinned in 03-statefulset.yaml
+```
+
+If it differs, bump `VERSION` **and** `SHA` together — take the hash from upstream's
+`checksums.txt` for the matching release, never from anywhere else:
+
+```powershell
+curl.exe -sL https://github.com/crypto-org-chain/chain-main/releases/download/v<NEW>/checksums.txt |
+  Select-String "chain-main_<NEW>_Linux_x86_64"
+```
+
+### 2. Are the pinned nodePorts free on that cluster?
+
+`04-service.yaml` pins **30657 / 31317 / 30909** so consumer URLs survive a Service being
+recreated. On a cluster where any of those is already taken, `apply` fails outright with
+`provided port is already allocated`.
+
+```powershell
+kubectl get svc -A -o jsonpath='{range .items[*].spec.ports[*]}{.nodePort}{"\n"}{end}' |
+  Select-String -Pattern '^(30657|31317|30909)$'
+```
+
+Empty output means they are free. Otherwise pick three unused ports in 30000–32767 and
+record them wherever you keep the port registry.
+
+### 3. Does the storage class already exist, and with which SKU?
+
+`parameters` are **immutable**. If `cronospos-storage` exists with a different `skuName`,
+re-applying will not change it and will not error — you simply get the old SKU. Verify:
+
+```powershell
+kubectl get sc cronospos-storage -o jsonpath='{.parameters}'
+```
+
+### 4. Do the seeds still resolve?
+
+Seeds are hardcoded in the `configure` init container from the cosmos chain-registry. They
+churn slowly, but a node with zero reachable seeds finds no peers. Cross-check against
+`https://github.com/cosmos/chain-registry/blob/master/cryptoorgchain/chain.json` if peer count
+stays at 0.
+
+> **Config drift:** `kubectl set env` (RUNBOOK §7b) mutates the live StatefulSet, not this
+> file. A later `kubectl apply -f 03-statefulset.yaml` resets both switches to the file's
+> values — `FORCE_RESTORE=""` and `ADOPT_EXISTING="false"`. That is the intended direction
+> (the file is the source of truth), but do not expect a `set env` change to survive an apply.
+
+---
+
 ## 6. Deploy
 
 ```bash
@@ -193,6 +258,17 @@ decide whether this actually worked.
 - **Init order is load-bearing.** Restore runs first precisely because it is the
   capability-dropped root container: it cannot chmod files owned by 1025, so it must run
   before anything writes as 1025. That comment is in the manifest — do not "tidy" the order.
+- **Two env switches replace every manual PVC fix-up.** There is no procedure anywhere that
+  mounts this PVC from a throwaway pod, on purpose:
+
+  | Env on `restore-snapshot` | Effect |
+  |---|---|
+  | `FORCE_RESTORE=<new token>` | Wipe and re-pull the snapshot. A **token, not a boolean** — recorded on the volume once honoured, so leaving it set cannot cause a re-wipe loop. New value = force again. |
+  | `ADOPT_EXISTING=true` | Treat chain data already on the volume as legitimate and use it as-is. Writes only the sentinel; **never deletes**. This is the switch for a prod-data migration. |
+
+  An interrupted restore needs neither — `.restore-in-progress` marks the restore's own work
+  and the next start clears it automatically. The guard that refuses *unmarked* populated
+  data stays strict, because that is what protects migrated prod state.
 
 ## 8. Deliberately not here
 
