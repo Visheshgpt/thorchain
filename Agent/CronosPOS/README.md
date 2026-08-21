@@ -94,11 +94,22 @@ whatever is idle during catch-up.
 **Disk — 128Gi StandardSSD_LRS.**
 
 ```
-  extracted pruned state      ~18-22 GB   (8.7 GB lz4, ~2-2.5x on Cosmos state)
+  extracted pruned state      11.9 GB     MEASURED on first restore, 2026-08-21
+                                          (8.7 GB lz4 -> ~1.37x, NOT the 2-2.5x
+                                          usually assumed: LevelDB SST files are
+                                          already Snappy-compressed internally,
+                                          so lz4 has little left to squeeze)
   chain-maind binary          ~192 MB
   growth                      ~2-5 GB/mo  (17,000 blocks/day, blockstore dominates)
-  12-month working set        ~70 GB
+  12-month working set        ~40-70 GB
 ```
+
+First restore reported `11.9G used / 113.0G available` on a 124.9 GiB filesystem — 10%.
+That is far more headroom than 12 months needs. 128Gi still stands, for two reasons:
+`allowVolumeExpansion` grows a disk but **Azure disks can never shrink**, so headroom is
+one-way insurance; and on StandardSSD_LRS the IOPS are flat regardless of size, so the
+smaller E6 (64Gi) tier would buy nothing back except a marginal cost saving while risking
+a fill.
 
 On StandardSSD_LRS, IOPS are **flat at ~500 regardless of size**, so unlike Premium there is
 no performance reason to size up — 128Gi is a pure capacity decision. If the node proves

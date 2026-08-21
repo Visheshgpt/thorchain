@@ -28,7 +28,8 @@ kubectl get pods -n $NS -w
 ## 2. Watch it come up
 
 Expected: `Init:0/3` → `Init:2/3` → `PodInitializing` → `Running`.
-First boot is dominated by the snapshot stream — around 5–10 min at 30 MB/s.
+First boot is dominated by the snapshot stream. Measured 2026-08-21: **4m36s at 31.5 MB/s**
+for 8729 MB, extracting to 11.9 GB.
 
 ```powershell
 kubectl logs -n $NS chain-maind-0 -c restore-snapshot -f      # streamed snapshot (the long one)
