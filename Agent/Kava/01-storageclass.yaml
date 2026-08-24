@@ -1,0 +1,40 @@
+# ============================================================
+# Azure Disk StorageClass for Kava chain data.
+#
+# skuName: StandardSSD_LRS -- this cluster's default SKU, the
+# same class as arweave-storage and cronospos-storage. Flat
+# ~500 IOPS / 60 MB/s across almost all sizes, so growing the
+# disk buys capacity, not speed.
+#
+#   Kava is a heavier chain than Cronos POS (22.2M blocks, EVM
+#   state, a 35 GB pruned snapshot). If catch-up proves
+#   IOPS-bound, Premium_LRS scales IOPS with size
+#   (P15 256Gi = 1100 IOPS vs E15's flat 500) at roughly 2x
+#   the cost. Watch check 3 in the RUNBOOK before deciding.
+#
+# NOTE: StorageClass `parameters` are IMMUTABLE. skuName cannot
+#       be switched in place -- it needs a new class, a new
+#       PVC, and a full 35 GB re-restore.
+#
+# cachingMode: None -- goleveldb is write-heavy random IO that
+# does its own fsync. Azure host caching in front of it adds
+# latency spikes and buys nothing.
+#
+# reclaimPolicy: Retain -- deleting the PVC must not delete the
+# disk. The cost: deleting the PVC does not stop billing.
+# ============================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: kava-storage
+  labels:
+    app: kava
+    blockchain: kava
+    environment: non-prod
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: StandardSSD_LRS             # Standard SSD — default SKU for this cluster
+  cachingMode: None
+reclaimPolicy: Retain                  # NEVER Delete — blockchain data is irreplaceable
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

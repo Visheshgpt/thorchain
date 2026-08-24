@@ -1,0 +1,11 @@
+apiVersion: v1                      # Stable core API version for Namespace resources
+kind: Namespace
+metadata:
+  name: cronospos                   # Namespace name — derived from node name (CronosPOS)
+  labels:
+    blockchain: cronospos           # Identifies the blockchain protocol running in this namespace
+    node: node_cronospos            # Unique node identifier used for label selectors across all resources
+    managed-by: manifest-generator  # Tracks that this resource was created by the AKS Manifest Generator
+
+
+

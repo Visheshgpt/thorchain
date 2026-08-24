@@ -1,0 +1,42 @@
+# ============================================================
+# PVC for the chain home (/kava-home).
+#
+# SIZING
+#   Polkachu pruned snapshot, compressed ...  34.6 GiB
+#     (measured: content-length 37,146,607,892)
+#   Extracted pruned state .................  ~47-70 GB
+#     (Cronos POS measured 1.37x on lz4; assume up to 2x here)
+#   genesis.json ...........................  210 MB  <- yes, really
+#   Growth .................................  ~5 GB / month
+#
+#   Kava's own docs quote growth per pruning mode:
+#     archival  ~100 GB/mo   default ~25 GB/mo   everything ~5 GB/mo
+#   Polkachu's snapshot is pruning="custom" keep-recent=100
+#   interval=10, which behaves like "everything", so ~5 GB/mo
+#   is the right expectation -- NOT the 25 GB/mo default figure.
+#
+#   12-month working set  ~=  70 + 60  =  ~130 GB   ->  256Gi
+#
+# The 34.6 GiB tarball is NEVER written to this disk -- the
+# restore streams curl | lz4 -d | tar -x straight into the
+# volume, so there is no download+extract peak to budget.
+#
+# If pruning is ever relaxed toward "default" (25 GB/mo), this
+# fills inside a year. Expansion is online and one-way:
+#   kubectl patch pvc kava-data ... storage: 512Gi
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kava-data
+  namespace: kava
+  labels:
+    app: kava
+    blockchain: kava
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: kava-storage
+  resources:
+    requests:
+      storage: 256Gi

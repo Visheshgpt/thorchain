@@ -1,0 +1,77 @@
+apiVersion: apps/v1                 # Stable API version for StatefulSet resources
+kind: StatefulSet
+metadata:
+  name: node-cronospos              # StatefulSet name — pod will be named node-cronospos-0
+  namespace: cronospos              # Must match namespace in 00-node_cronospos_namespace.yaml
+  labels:
+    blockchain: cronospos           # Protocol identifier
+    node: node_cronospos            # Node identifier used by all services as selector
+    managed-by: manifest-generator  # Tracks origin of this resource
+spec:
+  serviceName: node-cronospos       # Must match the headless Service name in 04-node_cronospos_service.yaml
+  replicas: 1                       # Single replica — blockchain nodes do not horizontally scale
+  selector:
+    matchLabels:
+      node: node_cronospos          # Must match pod template labels below
+  template:
+    metadata:
+      labels:
+        blockchain: cronospos       # Protocol identifier on the pod
+        node: node_cronospos        # Used by all three Services as the selector
+    spec:
+      securityContext:
+        runAsNonRoot: false         # No user: field in compose — daemon may require root
+        fsGroup: 1000               # Ensures the mounted PVC is writable by the container user
+      terminationGracePeriodSeconds: 60  # Allow chain-maind to flush state before SIGKILL
+      containers:
+        - name: chainmaind          # Container name — matches docker-compose service name
+          image: cryptocom/chain-main:v8.0.0  # Pinned image — do NOT use :latest in production
+          args:                     # Parsed from docker-compose command: field
+            - "chain-maind"         # Binary name (compose command includes it explicitly)
+            - "start"               # Subcommand
+            - "--home"              # Data directory flag
+            - "/chain-home"         # Mapped to PVC mount path below
+            - "--rpc.laddr"         # RPC listen address flag
+            - "tcp://0.0.0.0:26657" # Listen on all interfaces inside the pod
+          ports:
+            - name: p2p             # Cosmos P2P port — fixed by protocol, never change
+              containerPort: 26656
+              protocol: TCP
+            - name: rpc             # Tendermint RPC — fixed by protocol
+              containerPort: 26657
+              protocol: TCP
+            - name: cosmos-api      # Cosmos REST API — fixed by protocol
+              containerPort: 1317
+              protocol: TCP
+            - name: grpc            # gRPC API — fixed by protocol
+              containerPort: 9090
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "250m"           # Guaranteed CPU — start minimal, scale up if needed
+              memory: "1Gi"         # Guaranteed memory
+            limits:
+              cpu: "2"              # Max CPU burst allowed
+              memory: "4Gi"         # Max memory — increase with --mem-lim if chain requires more
+          readinessProbe:           # Pod receives traffic only when this passes
+            tcpSocket:
+              port: 26656           # P2P port — confirms daemon is up and listening
+            initialDelaySeconds: 30 # Allow time for chain to start and load state
+            periodSeconds: 15       # Check every 15 seconds
+            failureThreshold: 3     # Mark not-ready after 3 consecutive failures
+          livenessProbe:            # Pod is restarted if this fails continuously
+            tcpSocket:
+              port: 26656           # Same port as readiness — restart if P2P goes silent
+            initialDelaySeconds: 60 # Give more time before first liveness check
+            periodSeconds: 30       # Check every 30 seconds
+            failureThreshold: 5     # Restart after 5 consecutive failures
+          volumeMounts:
+            - name: chain-data      # Must match volume name in volumes section below
+              mountPath: /chain-home  # Matches --home flag in args and original compose bind mount
+      volumes:
+        - name: chain-data          # Volume backed by the PVC in 02-node_cronospos_pvc.yaml
+          persistentVolumeClaim:
+            claimName: node-cronospos-data  # Must match PVC name in 02-node_cronospos_pvc.yaml
+
+
+

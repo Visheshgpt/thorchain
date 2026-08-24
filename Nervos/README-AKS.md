@@ -227,7 +227,95 @@ curl -s -X POST http://127.0.0.1:8114 -H 'Content-Type: application/json' \
   -d '{"id":1,"jsonrpc":"2.0","method":"local_node_info","params":[]}'
 ```
 
-### 2d. Either way, apply the config fix now
+### 2d. Other ways to confirm it
+
+Everything so far infers the rule from symptoms. These read the cause
+directly, and are what to reach for if anyone pushes back.
+
+**1. Find the NSG and route table on the actual subnet.** Note the subnet is
+`10.202.17.192/27` — a BYO VNet, so the NSG is very likely NOT in the AKS
+node resource group. Chasing the node RG first is the usual wasted hour:
+
+```powershell
+$SUBNET = az aks show -g azrg-cus-coinia-aks-dev -n cuscoiniadevaks `
+  --query "agentPoolProfiles[0].vnetSubnetId" -o tsv
+az network vnet subnet show --ids $SUBNET `
+  --query "{nsg:networkSecurityGroup.id, routeTable:routeTable.id}" -o json
+```
+
+- **`routeTable` is set** → look at it next. A `0.0.0.0/0` route to a
+  `VirtualAppliance` means all egress is forced through an Azure Firewall or
+  NVA, and the deny lives there, not in the NSG.
+- **`nsg` is set** → dump its rules and grep for the port:
+
+```powershell
+az network nsg rule list --ids <the nsg id> --include-default -o table
+```
+
+**2. Network Watcher IP flow verify — this names the exact rule.** The single
+best piece of evidence you can hand the network team: Azure itself tells you
+allow/deny *and* which rule decided.
+
+```powershell
+$NODE_RG = az aks show -g azrg-cus-coinia-aks-dev -n cuscoiniadevaks --query nodeResourceGroup -o tsv
+az vmss list -g $NODE_RG --query "[].name" -o tsv
+az vmss nic list -g $NODE_RG --vmss-name <vmss-name> `
+  --query "[0].{nic:name,ip:ipConfigurations[0].privateIPAddress}" -o json
+
+az network watcher test-ip-flow `
+  --resource-group $NODE_RG `
+  --vm <vmss-instance-resource-id> `
+  --nic <nic-name> `
+  --direction Outbound --protocol TCP `
+  --local <node-private-ip>:50000 `
+  --remote 16.163.82.218:8114
+```
+
+Run it twice — once with `:8114`, once with `:443`. Same source, same
+destination IP, opposite results, with the deciding rule named for each.
+That is unarguable.
+
+**3. NSG flow logs, if they are on.** A flow log entry showing the DENY for
+`13.86.34.113 -> 16.163.82.218:8114` is the same evidence with a timestamp:
+
+```powershell
+az network watcher flow-log list --location <cluster region> -o table
+```
+
+**4. Rule out the Kubernetes layer entirely.** Everything so far ran inside a
+pod, so a CNI or NetworkPolicy could in principle be responsible. Test from
+the **node's own network namespace** instead — `kubectl debug node/...`
+gives a `hostNetwork` pod:
+
+```powershell
+kubectl debug node/aks-aksnodepool-15306923-vmss00000p -it --image=alpine:3.19 -- sh
+# then, inside:
+nc -z -w 8 16.163.82.218 8114 ; echo "8114 -> $?"
+nc -z -w 8 16.163.82.218 443  ; echo "443  -> $?"
+```
+
+- Both behave as they did in the pod → the block is **outside** Kubernetes.
+  NSG or firewall. Nothing in this repo can fix it.
+- 8114 **works** from the node but not from a pod → the block is in the pod
+  network path (CNI / NetworkPolicy / Cilium), and **we can fix that
+  ourselves**.
+
+Gatekeeper may refuse a `hostNetwork` debug pod on this cluster. If it does,
+that refusal is not a result — say so rather than reading it as a pass.
+
+**5. Drop vs reject is already answered.** Worth knowing you do not need
+another test for this: every 8114 probe took the **full 8s timeout**, while
+every open port answered in 0–1s. A silent drop is a firewall/NSG *deny*
+rule. A `REJECT` would have returned an RST instantly. So the timing data
+already tells you it is a deny rule, not a closed port and not a routing
+blackhole.
+
+**6. Ground truth — just run it.** Apply the section 2c workaround and read
+`get_peers`. A node that connects to peers over 8115 while every 8114 dial
+times out in the log is the finding restated by the actual application, which
+is the only evidence that really matters in the end.
+
+### 2e. Either way, apply the config fix now
 
 Section 3 onward stands on its own. The unmounted `ckb.toml` was a genuine,
 separate defect — the node cannot sync with it regardless of the firewall.

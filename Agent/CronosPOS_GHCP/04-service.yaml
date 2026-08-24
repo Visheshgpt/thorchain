@@ -1,0 +1,107 @@
+# =============================================================================
+# 04-node_cronospos_service.yaml — THREE services for CronosPOS
+#
+# Service 1: node-cronospos        — Headless ClusterIP (required by StatefulSet)
+# Service 2: node-cronospos-lb     — Internal LB for P2P (port 26656)
+# Service 3: node-cronospos-rpc-lb — Internal LB for all API/RPC ports
+#
+# IP SHARING NOTE:
+#   CronosPOS P2P is fixed at 26656 (Cosmos SDK protocol).
+#   This port CANNOT be shared with any other Cosmos SDK chain on the same IP.
+#   IP sharing is only valid when the other node uses completely different ports
+#   (e.g. Bitcoin 8333, Litecoin 9333). Use --p2p-lb-ip only in that case.
+# =============================================================================
+---
+# --- Service 1: Headless ClusterIP -------------------------------------------
+# Required by StatefulSet for stable pod DNS.
+# Pod DNS: node-cronospos-0.node-cronospos.cronospos.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-cronospos              # Headless service — must match StatefulSet.spec.serviceName
+  namespace: cronospos              # Must match namespace in 00-node_cronospos_namespace.yaml
+  labels:
+    blockchain: cronospos
+    node: node_cronospos
+    managed-by: manifest-generator
+spec:
+  clusterIP: None                   # Headless — no virtual IP; DNS resolves directly to pod IP
+  selector:
+    node: node_cronospos            # Routes to pods with this label
+  ports:
+    - name: p2p                     # Cosmos P2P — protocol-fixed port
+      port: 26656
+      targetPort: 26656
+      protocol: TCP
+    - name: rpc                     # Tendermint RPC — protocol-fixed port
+      port: 26657
+      targetPort: 26657
+      protocol: TCP
+    - name: cosmos-api              # Cosmos REST API — protocol-fixed port
+      port: 1317
+      targetPort: 1317
+      protocol: TCP
+    - name: grpc                    # gRPC API — protocol-fixed port
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+---
+# --- Service 2: Internal LoadBalancer — P2P ----------------------------------
+# Exposes the Cosmos P2P port (26656) via Azure Internal Load Balancer.
+# External P2P access requires a port enable request via DevOps/firewall team
+# — do NOT remove the internal annotation without approval.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-cronospos-lb           # Primary LB service name
+  namespace: cronospos
+  labels:
+    blockchain: cronospos
+    node: node_cronospos
+    managed-by: manifest-generator
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # Private VNet IP only — MUST NOT be removed
+spec:
+  type: LoadBalancer                # Azure provisions an Internal LB with a private VNet IP
+  selector:
+    node: node_cronospos
+  ports:
+    - name: p2p                     # Cosmos P2P — fixed by protocol at 26656, never change
+      port: 26656                   # LB listener port (external:internal from compose = 26656:26656)
+      targetPort: 26656             # Container port
+      protocol: TCP
+---
+# --- Service 3: Internal LoadBalancer — RPC / API ----------------------------
+# Exposes all API and RPC ports via Azure Internal Load Balancer.
+# These ports must NEVER be exposed publicly — VNet access only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-cronospos-rpc-lb       # RPC/API LB service name
+  namespace: cronospos
+  labels:
+    blockchain: cronospos
+    node: node_cronospos
+    managed-by: manifest-generator
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # Private VNet IP — required for all API ports
+spec:
+  type: LoadBalancer                # Azure provisions an Internal LB with a private VNet IP
+  selector:
+    node: node_cronospos
+  ports:
+    - name: rpc                     # Tendermint RPC — external:internal from compose = 1332:26657
+      port: 1332                    # LB listener port (as declared in compose)
+      targetPort: 26657             # Container port — protocol-fixed, never change
+      protocol: TCP
+    - name: cosmos-api              # Cosmos REST API — external:internal from compose = 2332:1317
+      port: 2332                    # LB listener port (as declared in compose)
+      targetPort: 1317              # Container port — protocol-fixed, never change
+      protocol: TCP
+    - name: grpc                    # gRPC API — external:internal from compose = 3332:9090
+      port: 3332                    # LB listener port (as declared in compose)
+      targetPort: 9090              # Container port — protocol-fixed, never change
+      protocol: TCP
+
+
+

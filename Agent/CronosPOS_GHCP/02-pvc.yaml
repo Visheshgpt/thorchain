@@ -1,0 +1,19 @@
+apiVersion: v1                      # Stable core API version for PersistentVolumeClaim resources
+kind: PersistentVolumeClaim
+metadata:
+  name: node-cronospos-data         # PVC name — referenced by StatefulSet volume mount
+  namespace: cronospos              # Must match the namespace in 00-node_cronospos_namespace.yaml
+  labels:
+    blockchain: cronospos           # Identifies the blockchain this PVC belongs to
+    node: node_cronospos            # Node identifier for label selectors
+    managed-by: manifest-generator  # Tracks origin of this resource
+spec:
+  accessModes:
+    - ReadWriteOnce                 # Azure Disk supports only single-node read-write access
+  storageClassName: node-cronospos-storage  # Must match StorageClass in 01-node_cronospos_storageclass.yaml
+  resources:
+    requests:
+      storage: 100Gi               # Initial disk size — pvc-watcher auto-expands up to 500Gi
+
+
+

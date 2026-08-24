@@ -1,0 +1,27 @@
+# ============================================================
+# Kava mainnet FULL NODE on AKS.
+#
+#   chain-id   kava_2222-10
+#   daemon     kava v0.28.2   (live consensus version -- verified)
+#   cosmos-sdk v0.47.15
+#   cometbft   v0.37.18 (kava-labs fork)
+#   evm        evmos/ethermint v0.21.0, EVM chain ID 2222
+#   block time ~5.71s  (~15,100 blocks/day)
+#
+# Kava is a Cosmos SDK chain WITH an EVM co-chain on the same
+# node, so it serves CometBFT RPC (26657) AND Ethereum
+# JSON-RPC (8545) from one process.
+#
+# NO Dockerfile was supplied for this chain -- every value here
+# came from the research ladder in ../agent_v2.md. See README
+# section 2 for the source of each fact.
+#
+# Apply in numeric order. The prefixes ARE the order.
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kava
+  labels:
+    app.kubernetes.io/part-of: kava-fullnode
+    app.kubernetes.io/managed-by: kubectl
