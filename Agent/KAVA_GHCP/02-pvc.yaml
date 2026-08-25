@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 02-node_kava_pvc.yaml
+# PersistentVolumeClaim for KAVA archive node chain data.
+# Maps to the docker-compose volume: /1Disk113/node-kava2/kava/.kava:/kava/.kava
+# Initial size: 100Gi — pvc-watcher will auto-expand up to 500Gi at 80% usage.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+apiVersion: v1                    # Core API — PVC is a v1 resource
+kind: PersistentVolumeClaim
+metadata:
+  name: node-kava-data             # Referenced by StatefulSet volumeMounts in 03-node_kava_statefulset.yaml
+  namespace: kava                  # Must match namespace in 00-node_kava_namespace.yaml
+  labels:
+    blockchain: kava               # Protocol identifier
+    node: node_kava                # Node identifier
+    managed-by: manifest-generator
+spec:
+  accessModes:
+    - ReadWriteOnce                # Azure Disk only supports RWO — one node mounts at a time
+  storageClassName: node-kava-storage  # Must match StorageClass in 01-node_kava_storageclass.yaml
+  resources:
+    requests:
+      storage: 100Gi              # Initial allocation — pvc-watcher auto-expands; override with --storage-size
+
+
+

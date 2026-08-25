@@ -1,0 +1,36 @@
+version: '3.8'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kava Archive Node — docker-compose
+# Source VM  : 10.202.14.113
+# Image      : rocksdb:9.3.3  (custom-built from github.com/Kava-Labs/kava
+#                               using dockerfile-rocksdb, chain-id kava_2222-10)
+# Data path  : /1Disk113/node-kava2/kava/.kava
+# Ports:
+#   26657 — Tendermint RPC  (internal — block/tx queries)
+#   26656 — P2P             (peer discovery and sync)
+#   1317  — Cosmos REST/LCD (balance, tx, staking queries)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  kava-node:
+    image: rocksdb:9.3.3
+    container_name: kava-archive-node
+    restart: unless-stopped
+
+    command: >
+      kava start
+      --pruning nothing
+      --home /kava/.kava
+
+    volumes:
+      - /1Disk113/node-kava2/kava/.kava:/kava/.kava
+
+    ports:
+      - "26657:26657"   # Tendermint RPC
+      - "26656:26656"   # P2P
+      - "1317:1317"     # Cosmos REST / LCD API
+
+
+

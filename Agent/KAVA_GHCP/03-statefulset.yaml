@@ -1,0 +1,88 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 03-node_kava_statefulset.yaml
+# Deploys the KAVA archive node as a Kubernetes StatefulSet.
+# Source VM : 10.202.14.113
+# Image     : rocksdb:9.3.3 (custom-built — must be pushed to ACR before apply)
+# Chain ID  : kava_2222-10
+# Pruning   : nothing (archive node — full history retained)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+apiVersion: apps/v1               # Stable API version for StatefulSet resources
+kind: StatefulSet
+metadata:
+  name: node-kava                  # StatefulSet name — pod will be named node-kava-0
+  namespace: kava                  # Must match namespace in 00-node_kava_namespace.yaml
+  labels:
+    blockchain: kava               # Protocol identifier
+    node: node_kava                # Node identifier used by all services as selector
+    managed-by: manifest-generator
+spec:
+  serviceName: node-kava           # Must match the headless Service name in 04-node_kava_service.yaml
+  replicas: 1                      # Single replica — blockchain archive nodes do not horizontally scale
+  selector:
+    matchLabels:
+      node: node_kava              # Must match pod template labels below
+  template:
+    metadata:
+      labels:
+        blockchain: kava           # Protocol identifier on the pod
+        node: node_kava            # Used by all three Services as the selector
+    spec:
+      securityContext:
+        runAsNonRoot: false        # No user: field in compose — kava daemon may require root
+        fsGroup: 1000              # Ensures mounted PVC at /kava/.kava is writable by container user
+      terminationGracePeriodSeconds: 60  # Allow kava daemon to flush state before SIGKILL
+      containers:
+        - name: kava-node          # Container name — matches docker-compose service name
+          # TODO: Replace with your ACR image path before applying, e.g.:
+          #   <your-acr>.azurecr.io/kava/rocksdb:9.3.3
+          # This is a custom-built image (github.com/Kava-Labs/kava, dockerfile-rocksdb)
+          # and will NOT be found on Docker Hub.
+          image: rocksdb:9.3.3     # Custom RocksDB-enabled KAVA build — chain-id kava_2222-10
+          args:                    # Parsed from docker-compose command: field
+            - "kava"               # Binary name
+            - "start"              # Subcommand — starts the full node
+            - "--pruning"          # Pruning strategy flag
+            - "nothing"            # Archive mode — retains full chain history
+            - "--home"             # Data directory flag
+            - "/kava/.kava"        # Mapped to PVC mount path below
+          ports:
+            - name: rpc            # Tendermint RPC — block/tx queries; fixed by protocol
+              containerPort: 26657
+              protocol: TCP
+            - name: p2p            # Cosmos P2P — peer discovery and chain sync; fixed by protocol
+              containerPort: 26656
+              protocol: TCP
+            - name: rest           # Cosmos REST/LCD — balance, tx, staking queries; fixed by protocol
+              containerPort: 1317
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "250m"          # Guaranteed CPU — start minimal, scale up if chain sync lags
+              memory: "1Gi"        # Guaranteed memory — archive nodes may need more; monitor closely
+            limits:
+              cpu: "2"             # Max CPU burst — increase with --cpu-lim if sync is slow
+              memory: "4Gi"        # Max memory — archive nodes can spike; increase with --mem-lim
+          readinessProbe:          # Pod receives traffic only when P2P port is listening
+            tcpSocket:
+              port: 26656          # P2P port — confirms daemon is up and connected to peers
+            initialDelaySeconds: 30  # Allow time for kava to start and load chain state
+            periodSeconds: 15      # Check every 15 seconds
+            failureThreshold: 3    # Mark not-ready after 3 consecutive failures
+          livenessProbe:           # Pod is restarted if P2P goes silent for too long
+            tcpSocket:
+              port: 26656          # Same port as readiness — restart if P2P drops
+            initialDelaySeconds: 60  # Give more time before first liveness check (archive load is slow)
+            periodSeconds: 30      # Check every 30 seconds
+            failureThreshold: 5    # Restart after 5 consecutive failures
+          volumeMounts:
+            - name: kava-data      # Must match volume name in volumes section below
+              mountPath: /kava/.kava  # Matches --home flag in args and original compose bind mount
+      volumes:
+        - name: kava-data          # Volume backed by the PVC in 02-node_kava_pvc.yaml
+          persistentVolumeClaim:
+            claimName: node-kava-data  # Must match PVC name in 02-node_kava_pvc.yaml
+
+
+

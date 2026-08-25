@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 01-node_kava_storageclass.yaml
+# Defines the Azure Disk StorageClass for the KAVA archive node.
+# Uses StandardSSD_LRS — consistent with all other nodes in this cluster.
+# reclaimPolicy: Retain — KAVA archive data is irreplaceable; NEVER use Delete.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+apiVersion: storage.k8s.io/v1     # StorageClass API group — not v1 core
+kind: StorageClass
+metadata:
+  name: node-kava-storage          # Referenced by PVC in 02-node_kava_pvc.yaml
+  labels:
+    blockchain: kava               # Protocol identifier
+    node: node_kava                # Node identifier
+    managed-by: manifest-generator
+provisioner: disk.csi.azure.com   # Azure Disk CSI driver — verified provisioner for AKS
+parameters:
+  skuName: StandardSSD_LRS        # Standard SSD — default SKU for this cluster; override with --storage-sku
+reclaimPolicy: Retain             # CRITICAL: Retain prevents accidental data loss on PVC deletion
+volumeBindingMode: WaitForFirstConsumer  # Disk provisioned in same AZ as the scheduled pod
+allowVolumeExpansion: true        # Required for pvc-watcher auto-expansion to work
+
+
+

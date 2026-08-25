@@ -1,0 +1,19 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 00-node_kava_namespace.yaml
+# Creates the dedicated Kubernetes namespace for the KAVA archive node.
+# APPLY FIRST — all other resources depend on this namespace existing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+apiVersion: v1                    # Stable core API — Namespace is a v1 resource
+kind: Namespace
+metadata:
+  name: kava                      # Namespace name — matches --namespace flag and node label
+  labels:
+    blockchain: kava               # Protocol identifier — used for kubectl label selectors
+    node: node_kava                # Node identifier — consistent across all KAVA manifests
+    environment: non-prod          # Deployment stage — update to 'prod' when promoted
+    managed-by: manifest-generator # Tracks that this resource was generated, not hand-crafted
+
+
+

@@ -1,0 +1,120 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 04-node_kava_service.yaml
+# THREE services for the KAVA archive node (3 port mappings detected).
+#
+#   Service 1 — node-kava          (Headless ClusterIP: None)
+#               Required by StatefulSet for stable pod DNS.
+#               DNS: node-kava-0.node-kava.kava.svc.cluster.local
+#
+#   Service 2 — node-kava-lb       (Internal LoadBalancer — P2P port 26656)
+#               Private VNet IP only — peer sync traffic stays internal.
+#               External P2P access requires a port enable request via the
+#               DevOps/firewall team — DO NOT remove the internal annotation
+#               without approval.
+#
+#   Service 3 — node-kava-rpc-lb   (Internal LoadBalancer — RPC 26657 + REST 1317)
+#               Private VNet IP only — API access restricted to VNet.
+#               MUST NOT be exposed to the public internet.
+#
+# CRITICAL: Both LB services carry azure-load-balancer-internal: "true".
+#           Removing this annotation will assign a public IP — never do this
+#           without a DevOps security review and approved port enable request.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+---
+# ── Service 1: Headless ───────────────────────────────────────────────────────
+# Required by the StatefulSet spec.serviceName field.
+# Gives each pod a stable DNS entry — used for intra-cluster communication.
+# clusterIP: None means no virtual IP is allocated — DNS resolves directly to pod IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-kava                  # Must match StatefulSet spec.serviceName in 03-node_kava_statefulset.yaml
+  namespace: kava                  # Must match namespace in 00-node_kava_namespace.yaml
+  labels:
+    blockchain: kava
+    node: node_kava
+    service-type: headless         # Tag to distinguish from LB services
+    managed-by: manifest-generator
+spec:
+  clusterIP: None                  # Headless — no virtual IP; DNS resolves to pod IP directly
+  selector:
+    node: node_kava                # Routes to pods with this label (set in StatefulSet pod template)
+  ports:
+    - name: rpc                    # Tendermint RPC
+      port: 26657
+      targetPort: 26657
+      protocol: TCP
+    - name: p2p                    # Cosmos P2P
+      port: 26656
+      targetPort: 26656
+      protocol: TCP
+    - name: rest                   # Cosmos REST/LCD
+      port: 1317
+      targetPort: 1317
+      protocol: TCP
+
+
+---
+# ── Service 2: P2P Internal LoadBalancer ──────────────────────────────────────
+# Exposes KAVA P2P port 26656 on a private Azure VNet IP.
+# Peer discovery and chain sync happen over this service.
+# External P2P access requires a port enable request via DevOps/firewall team —
+# DO NOT remove the internal annotation without approval.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-kava-lb               # P2P LoadBalancer service name
+  namespace: kava
+  labels:
+    blockchain: kava
+    node: node_kava
+    service-type: p2p-lb           # Tag to distinguish from RPC LB
+    managed-by: manifest-generator
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # MUST be present — assigns private VNet IP only
+spec:
+  type: LoadBalancer               # Triggers Azure to provision an Internal Load Balancer
+  selector:
+    node: node_kava                # Routes to the KAVA pod
+  ports:
+    - name: p2p                    # Cosmos P2P — fixed by KAVA/Cosmos protocol, never change
+      port: 26656
+      targetPort: 26656
+      protocol: TCP
+
+
+---
+# ── Service 3: RPC + REST Internal LoadBalancer ───────────────────────────────
+# Exposes Tendermint RPC (26657) and Cosmos REST/LCD (1317) on a private VNet IP.
+# Used by internal consumers: block explorers, indexers, monitoring tools.
+# MUST remain internal — these ports expose full chain query capabilities.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-kava-rpc-lb           # RPC + REST LoadBalancer service name
+  namespace: kava
+  labels:
+    blockchain: kava
+    node: node_kava
+    service-type: rpc-lb           # Tag to distinguish from P2P LB
+    managed-by: manifest-generator
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # MUST be present — RPC must NEVER be public
+spec:
+  type: LoadBalancer               # Triggers Azure to provision an Internal Load Balancer
+  selector:
+    node: node_kava                # Routes to the KAVA pod
+  ports:
+    - name: rpc                    # Tendermint RPC — block/tx queries; fixed by protocol
+      port: 26657
+      targetPort: 26657
+      protocol: TCP
+    - name: rest                   # Cosmos REST/LCD — balance, staking, tx queries; fixed by protocol
+      port: 1317
+      targetPort: 1317
+      protocol: TCP
+
+
+
