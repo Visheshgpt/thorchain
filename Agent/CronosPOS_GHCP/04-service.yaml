@@ -26,6 +26,15 @@ metadata:
     managed-by: manifest-generator
 spec:
   clusterIP: None                   # Headless — no virtual IP; DNS resolves directly to pod IP
+  publishNotReadyAddresses: true    # LOGIC FIX — REQUIRED now that readiness reflects real sync state.
+                                    # The old probe was tcpSocket on 26656, which passed seconds after
+                                    # start, so the pod was "Ready" almost immediately and DNS always
+                                    # resolved. Readiness is now CometBFT /health, which stays FALSE for
+                                    # the hours the node spends catching up. Without this flag the pod
+                                    # has no DNS record for that whole window, so
+                                    # node-cronospos-0.node-cronospos.cronospos.svc.cluster.local does
+                                    # not resolve and the StatefulSet loses its stable identity while
+                                    # syncing.
   selector:
     node: node_cronospos            # Routes to pods with this label
   ports:
@@ -50,6 +59,27 @@ spec:
 # Exposes the Cosmos P2P port (26656) via Azure Internal Load Balancer.
 # External P2P access requires a port enable request via DevOps/firewall team
 # — do NOT remove the internal annotation without approval.
+#
+# REVIEW NOTE — this Service currently buys nothing, and costs a VNet IP.
+#   An INTERNAL LB hands out an RFC1918 address. CronosPOS peers live on the
+#   public internet and cannot dial an RFC1918 address, so no inbound peering
+#   can ever arrive here. A full node needs only OUTBOUND p2p, which already
+#   works from the pod IP via the cluster's egress path with no Service at all.
+#   The node syncs fine without this.
+#
+#   It is left in place because it is not harmful to correctness, and because
+#   the DevOps port-enable request referenced above may be pending. Two things
+#   to know while it exists:
+#     - it consumes one private VNet address; if the AKS subnet is short of
+#       addresses, EXTERNAL-IP stays <pending> and a SyncLoadBalancerFailed
+#       event fires every few minutes;
+#     - inbound p2p is ALL-OR-NOTHING. Making it work needs a PUBLIC IP *and*
+#       external_address set to that public IP in config.toml. The configure
+#       init container deliberately leaves external_address EMPTY. Do both or
+#       neither — advertising an address peers cannot reach gets the node
+#       deprioritised and dropped, which is worse than advertising nothing.
+#
+#   Delete this whole Service if the port-enable request is not going ahead.
 apiVersion: v1
 kind: Service
 metadata:
@@ -74,6 +104,15 @@ spec:
 # --- Service 3: Internal LoadBalancer — RPC / API ----------------------------
 # Exposes all API and RPC ports via Azure Internal Load Balancer.
 # These ports must NEVER be exposed publicly — VNet access only.
+#
+# REVIEW NOTE — the non-standard frontend ports below are CORRECT, keep them.
+#   Using 1332/2332/3332 as LB listener ports (rather than 26657/1317/9090)
+#   is what makes this node's port set DISJOINT from every other Cosmos chain,
+#   which is the precondition for sharing one LB IP. Several Services may share
+#   a single frontend IP only if their port sets do not overlap; every Cosmos
+#   chain defaults to 26657/1317/9090, so chains left on standard ports collide
+#   and the Service sticks in SyncLoadBalancerFailed.
+#   targetPort stays the real container port, so the node itself is untouched.
 apiVersion: v1
 kind: Service
 metadata:
