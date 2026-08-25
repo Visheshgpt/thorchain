@@ -26,15 +26,24 @@ metadata:
     managed-by: manifest-generator
 spec:
   clusterIP: None                   # Headless — no virtual IP; DNS resolves directly to pod IP
-  publishNotReadyAddresses: true    # LOGIC FIX — REQUIRED now that readiness reflects real sync state.
-                                    # The old probe was tcpSocket on 26656, which passed seconds after
-                                    # start, so the pod was "Ready" almost immediately and DNS always
-                                    # resolved. Readiness is now CometBFT /health, which stays FALSE for
-                                    # the hours the node spends catching up. Without this flag the pod
-                                    # has no DNS record for that whole window, so
+  publishNotReadyAddresses: true    # LOGIC FIX — the pod is NOT Ready for the whole startup window,
+                                    # and needs stable DNS throughout it.
+                                    #
+                                    # Readiness is now gated behind a startupProbe that allows up to
+                                    # 30 min for the store to open after an 8.7 GB snapshot restore.
+                                    # Kubernetes holds readiness FALSE until a startupProbe succeeds,
+                                    # so for that window the pod has no DNS record and
                                     # node-cronospos-0.node-cronospos.cronospos.svc.cluster.local does
-                                    # not resolve and the StatefulSet loses its stable identity while
-                                    # syncing.
+                                    # not resolve — the StatefulSet loses its stable identity exactly
+                                    # when you most want to reach it. This flag fixes that.
+                                    #
+                                    # NOTE on what /health means: CometBFT's Health handler returns an
+                                    # empty 200 unconditionally and does NOT inspect sync state (see
+                                    # rpc/core/health.go). So once the startupProbe clears, the pod
+                                    # reports Ready even while it is still catching up.
+                                    # READY IS NOT SYNCED — judge sync from
+                                    # /status .sync_info.catching_up and the height gap, never from
+                                    # the pod's Ready column.
   selector:
     node: node_cronospos            # Routes to pods with this label
   ports:

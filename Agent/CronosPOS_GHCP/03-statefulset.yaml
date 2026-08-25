@@ -314,6 +314,24 @@ spec:
               CHAIN_ID="crypto-org-chain-mainnet-1"
 
               # Seeds from the cosmos chain-registry, DNS-verified.
+              # PERSISTENT PEERS -- the fix for blocksync stalling.
+              #
+              # `seeds` alone is NOT enough. A CometBFT seed answers one PEX
+              # request and then hangs up on purpose
+              # (p2p/pex/pex_reactor.go: "If we're a seed and this is an
+              # inbound peer, respond once and disconnect"). So every seed
+              # connection is disposable, the node is left holding only
+              # whatever pex happens to find, and blocksync drains those few
+              # peers and then STALLS with the height frozen.
+              #
+              # persistent_peers are re-dialed with backoff and kept. These 12
+              # were harvested live from a healthy mainnet node's /net_info and
+              # are real full nodes on crypto-org-chain-mainnet-1, not seeds.
+              #
+              # Refresh them if peer count stays low -- they do churn. Pull a
+              # fresh set from any public RPC:  <rpc>/net_info
+              PPEERS="e1b058e5cfa2b836ddaa496b10911da62dcf182e@134.65.192.82:26656,85a70ac9044defc738a85f83467d7e667b5bc01d@85.215.118.205:26656,b4e79e8709b70e84a1b3e81532a9cf326edd375a@135.181.73.232:26656,aea1366a38fc1b2977fee9c6c454dc4071ce10f2@57.128.144.246:26656,04a3ed259383bf38928155c28cb66ef5d2d21336@185.209.230.101:26656,efb083f235037cb419b2c9d1712655e45ca72c68@18.140.15.207:26656,dd8e1086a3cd7170de4121dc19159902cfc5fdf0@176.9.34.178:26656,ecda1766f32b09f84d6bc8af86083065da62db71@168.119.15.27:26656,b24a56a5c6d7a38fefcd59ea59578a7036ed7b32@65.21.232.114:26656,b3141dcb1ffbab78dfb519721d138e5c78d40ab3@99.2.62.129:26656,64c1fa57ad79487da039a022ac43ff97f4624c13@159.69.118.2:26656,fc5025c2a4ce862feed1ce62413b89c16e69febb@147.135.115.51:26656"
+
               SEEDS="87c3adb7d8f649c51eebe0d3335d8f9e28c362f2@seed-0.crypto.org:26656,e1d7ff02b78044795371beb1cd5fb803f9389256@seed-1.crypto.org:26656,2c55809558a4e491e9995962e10c026eb9014655@seed-2.crypto.org:26656,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656,ade4d8bc8cbe014af6ebdf3cb7b1e9ad36f412c0@seeds.polkachu.com:20256"
 
               if [ ! -f "$CFG/config.toml" ]; then
@@ -343,6 +361,7 @@ spec:
               # "laddr", so match the port to stay unambiguous.
               sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CFG/config.toml"
               sed -i "s|^seeds = .*|seeds = \"$SEEDS\"|"                                 "$CFG/config.toml"
+              sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"           "$CFG/config.toml"
               sed -i 's|^max_num_outbound_peers = .*|max_num_outbound_peers = 20|'        "$CFG/config.toml"
               sed -i 's|^max_num_inbound_peers = .*|max_num_inbound_peers = 10|'          "$CFG/config.toml"
 
@@ -364,7 +383,7 @@ spec:
               set_sec "$CFG/app.toml" state-sync snapshot-interval 0
 
               echo "[configure] ---- config.toml ----"
-              grep -E '^(laddr|seeds|external_address|max_num_(out|in)bound_peers) ' "$CFG/config.toml" || true
+              grep -E '^(laddr|seeds|persistent_peers|external_address|max_num_(out|in)bound_peers) ' "$CFG/config.toml" || true
               echo "[configure] ---- app.toml ----"
               grep -E '^(minimum-gas-prices|pruning)' "$CFG/app.toml" || true
               echo "[configure] DONE"
