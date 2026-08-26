@@ -1,25 +1,55 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# 03-node_kava_statefulset.yaml
-# Deploys the KAVA archive node as a Kubernetes StatefulSet.
-# Source VM : 10.202.14.113
-# Image     : rocksdb:9.3.3 (custom-built — must be pushed to ACR before apply)
-# Chain ID  : kava_2222-10
-# Pruning   : nothing (archive node — full history retained)
+# 03-node_kava_statefulset.yaml — KAVA mainnet full node
+#
+# Source VM : 10.202.14.113   Chain ID : kava_2222-10
+#
+# THREE DECISIONS THAT DIFFER FROM THE COMPOSE FILE. Read these before editing.
+#
+#  1. IMAGE: rocksdb:9.3.3  ->  kava/kava:v0.28.2-goleveldb
+#     rocksdb:9.3.3 is a LOCAL BUILD TAG (built on the VM from the Kava repo's
+#     dockerfile-rocksdb). It exists on no registry, so the pod can never pull
+#     it. The official image is public and version-matched to the live network.
+#
+#  2. DB BACKEND: rocksdb  ->  goleveldb.  NOT a preference -- it is forced:
+#       * kava/kava publishes NO rocksdb tag for v0.28.1 or v0.28.2.
+#         Only v0.28.0-rocksdb exists, and v0.28.0 is two releases behind.
+#       * The Polkachu snapshot restored below is goleveldb.
+#     A goleveldb binary CANNOT open a RocksDB store, or vice versa.
+#     >> MIGRATION CONSEQUENCE: the prod VM's chain data is RocksDB, so it
+#        CANNOT be disk-snapshotted onto this node. Moving prod data later
+#        means either building a rocksdb image yourself, or re-syncing. <<
+#
+#  3. PRUNING: nothing (archive)  ->  custom (pruned).
+#     Kava's own docs require, for an ARCHIVE node:
+#         "at least 128GB of dedicated memory (256GB is optimal)"
+#         disk "around 6TB uncompressed, ideally 12TB", +100 GB/month
+#     This pod has a 4-16Gi memory ceiling and a 100Gi PVC. Archive is not
+#     merely tight here, it is impossible. This is a PRUNED node.
+#     Archive needs its own node pool and its own disk design -- separate task.
+#
+# VERIFIED AGAINST THE LIVE NETWORK (not assumed):
+#   chain-id   kava_2222-10        app  kava 0.28.2
+#   cosmos-sdk v0.47.15            evm  evmos/ethermint v0.21.0
+#   cometbft   v0.37.18 (kava fork)
+#   block time ~5.71s (~15,100/day)
+#
+# Init flow, each step idempotent:
+#   restore-snapshot (root)  Polkachu pruned snapshot, streamed into the PVC
+#   configure        (1000)  kava init -> genesis -> config.toml / app.toml
+#   kava-node        (1000)  kava start
 # ─────────────────────────────────────────────────────────────────────────────
-
-
 apiVersion: apps/v1               # Stable API version for StatefulSet resources
 kind: StatefulSet
 metadata:
   name: node-kava                  # StatefulSet name — pod will be named node-kava-0
-  namespace: kava                  # Must match namespace in 00-node_kava_namespace.yaml
+  namespace: kava                  # Must match namespace in 00-namespace.yaml
   labels:
     blockchain: kava               # Protocol identifier
     node: node_kava                # Node identifier used by all services as selector
     managed-by: manifest-generator
 spec:
-  serviceName: node-kava           # Must match the headless Service name in 04-node_kava_service.yaml
-  replicas: 1                      # Single replica — blockchain archive nodes do not horizontally scale
+  serviceName: node-kava           # Must match the headless Service name in 04-service.yaml
+  replicas: 1                      # Single replica — blockchain nodes do not horizontally scale
   selector:
     matchLabels:
       node: node_kava              # Must match pod template labels below
@@ -29,24 +59,310 @@ spec:
         blockchain: kava           # Protocol identifier on the pod
         node: node_kava            # Used by all three Services as the selector
     spec:
+      enableServiceLinks: false    # k8s <SVC>_PORT env vars have collided with cosmos/viper lookups
       securityContext:
-        runAsNonRoot: false        # No user: field in compose — kava daemon may require root
+        runAsNonRoot: false        # Kept — the snapshot init container needs root to apk add lz4
         fsGroup: 1000              # Ensures mounted PVC at /kava/.kava is writable by container user
-      terminationGracePeriodSeconds: 60  # Allow kava daemon to flush state before SIGKILL
+        fsGroupChangePolicy: OnRootMismatch  # Default re-chowns the whole tree on EVERY start
+      terminationGracePeriodSeconds: 600  # Was 60. kava must flush its store; SIGKILL mid-write
+                                          # corrupts it and costs a 35 GiB re-restore.
+
+      initContainers:
+
+        # --- 1. Snapshot restore -------------------------------------------
+        # The ONLY root container, and only because the image has no lz4 and
+        # `apk add` needs root. Capabilities are fully dropped, so this root
+        # can neither read, write nor chmod anything it does not own.
+        - name: restore-snapshot
+          image: kava/kava:v0.28.2-goleveldb
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            # FORCE_RESTORE — the ONLY supported way to wipe and re-pull. A
+            # TOKEN, not a boolean: the value is recorded on the volume once
+            # honoured, so leaving it set cannot cause a re-wipe loop.
+            - { name: FORCE_RESTORE,  value: "" }
+            # ADOPT_EXISTING — treat chain data already on the volume as
+            # legitimate and use it as-is. Only ever ADDS the sentinel; never
+            # deletes. This is the switch for a prod-data migration.
+            - { name: ADOPT_EXISTING, value: "false" }
+          resources:               # MUST NOT exceed the main container's requests:
+            requests:              # pod effective request = max(init, sum(app))
+              cpu: "250m"
+              memory: "1Gi"
+            limits:
+              memory: "2Gi"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/kava/.kava
+              SENTINEL="$HOME_DIR/.snapshot-restored"
+              INPROGRESS="$HOME_DIR/.restore-in-progress"
+              TOKENFILE="$HOME_DIR/.force-restore-token"
+              SNAP_PAGE="https://polkachu.com/tendermint_snapshots/kava"
+              SNAP_BASE="https://snapshots.polkachu.com/snapshots/kava"
+
+              mkdir -p "$HOME_DIR"
+
+              # /etc/passwd shim for UID 1000 (some cosmos paths consult os/user)
+              cat > /passwd-vol/passwd <<'PASSWD'
+              root:x:0:0:root:/root:/bin/sh
+              nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
+              kava:x:1000:1000:kava:/kava:/bin/sh
+              PASSWD
+              echo "[restore] passwd shim written"
+
+              # -- forced re-restore, one shot per distinct token -----------
+              FORCE="${FORCE_RESTORE:-}"
+              SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
+              if [ -n "$FORCE" ] && [ "$FORCE" != "$SEEN" ]; then
+                echo "[restore] FORCE_RESTORE token '$FORCE' is new -- wiping and re-pulling"
+                rm -rf "$HOME_DIR/data"
+                rm -f "$SENTINEL"
+                printf '%s' "$FORCE" > "$TOKENFILE"
+              elif [ -n "$FORCE" ]; then
+                echo "[restore] FORCE_RESTORE token '$FORCE' already honoured -- ignoring"
+              fi
+
+              if [ -f "$SENTINEL" ]; then
+                echo "[restore] already restored at height $(cat "$SENTINEL")"
+                exit 0
+              fi
+
+              # DO NOT DELETE DATA WE DID NOT PUT THERE. INPROGRESS tells our
+              # own interrupted attempt apart from someone else's chain dir.
+              if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
+                if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
+                  echo "[restore] ADOPT_EXISTING=true -- adopting the data already on this volume"
+                  echo "adopted" > "$SENTINEL"
+                  rm -f "$INPROGRESS"
+                  exit 0
+                fi
+                if [ -f "$INPROGRESS" ]; then
+                  echo "[restore] partial extract from a previous attempt -- clearing"
+                  rm -rf "$HOME_DIR/data"
+                else
+                  echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
+                  echo "[restore] Refusing to overwrite data this script did not create."
+                  echo "[restore] Good data?  set ADOPT_EXISTING=true"
+                  echo "[restore] Junk data?  set FORCE_RESTORE to any new value"
+                  exit 1
+                fi
+              fi
+
+              echo "[restore] installing lz4"
+              apk add --no-cache lz4 tar >/dev/null
+
+              # Polkachu keeps ONE snapshot and deletes yesterday's, so the
+              # filename changes daily and a hardcoded URL 404s within 24h.
+              echo "[restore] discovering current snapshot"
+              FILE=$(curl -fsSL --retry 5 --max-time 120 "$SNAP_PAGE" \
+                     | grep -oE 'kava_[0-9]+\.tar\.lz4' | head -1)
+              if [ -z "$FILE" ]; then
+                echo "[restore] FATAL: could not discover a snapshot filename."
+                exit 1
+              fi
+              HEIGHT=$(echo "$FILE" | sed -n 's/kava_\([0-9]*\)\.tar\.lz4/\1/p')
+              echo "[restore] selected $FILE (height $HEIGHT, ~35 GiB)"
+
+              touch "$INPROGRESS"
+              ATTEMPT=0
+              while : ; do
+                ATTEMPT=$((ATTEMPT + 1))
+                if [ "$ATTEMPT" -gt 5 ]; then
+                  echo "[restore] FATAL: failed after 5 attempts"
+                  exit 1
+                fi
+                echo "[restore] streaming attempt $ATTEMPT (~20-40 min for 35 GiB)"
+                # Streamed, never staged: the tarball is never written down, so
+                # the PVC needs no download+extract peak.
+                #
+                # --no-same-owner is REQUIRED. The tarball's files carry the
+                # producer's uid; tar as root defaults to --same-owner and
+                # tries to chown each one back. Capabilities are dropped here
+                # so there is no CAP_CHOWN, every chown fails, and GNU tar
+                # treats that as an ERROR and exits 2 -- which would send this
+                # `if` down the failure branch and delete the 35 GiB it just
+                # wrote, five times over.
+                if curl -fL --retry 3 --retry-delay 10 "$SNAP_BASE/$FILE" \
+                     | lz4 -dc - | tar -x --no-same-owner -C "$HOME_DIR" ; then
+                  # POSIX sh has no pipefail, so tar can exit 0 on a truncated
+                  # stream. Verify the stores actually landed.
+                  OK=1
+                  for d in blockstore.db state.db application.db; do
+                    if [ ! -d "$HOME_DIR/data/$d" ]; then
+                      echo "[restore] missing data/$d after extract"
+                      OK=0
+                    fi
+                  done
+                  if [ "$OK" = "1" ]; then
+                    echo "[restore] extract verified"
+                    break
+                  fi
+                fi
+                echo "[restore] attempt $ATTEMPT failed -- retrying"
+                rm -rf "$HOME_DIR/data"
+                sleep 15
+              done
+
+              echo "$HEIGHT" > "$SENTINEL"
+              rm -f "$INPROGRESS"
+              # Extracted as root; everything after runs as UID 1000. CAP_CHOWN
+              # is dropped so chown is unavailable, but root can chmod its OWN
+              # files. Inside the restore branch only -- on a restart the
+              # sentinel short-circuits above.
+              echo "[restore] chmod -R a+rwX"
+              chmod -R a+rwX "$HOME_DIR"
+              df -h "$HOME_DIR"
+              echo "[restore] DONE at height $HEIGHT"
+          volumeMounts:
+            - { name: kava-data,  mountPath: /kava/.kava }
+            - { name: passwd-vol, mountPath: /passwd-vol }
+
+        # --- 2. Config init + TOML patch ------------------------------------
+        # Runs as UID 1000, the same identity as the main container. The image
+        # CMD is just ["kava"] -- there is no entrypoint that re-renders config
+        # on boot, so hand-edited TOMLs are safe here; nothing overwrites them.
+        - name: configure
+          image: kava/kava:v0.28.2-goleveldb
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "512Mi"
+            limits:
+              memory: "2Gi"        # genesis.json is 210 MB; parsing it needs headroom
+          env:
+            - { name: HOME,    value: "/kava" }
+            - { name: MONIKER, value: "node-kava" }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/kava/.kava
+              CFG="$HOME_DIR/config"
+              CHAIN_ID="kava_2222-10"
+              GENESIS_URL="https://kava-genesis-files.s3.us-east-1.amazonaws.com/kava_2222-10/genesis.json"
+
+              # Seeds from the cosmos chain-registry.
+              SEEDS="ade4d8bc8cbe014af6ebdf3cb7b1e9ad36f412c0@seeds.polkachu.com:13956,ebc272824924ea1a27ea3183dd0b9ba713494f83@kava-mainnet-seed.autostake.com:26656,7ab4b78fbe5ee9e3777b21464a3162bd4cc17f57@seed-kava-01.stakeflow.io:1206,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656,10ed1e176d874c8bb3c7c065685d2da6a4b86475@seed-kava.ibs.team:16677"
+
+              # PERSISTENT PEERS -- required, not optional.
+              # `seeds` alone is NOT enough. A CometBFT seed answers one PEX
+              # request and then hangs up on purpose (p2p/pex/pex_reactor.go:
+              # "If we're a seed and this is an inbound peer, respond once and
+              # disconnect"). A seeds-only node therefore holds 1-2 peers,
+              # blocksync drains them, and the height FREEZES. persistent_peers
+              # are re-dialed with backoff and kept.
+              # Harvested live from healthy kava_2222-10 nodes' /net_info.
+              # Refresh from any public RPC's /net_info if peer count stays low.
+              PPEERS="508d7ec33c7f3c9c479ca9b845cadbbefee670f7@91.134.37.131:26656,2c45d50fc4f88af9ba6b74ef352329815939b1dc@54.148.216.185:26656,ea5d5f73137d42cdba26aed39a5b868ad4000eb8@65.109.103.190:26466,d4656950f29da40c3bd51398c4f8a8a6a6228da1@54.159.132.131:26656,80198fc0e14e00046e6b1a6dff6715cf0ed23ec0@176.103.222.15:26656,a8ad45ebd2f536cae8a41bf1d50f96ca9726b406@192.145.45.163:36656,b4f8e40f855491d259dc1add76e5330a069e91d3@5.181.187.95:26656,955f2ff649649d37dd88d7ef55ee126c43a91c06@43.133.13.19:26656,24092fcc82b56f1e45c0a5e7d57088d99cd9b4f8@85.195.101.218:26656,b398be3de934573073f75c4075df9829cf7dacc6@142.132.158.9:13956,4242b98136917a6c5af2ef7d754b9056b0f33095@95.217.39.34:13956,9db87b3fe3ad64b4c640014979725e27c98a5ef5@23.92.177.103:50910"
+
+              if [ ! -f "$CFG/config.toml" ]; then
+                echo "[configure] kava init"
+                kava init "$MONIKER" --chain-id "$CHAIN_ID" --home "$HOME_DIR"
+              else
+                echo "[configure] config.toml present -- reconfiguring in place"
+              fi
+
+              # Genesis is ~210 MB. Cached on the PVC; re-fetched only if
+              # missing or implausibly small.
+              GEN="$CFG/genesis.json"
+              SZ=$(stat -c %s "$GEN" 2>/dev/null || echo 0)
+              if [ "$SZ" -gt 200000000 ]; then
+                echo "[configure] genesis present ($SZ bytes) -- skipping"
+              else
+                echo "[configure] downloading genesis (~210 MB)"
+                curl -fsSL --retry 5 --retry-delay 5 --max-time 900 -o "$GEN" "$GENESIS_URL"
+                echo "[configure] genesis $(stat -c %s "$GEN") bytes"
+              fi
+
+              # Section-aware TOML setter. `enable` appears under [api], [grpc],
+              # [grpc-web], [state-sync] AND [json-rpc]; a bare sed hits them all.
+              set_sec() {
+                f="$1"; sec="$2"; key="$3"; val="$4"
+                awk -v sec="[$sec]" -v key="$key" -v val="$val" '
+                  /^\[/ { cur = $1 }
+                  { if (cur == sec && $0 ~ "^"key"[ ]*=") { print key " = " val; next } print }
+                ' "$f" > "$f.tmp"
+                mv "$f.tmp" "$f"
+              }
+
+              # ---- config.toml -------------------------------------------
+              # Bind RPC to all interfaces; default 127.0.0.1 is unreachable
+              # from a Service. [p2p] laddr also ends in "laddr", so match on
+              # the port to stay unambiguous.
+              sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CFG/config.toml"
+              sed -i "s|^seeds = .*|seeds = \"$SEEDS\"|"                                 "$CFG/config.toml"
+              sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"           "$CFG/config.toml"
+              sed -i 's|^max_num_outbound_peers = .*|max_num_outbound_peers = 20|'        "$CFG/config.toml"
+              sed -i 's|^max_num_inbound_peers = .*|max_num_inbound_peers = 10|'          "$CFG/config.toml"
+              # db_backend stays goleveldb, matching the image tag AND the
+              # snapshot. Setting rocksdb here would make the node unable to
+              # open its own store. See the header.
+              sed -i 's|^db_backend = .*|db_backend = "goleveldb"|'                       "$CFG/config.toml"
+
+              # ---- app.toml ----------------------------------------------
+              # minimum-gas-prices carries BOTH denoms — Kava is an Ethermint
+              # chain and needs the EVM denom (akava) alongside ukava. Value
+              # from Kava's own node-configuration FAQ.
+              sed -i 's|^minimum-gas-prices = .*|minimum-gas-prices = "0.001ukava;1000000000akava"|' "$CFG/app.toml"
+              # pruning=custom keep-recent=100 interval=10 — the settings the
+              # Polkachu snapshot was produced with. NOT "nothing" (archive).
+              sed -i 's|^pruning = .*|pruning = "custom"|'                                "$CFG/app.toml"
+              sed -i 's|^pruning-keep-recent = .*|pruning-keep-recent = "100"|'           "$CFG/app.toml"
+              sed -i 's|^pruning-interval = .*|pruning-interval = "10"|'                  "$CFG/app.toml"
+
+              set_sec "$CFG/app.toml" api      enable  true
+              set_sec "$CFG/app.toml" api      address '"tcp://0.0.0.0:1317"'
+              set_sec "$CFG/app.toml" grpc     enable  true
+              set_sec "$CFG/app.toml" grpc     address '"0.0.0.0:9090"'
+              set_sec "$CFG/app.toml" grpc-web enable  false
+              # Do NOT serve state-sync snapshots to other nodes — costs disk
+              # and CPU, and this node is a consumer.
+              set_sec "$CFG/app.toml" state-sync snapshot-interval 0
+              # EVM JSON-RPC left DISABLED, matching the source compose file
+              # (which exposed only 26657/26656/1317). To enable, set this to
+              # true, set address to "0.0.0.0:8545", and add the port to the
+              # container + Services.
+              set_sec "$CFG/app.toml" json-rpc enable false
+
+              echo "[configure] ---- config.toml ----"
+              grep -E '^(laddr|seeds|persistent_peers|external_address|db_backend|max_num_(out|in)bound_peers) ' "$CFG/config.toml" || true
+              echo "[configure] ---- app.toml ----"
+              grep -E '^(minimum-gas-prices|pruning)' "$CFG/app.toml" || true
+              echo "[configure] DONE"
+          volumeMounts:
+            - { name: kava-data,  mountPath: /kava/.kava }
+            - { name: passwd-vol, mountPath: /etc/passwd, subPath: passwd }
+
       containers:
         - name: kava-node          # Container name — matches docker-compose service name
-          # TODO: Replace with your ACR image path before applying, e.g.:
-          #   <your-acr>.azurecr.io/kava/rocksdb:9.3.3
-          # This is a custom-built image (github.com/Kava-Labs/kava, dockerfile-rocksdb)
-          # and will NOT be found on Docker Hub.
-          image: rocksdb:9.3.3     # Custom RocksDB-enabled KAVA build — chain-id kava_2222-10
-          args:                    # Parsed from docker-compose command: field
-            - "kava"               # Binary name
+          image: kava/kava:v0.28.2-goleveldb   # Official public image, version-matched to the live network
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000        # Matches fsGroup 1000 so restored files are writable
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          command: ["kava"]        # Image CMD is ["kava"]; no entrypoint script to preserve
+          args:
             - "start"              # Subcommand — starts the full node
-            - "--pruning"          # Pruning strategy flag
-            - "nothing"            # Archive mode — retains full chain history
             - "--home"             # Data directory flag
             - "/kava/.kava"        # Mapped to PVC mount path below
+            # --pruning is deliberately NOT passed. It is set in app.toml as
+            # "custom" with keep-recent/interval, which a bare flag cannot
+            # express. Passing --pruning here would override that.
+          env:
+            - { name: HOME, value: "/kava" }
           ports:
             - name: rpc            # Tendermint RPC — block/tx queries; fixed by protocol
               containerPort: 26657
@@ -57,32 +373,73 @@ spec:
             - name: rest           # Cosmos REST/LCD — balance, tx, staking queries; fixed by protocol
               containerPort: 1317
               protocol: TCP
+            - name: grpc           # gRPC — enabled in app.toml above
+              containerPort: 9090
+              protocol: TCP
+          # SIZING -- read this before trusting it.
+          #
+          # Kava's own docs state a DEFAULT-PRUNING node wants "at least 64GB
+          # of dedicated memory". This pod is nowhere near that, because a
+          # Standard_D4ads_v5 node has ~11 GiB usable in total.
+          #
+          # 4Gi request / 10Gi limit is the most that fits on the current node
+          # pool. It may well be enough for a pruned node at Kava's tx volume,
+          # but it is BELOW upstream guidance and OOMKill is a live risk during
+          # catch-up. Watch for OOMKilled restarts.
+          #
+          # If it OOMs there is no manifest-side fix -- it needs a bigger node.
+          # Standard_E8ads_v5 (8 vCPU / 64 GiB) is the SKU that matches the doc.
+          #
+          # NO CPU LIMIT, on purpose. CFS throttling on a CometBFT node delays
+          # block execution past consensus timeouts and is the classic cause of
+          # a node that "runs but falls behind".
           resources:
             requests:
-              cpu: "250m"          # Guaranteed CPU — start minimal, scale up if chain sync lags
-              memory: "1Gi"        # Guaranteed memory — archive nodes may need more; monitor closely
+              cpu: "1"
+              memory: "4Gi"
             limits:
-              cpu: "2"             # Max CPU burst — increase with --cpu-lim if sync is slow
-              memory: "4Gi"        # Max memory — archive nodes can spike; increase with --mem-lim
-          readinessProbe:          # Pod receives traffic only when P2P port is listening
-            tcpSocket:
-              port: 26656          # P2P port — confirms daemon is up and connected to peers
-            initialDelaySeconds: 30  # Allow time for kava to start and load chain state
-            periodSeconds: 15      # Check every 15 seconds
-            failureThreshold: 3    # Mark not-ready after 3 consecutive failures
-          livenessProbe:           # Pod is restarted if P2P goes silent for too long
-            tcpSocket:
-              port: 26656          # Same port as readiness — restart if P2P drops
-            initialDelaySeconds: 60  # Give more time before first liveness check (archive load is slow)
-            periodSeconds: 30      # Check every 30 seconds
-            failureThreshold: 5    # Restart after 5 consecutive failures
+              memory: "10Gi"
+          # All three probes hit CometBFT's own endpoints. A tcpSocket check on
+          # 26656 (the previous config) reports healthy through a total freeze,
+          # because the P2P listener never closes.
+          startupProbe:
+            httpGet: { path: /health, port: rpc }
+            periodSeconds: 15
+            failureThreshold: 160  # up to 40 min: opening a 35 GiB store + a 210 MB genesis
+          readinessProbe:
+            httpGet: { path: /health, port: rpc }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          # HEIGHT-PROGRESS liveness. Restarting a node that is merely BEHIND
+          # does not help, but a STALLED node has nothing else to recover it.
+          # Fires only after the height fails to move across three consecutive
+          # 10-minute checks. At ~5.7s blocks a syncing node does >100/min, so
+          # a false positive is not plausible.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  H=$(curl -s --max-time 10 http://localhost:26657/status \
+                      | sed -n 's/.*"latest_block_height": *"\([0-9]*\)".*/\1/p')
+                  P=$(cat /tmp/last_height 2>/dev/null || echo 0)
+                  echo "$H" > /tmp/last_height
+                  [ -n "$H" ] && [ "$H" -gt "$P" ]
+            initialDelaySeconds: 2400
+            periodSeconds: 600
+            timeoutSeconds: 20
+            failureThreshold: 3
           volumeMounts:
             - name: kava-data      # Must match volume name in volumes section below
               mountPath: /kava/.kava  # Matches --home flag in args and original compose bind mount
+            - name: passwd-vol
+              mountPath: /etc/passwd
+              subPath: passwd
       volumes:
-        - name: kava-data          # Volume backed by the PVC in 02-node_kava_pvc.yaml
+        - name: kava-data          # Volume backed by the PVC in 02-pvc.yaml
           persistentVolumeClaim:
-            claimName: node-kava-data  # Must match PVC name in 02-node_kava_pvc.yaml
-
-
-
+            claimName: node-kava-data  # Must match PVC name in 02-pvc.yaml
+        - name: passwd-vol         # /etc/passwd shim for UID 1000
+          emptyDir: {}

@@ -39,6 +39,17 @@ metadata:
     managed-by: manifest-generator
 spec:
   clusterIP: None                  # Headless — no virtual IP; DNS resolves to pod IP directly
+  publishNotReadyAddresses: true   # REQUIRED. Readiness is now gated behind a startupProbe that
+                                   # allows up to 40 min for a 35 GiB store + 210 MB genesis to
+                                   # open. Kubernetes holds readiness FALSE until a startupProbe
+                                   # succeeds, so without this the pod has NO DNS record for that
+                                   # whole window and node-kava-0.node-kava.kava.svc.cluster.local
+                                   # does not resolve — the StatefulSet loses its stable identity
+                                   # exactly when you most need to reach it.
+                                   #
+                                   # NOTE: /health returns an empty 200 unconditionally and never
+                                   # inspects sync state. READY IS NOT SYNCED — judge sync from
+                                   # /status .sync_info.catching_up, never from the Ready column.
   selector:
     node: node_kava                # Routes to pods with this label (set in StatefulSet pod template)
   ports:
@@ -54,10 +65,35 @@ spec:
       port: 1317
       targetPort: 1317
       protocol: TCP
+    - name: grpc                   # gRPC — enabled in app.toml by the configure init container
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
 
 
 ---
 # ── Service 2: P2P Internal LoadBalancer ──────────────────────────────────────
+#
+# REVIEW NOTE — this Service buys nothing today, and costs a VNet IP.
+#   An INTERNAL LB hands out an RFC1918 address. Kava peers live on the public
+#   internet and cannot dial an RFC1918 address, so no inbound peering can ever
+#   arrive here. A full node needs only OUTBOUND p2p, which already works from
+#   the pod IP via the cluster's egress path with no Service at all.
+#
+#   Inbound p2p is ALL-OR-NOTHING: it needs a PUBLIC IP *and* external_address
+#   set to that public IP in config.toml. The configure init container
+#   deliberately leaves external_address EMPTY. Do both or neither —
+#   advertising an address peers cannot reach gets the node deprioritised and
+#   dropped, which is worse than advertising nothing.
+#
+#   Delete this Service unless a public-IP peering change is actually planned.
+#
+# PORT-COLLISION WARNING for Service 3 below: its frontend ports are the
+#   standard 26657/1317/9090. Several Services may share one LB frontend IP
+#   only if their port sets are DISJOINT — so this node CANNOT share an IP with
+#   any other Cosmos chain left on standard ports. Either give it its own IP
+#   (the default), or remap the frontend `port` values per chain as CronosPOS
+#   does (1332/2332/3332) while leaving targetPort alone.
 # Exposes KAVA P2P port 26656 on a private Azure VNet IP.
 # Peer discovery and chain sync happen over this service.
 # External P2P access requires a port enable request via DevOps/firewall team —
@@ -114,6 +150,10 @@ spec:
     - name: rest                   # Cosmos REST/LCD — balance, staking, tx queries; fixed by protocol
       port: 1317
       targetPort: 1317
+      protocol: TCP
+    - name: grpc                   # gRPC — enabled in app.toml by the configure init container
+      port: 9090
+      targetPort: 9090
       protocol: TCP
 
 
