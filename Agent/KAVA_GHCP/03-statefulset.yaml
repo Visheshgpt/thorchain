@@ -376,29 +376,39 @@ spec:
             - name: grpc           # gRPC — enabled in app.toml above
               containerPort: 9090
               protocol: TCP
-          # SIZING -- read this before trusting it.
+          # SIZING -- derived from the ACTUAL node pool, measured 2026-08-26.
           #
-          # Kava's own docs state a DEFAULT-PRUNING node wants "at least 64GB
-          # of dedicated memory". This pod is nowhere near that, because a
-          # Standard_D4ads_v5 node has ~11 GiB usable in total.
+          #   Node pool          Standard_D8s_v6  (8 vCPU / 32 GiB)
+          #   Allocatable        7820m CPU / 29.0 GiB   (after AKS reservations)
+          #   Non-kava pods use  ~2.7 GiB actual on this node
+          #   => ~26 GiB is genuinely available to this pod
           #
-          # 4Gi request / 10Gi limit is the most that fits on the current node
-          # pool. It may well be enough for a pruned node at Kava's tx volume,
-          # but it is BELOW upstream guidance and OOMKill is a live risk during
-          # catch-up. Watch for OOMKilled restarts.
+          # A 10Gi limit was the previous value and it was NOT enough: the node
+          # reached 9.0 GiB (90%) while still OPENING its store, before syncing
+          # had begun. 20Gi leaves the load peak real headroom and still keeps
+          # ~6 GiB clear on the node for everything else.
           #
-          # If it OOMs there is no manifest-side fix -- it needs a bigger node.
-          # Standard_E8ads_v5 (8 vCPU / 64 GiB) is the SKU that matches the doc.
+          # Kava's docs ask for 64 GB on a default-pruning node. That figure is
+          # aimed at production validators under load; this is a pruned full
+          # node and 20Gi is a reasonable working budget. If it still OOMKills,
+          # the next honest step is a memory-optimised pool (Standard_E8s_v6,
+          # 8 vCPU / 64 GiB) rather than squeezing this one further.
+          #
+          # WATCH: node limits are already overcommitted (95% before this
+          # change). Overcommit is normal and only bites if everything peaks at
+          # once -- but if the pod is ever rescheduled onto a busier node, check
+          # `kubectl top nodes` before assuming 20Gi is still safe there.
           #
           # NO CPU LIMIT, on purpose. CFS throttling on a CometBFT node delays
           # block execution past consensus timeouts and is the classic cause of
-          # a node that "runs but falls behind".
+          # a node that "runs but falls behind". The request is raised to 2
+          # because the measured load phase used ~2.6 CPU.
           resources:
             requests:
-              cpu: "1"
-              memory: "4Gi"
+              cpu: "2"
+              memory: "8Gi"
             limits:
-              memory: "10Gi"
+              memory: "20Gi"
           # All three probes hit CometBFT's own endpoints. A tcpSocket check on
           # 26656 (the previous config) reports healthy through a total freeze,
           # because the P2P listener never closes.
