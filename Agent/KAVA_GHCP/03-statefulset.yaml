@@ -402,10 +402,24 @@ spec:
           # All three probes hit CometBFT's own endpoints. A tcpSocket check on
           # 26656 (the previous config) reports healthy through a total freeze,
           # because the P2P listener never closes.
+          # STARTUP PROBE -- deliberately very generous. MEASURED: a 40-minute
+          # window (160 x 15s) was NOT enough. The node was killed mid-load
+          # with "failed startup probe / connection refused (x161 over 43m)"
+          # and then restart-looped, throwing away 40 min of work each cycle.
+          #
+          # Opening a 43 GB goleveldb store on StandardSSD_LRS -- flat ~500
+          # IOPS regardless of disk size -- plus reading and hashing a 210 MB
+          # genesis.json is I/O-bound and slow. CronosPOS opens a 12 GB store,
+          # which is why 40 min sufficed there and does not here.
+          #
+          # 360 x 30s = 3 HOURS. A startup probe that is too generous costs
+          # nothing (the pod simply stays not-Ready, and liveness/readiness
+          # stay disabled until it passes). One that is too small is fatal:
+          # the node can never finish starting. Err long.
           startupProbe:
             httpGet: { path: /health, port: rpc }
-            periodSeconds: 15
-            failureThreshold: 160  # up to 40 min: opening a 35 GiB store + a 210 MB genesis
+            periodSeconds: 30
+            failureThreshold: 360
           readinessProbe:
             httpGet: { path: /health, port: rpc }
             periodSeconds: 30
