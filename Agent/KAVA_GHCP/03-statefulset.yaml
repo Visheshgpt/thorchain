@@ -88,11 +88,23 @@ spec:
         # RESET_FOR_STATESYNC. The token is recorded on the volume once
         # honoured, so a crashloop cannot re-wipe. To force another reset,
         # change the value.
+        # Runs as UID 1000, NOT root. It installs nothing, so it never needed
+        # root -- that was inherited from the old snapshot-restore container,
+        # which needed `apk add lz4`.
+        #
+        # Running it as root actively BREAKS it: root here has ALL capabilities
+        # dropped, so no CAP_DAC_OVERRIDE and no CAP_FOWNER. State sync writes
+        # its store as UID 1000 (application.db/ and friends are 1000-owned),
+        # and a capability-dropped root cannot descend into those directories
+        # to delete them. `rm -rf` fails, `set -e` exits, Init:CrashLoopBackOff.
+        #
+        # As UID 1000 it owns everything it needs to remove, and /kava/.kava is
+        # group-writable via fsGroup: 1000, so it can unlink and recreate data/.
         - name: prepare-statesync
           image: kava/kava:v0.28.2-goleveldb
           securityContext:
-            runAsUser: 0
-            runAsGroup: 0
+            runAsUser: 1000
+            runAsGroup: 1000
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
           env:
@@ -143,7 +155,34 @@ spec:
               echo "[prepare] reset token '$TOKEN' is new -- clearing data/ for state sync"
               echo "[prepare] state sync REQUIRES an empty data dir; CometBFT skips it otherwise"
               du -sh "$HOME_DIR/data" 2>/dev/null || true
-              rm -rf "$HOME_DIR/data"
+
+              # Clear data/ WITHOUT depending on who owns what inside it.
+              #
+              # Deleting a file needs write+execute on its PARENT DIRECTORY,
+              # not ownership of the file. Those directories have been created
+              # by different UIDs across attempts (root during snapshot
+              # restore, 1000 during state sync), so a plain `rm -rf` has
+              # failed with "Permission denied" more than once here.
+              #
+              # RENAMING data/ only needs write on $HOME_DIR itself, which is
+              # group-writable via fsGroup: 1000 and therefore always works for
+              # every container in this pod. So: try rm, and if anything
+              # survives, move it aside instead. Either way state sync gets the
+              # empty data/ it requires.
+              rm -rf "$HOME_DIR/data" 2>/dev/null || true
+              if [ -d "$HOME_DIR/data" ]; then
+                STAMP=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-8 || echo old)
+                echo "[prepare] rm was blocked -- moving data/ aside as data.discard.$STAMP"
+                mv "$HOME_DIR/data" "$HOME_DIR/data.discard.$STAMP"
+              fi
+              # Best-effort reclaim of anything moved aside on a previous run.
+              # Non-fatal: whatever cannot be removed is retried next boot.
+              for d in "$HOME_DIR"/data.discard.*; do
+                if [ -d "$d" ]; then
+                  echo "[prepare] reclaiming $d"
+                  rm -rf "$d" 2>/dev/null || echo "[prepare] could not fully remove $d -- disk still held"
+                fi
+              done
               mkdir -p "$HOME_DIR/data"
               # priv_validator_state.json must exist or the node refuses to start.
               echo '{"height":"0","round":0,"step":0}' > "$HOME_DIR/data/priv_validator_state.json"
@@ -156,9 +195,9 @@ spec:
               # CAP_FOWNER -- so it cannot chmod a file it does not own. A
               # recursive chmod over $HOME_DIR fails there and, under `set -e`,
               # kills the script. That is an Init:Error crashloop.
-              chmod -R a+rwX "$HOME_DIR/data"
+              chmod -R a+rwX "$HOME_DIR/data" || true   # we own it now; never fatal
               printf '%s' "$TOKEN" > "$TOKENFILE"
-              chmod a+rw "$TOKENFILE"
+              chmod a+rw "$TOKENFILE" || true
               df -h "$HOME_DIR"
               echo "[prepare] DONE -- volume ready for state sync"
           volumeMounts:
