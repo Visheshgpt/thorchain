@@ -109,7 +109,7 @@ spec:
             capabilities: { drop: ["ALL"] }
           env:
             # Changing this value wipes data/ once and lets state sync run again.
-            - { name: RESET_FOR_STATESYNC, value: "statesync-2" }
+            - { name: RESET_FOR_STATESYNC, value: "statesync-3" }
             # ADOPT_EXISTING=true -> never wipe, use whatever is on the volume.
             # This is the switch for a prod-data migration.
             - { name: ADOPT_EXISTING,      value: "false" }
@@ -341,6 +341,26 @@ spec:
               set_sec "$CFG/config.toml" statesync trust_hash   "\"$TRUST_HASH\""
               set_sec "$CFG/config.toml" statesync trust_period '"168h0m0s"'
 
+              # CHUNK TIMEOUTS -- raised from the CometBFT defaults.
+              #
+              # Two state-sync attempts died at exactly the SAME place: every
+              # chunk applied except the LAST one (fetched, never delivered),
+              # after which CometBFT abandoned the snapshot and fell back to a
+              # 10-million-block-older one. Twice at the final chunk is not
+              # peer flakiness.
+              #
+              # chunk_request_timeout defaults to 10s (config.go:918). If the
+              # single peer serving that snapshot is slow on the last chunk,
+              # 10s is not enough and the whole snapshot is discarded. 60s
+              # costs nothing when chunks arrive quickly.
+              #
+              # discovery_time defaults to 15s (config.go:917). Raising it to
+              # 30s lets the node find MORE snapshot providers before it
+              # commits to one, so a stalled chunk can be re-requested
+              # elsewhere instead of killing the attempt.
+              set_sec "$CFG/config.toml" statesync chunk_request_timeout '"60s"'
+              set_sec "$CFG/config.toml" statesync discovery_time        '"30s"'
+
               # ---- app.toml ----------------------------------------------
               # minimum-gas-prices carries BOTH denoms — Kava is an Ethermint
               # chain and needs the EVM denom (akava) alongside ukava. Value
@@ -369,7 +389,7 @@ spec:
               echo "[configure] ---- config.toml ----"
               grep -E '^(laddr|seeds|persistent_peers|external_address|db_backend|max_num_(out|in)bound_peers) ' "$CFG/config.toml" || true
               echo "[configure] ---- statesync ----"
-              awk '/^\[statesync\]/{f=1} f&&/^(enable|rpc_servers|trust_height|trust_hash|trust_period) /{print} /^\[/&&!/statesync/{if(f&&++n>0)exit}' "$CFG/config.toml" || true
+              awk '/^\[statesync\]/{f=1} f&&/^(enable|rpc_servers|trust_height|trust_hash|trust_period|chunk_request_timeout|discovery_time) /{print} /^\[/&&!/statesync/{if(f&&++n>0)exit}' "$CFG/config.toml" || true
               echo "[configure] ---- app.toml ----"
               grep -E '^(minimum-gas-prices|pruning)' "$CFG/app.toml" || true
               echo "[configure] DONE"
