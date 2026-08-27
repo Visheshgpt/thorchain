@@ -97,7 +97,7 @@ spec:
             capabilities: { drop: ["ALL"] }
           env:
             # Changing this value wipes data/ once and lets state sync run again.
-            - { name: RESET_FOR_STATESYNC, value: "switch-to-statesync-1" }
+            - { name: RESET_FOR_STATESYNC, value: "statesync-2" }
             # ADOPT_EXISTING=true -> never wipe, use whatever is on the volume.
             # This is the switch for a prod-data migration.
             - { name: ADOPT_EXISTING,      value: "false" }
@@ -197,16 +197,28 @@ spec:
               # Seeds from the cosmos chain-registry.
               SEEDS="ade4d8bc8cbe014af6ebdf3cb7b1e9ad36f412c0@seeds.polkachu.com:13956,ebc272824924ea1a27ea3183dd0b9ba713494f83@kava-mainnet-seed.autostake.com:26656,7ab4b78fbe5ee9e3777b21464a3162bd4cc17f57@seed-kava-01.stakeflow.io:1206,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656,10ed1e176d874c8bb3c7c065685d2da6a4b86475@seed-kava.ibs.team:16677"
 
-              # PERSISTENT PEERS -- required, not optional.
-              # `seeds` alone is NOT enough. A CometBFT seed answers one PEX
-              # request and then hangs up on purpose (p2p/pex/pex_reactor.go:
-              # "If we're a seed and this is an inbound peer, respond once and
-              # disconnect"). A seeds-only node therefore holds 1-2 peers,
-              # blocksync drains them, and the height FREEZES. persistent_peers
-              # are re-dialed with backoff and kept.
-              # Harvested live from healthy kava_2222-10 nodes' /net_info.
-              # Refresh from any public RPC's /net_info if peer count stays low.
-              PPEERS="508d7ec33c7f3c9c479ca9b845cadbbefee670f7@91.134.37.131:26656,2c45d50fc4f88af9ba6b74ef352329815939b1dc@54.148.216.185:26656,ea5d5f73137d42cdba26aed39a5b868ad4000eb8@65.109.103.190:26466,d4656950f29da40c3bd51398c4f8a8a6a6228da1@54.159.132.131:26656,80198fc0e14e00046e6b1a6dff6715cf0ed23ec0@176.103.222.15:26656,a8ad45ebd2f536cae8a41bf1d50f96ca9726b406@192.145.45.163:36656,b4f8e40f855491d259dc1add76e5330a069e91d3@5.181.187.95:26656,955f2ff649649d37dd88d7ef55ee126c43a91c06@43.133.13.19:26656,24092fcc82b56f1e45c0a5e7d57088d99cd9b4f8@85.195.101.218:26656,b398be3de934573073f75c4075df9829cf7dacc6@142.132.158.9:13956,4242b98136917a6c5af2ef7d754b9056b0f33095@95.217.39.34:13956,9db87b3fe3ad64b4c640014979725e27c98a5ef5@23.92.177.103:50910"
+              # PERSISTENT PEERS -- required, and REACHABILITY-TESTED.
+              #
+              # `seeds` alone is not enough: a CometBFT seed answers one PEX
+              # request then hangs up on purpose (p2p/pex/pex_reactor.go), so a
+              # seeds-only node holds 1-2 peers and stalls.
+              #
+              # But a harvested peer list is not enough either. The first list
+              # here was taken straight from a public /net_info and MOST OF IT
+              # WAS DEAD -- the node ended up with numOutPeers=1 and state sync
+              # died at chunk 230/232 with no fallback peer. Only ~56% of
+              # harvested peers were dialable from this cluster.
+              #
+              # Every entry below was verified reachable FROM THIS POD on
+              # 2026-08-27 with:
+              #   kubectl exec ... -- sh -c 'for i in <ips>; do
+              #     nc -z -w 3 $i 26656 && echo $i OK; done'
+              # and its node ID cross-checked against live /net_info.
+              #
+              # RE-TEST with that same loop before trusting a refreshed list.
+              # Peers churn; a list that is merely harvested is not a list that
+              # works.
+              PPEERS="508d7ec33c7f3c9c479ca9b845cadbbefee670f7@91.134.37.131:26656,8d57aed1934c5466ef07ceaf9b91aa635b76c38f@94.155.47.54:26656,5493de09e7fc23c1fef0fc2075aa15ee1a58f087@77.74.195.236:26656,2198bb3bf989304a90efd2fbe280692597181206@5.180.82.117:26656,80198fc0e14e00046e6b1a6dff6715cf0ed23ec0@176.103.222.15:26656,6d996747eaaef37c0010c1f49c2b1b85391d15c4@169.155.170.153:26656,d34d768d47d9589e08c5d4da308931ed345835e2@80.11.128.70:26656,0d1cd4dc695fd432ef1cb09bdaa276343c390c78@173.231.40.234:26656,a4b1509a84c1beeb4b8eb09fcb3bdcb4db96595f@167.86.78.243:26656"
 
               if [ ! -f "$CFG/config.toml" ]; then
                 echo "[configure] kava init"
