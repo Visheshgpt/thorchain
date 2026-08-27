@@ -440,42 +440,35 @@ spec:
             - name: grpc           # gRPC — enabled in app.toml above
               containerPort: 9090
               protocol: TCP
-          # SIZING -- derived from the ACTUAL node pool, measured 2026-08-26.
+          # SIZING -- MEASURED, and the result is counter-intuitive.
           #
-          #   Node pool          Standard_D8s_v6  (8 vCPU / 32 GiB)
-          #   Allocatable        7820m CPU / 29.0 GiB   (after AKS reservations)
-          #   Non-kava pods use  ~2.7 GiB actual on this node
-          #   => ~26 GiB is genuinely available to this pod
+          #   Node pool     Standard_D8s_v6 (8 vCPU / 32 GiB)
+          #   Allocatable   7820m CPU / 29.0 GiB
+          #   Other pods    ~3 GiB actual on this node
           #
-          # MEASURED, twice, during the initial store open:
-          #   10Gi -> hit 9.0 GiB (90%) and was still loading.  Too small.
-          #   20Gi -> hit 20.2 GiB (98.5%) and was still loading. Too small.
-          # At 98.5% the cgroup is in continuous reclaim, which destroys the
-          # page cache the IAVL read path depends on -- reads collapsed to
-          # ~4.5 MB/s, so the memory ceiling was itself causing the slow load.
-          # 24Gi + ~2.9 GiB for everything else = ~27 GiB of 29 GiB allocatable.
+          # A 24Gi limit made state sync FAIL, repeatably: it applied 230 of
+          # 232 chunks and the final chunk never arrived, three runs in a row,
+          # across three different snapshots and both goleveldb and rocksdb.
+          # Dropping the limit to 10Gi fixed it on the first try.
           #
-          # Kava's docs ask for 64 GB on a default-pruning node. That figure is
-          # aimed at production validators under load; this is a pruned full
-          # node and 20Gi is a reasonable working budget. If it still OOMKills,
-          # the next honest step is a memory-optimised pool (Standard_E8s_v6,
-          # 8 vCPU / 64 GiB) rather than squeezing this one further.
+          # Why lowering it helps: at 24Gi the pod is free to grow its page
+          # cache until the NODE is at ~27 of 29 GiB (93%). Node-level memory
+          # pressure triggers kernel reclaim that is not confined to this
+          # cgroup -- enough to disrupt the p2p read path and lose the last
+          # chunk response. A 10Gi cap makes the cgroup reclaim its OWN cache
+          # early and never pressures the node.
           #
-          # WATCH: node limits are already overcommitted (95% before this
-          # change). Overcommit is normal and only bites if everything peaks at
-          # once -- but if the pod is ever rescheduled onto a busier node, check
-          # `kubectl top nodes` before assuming 20Gi is still safe there.
+          # DO NOT "fix" a slow start by raising this. It was raised twice on
+          # exactly that reasoning and both times made things worse.
           #
           # NO CPU LIMIT, on purpose. CFS throttling on a CometBFT node delays
-          # block execution past consensus timeouts and is the classic cause of
-          # a node that "runs but falls behind". The request is raised to 2
-          # because the measured load phase used ~2.6 CPU.
+          # block execution past consensus timeouts.
           resources:
             requests:
               cpu: "2"
-              memory: "8Gi"
+              memory: "4Gi"
             limits:
-              memory: "24Gi"
+              memory: "10Gi"
           # All three probes hit CometBFT's own endpoints. A tcpSocket check on
           # 26656 (the previous config) reports healthy through a total freeze,
           # because the P2P listener never closes.
