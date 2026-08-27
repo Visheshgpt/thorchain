@@ -5,19 +5,28 @@
 #
 # THREE DECISIONS THAT DIFFER FROM THE COMPOSE FILE. Read these before editing.
 #
-#  1. IMAGE: rocksdb:9.3.3  ->  kava/kava:v0.28.2-goleveldb
+#  1. IMAGE: rocksdb:9.3.3  ->  kava/kava:v0.28.0-rocksdb
 #     rocksdb:9.3.3 is a LOCAL BUILD TAG (built on the VM from the Kava repo's
 #     dockerfile-rocksdb). It exists on no registry, so the pod can never pull
-#     it. The official image is public and version-matched to the live network.
+#     it. kava/kava:v0.28.0-rocksdb is the public equivalent.
 #
-#  2. DB BACKEND: rocksdb  ->  goleveldb.  NOT a preference -- it is forced:
-#       * kava/kava publishes NO rocksdb tag for v0.28.1 or v0.28.2.
-#         Only v0.28.0-rocksdb exists, and v0.28.0 is two releases behind.
-#       * The Polkachu snapshot restored below is goleveldb.
-#     A goleveldb binary CANNOT open a RocksDB store, or vice versa.
-#     >> MIGRATION CONSEQUENCE: the prod VM's chain data is RocksDB, so it
-#        CANNOT be disk-snapshotted onto this node. Moving prod data later
-#        means either building a rocksdb image yourself, or re-syncing. <<
+#     WHY v0.28.0 AND NOT v0.28.2: kava/kava publishes no rocksdb tag for
+#     v0.28.1 or v0.28.2 -- goleveldb only. Being two patch releases behind is
+#     SAFE, verified from the release notes:
+#       v0.28.1  "non-breaking and optional ... not necessary if you do not
+#                 use a ledger"      (a ledger-go dependency bump)
+#       v0.28.2  "Bump cometbft to v0.37.18"
+#     Neither is consensus-breaking, so there is no app-hash halt risk.
+#
+#     BASE IMAGE IS UBUNTU 22.04, not Alpine -- no apk. Nothing here installs
+#     packages, and the runtime stage already ships curl and jq
+#     (Dockerfile-rocksdb), which is all the init scripts need. For ad-hoc
+#     debugging note there is no `nc`; use bash's /dev/tcp instead.
+#
+#  2. DB BACKEND: rocksdb -- MATCHING THE PRODUCTION VM. This is the point.
+#     Prod runs db_backend = "rocksdb", and a goleveldb binary CANNOT open a
+#     RocksDB store. Testing on goleveldb would prove the manifests work while
+#     rehearsing a configuration that could never accept the prod data.
 #
 #  3. PRUNING: nothing (archive)  ->  custom (pruned).
 #     Kava's own docs require, for an ARCHIVE node:
@@ -101,7 +110,7 @@ spec:
         # As UID 1000 it owns everything it needs to remove, and /kava/.kava is
         # group-writable via fsGroup: 1000, so it can unlink and recreate data/.
         - name: prepare-statesync
-          image: kava/kava:v0.28.2-goleveldb
+          image: kava/kava:v0.28.0-rocksdb
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
@@ -109,7 +118,7 @@ spec:
             capabilities: { drop: ["ALL"] }
           env:
             # Changing this value wipes data/ once and lets state sync run again.
-            - { name: RESET_FOR_STATESYNC, value: "statesync-3" }
+            - { name: RESET_FOR_STATESYNC, value: "rocksdb-1" }
             # ADOPT_EXISTING=true -> never wipe, use whatever is on the volume.
             # This is the switch for a prod-data migration.
             - { name: ADOPT_EXISTING,      value: "false" }
@@ -209,7 +218,7 @@ spec:
         # CMD is just ["kava"] -- there is no entrypoint that re-renders config
         # on boot, so hand-edited TOMLs are safe here; nothing overwrites them.
         - name: configure
-          image: kava/kava:v0.28.2-goleveldb
+          image: kava/kava:v0.28.0-rocksdb
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
@@ -298,9 +307,11 @@ spec:
               sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"           "$CFG/config.toml"
               sed -i 's|^max_num_outbound_peers = .*|max_num_outbound_peers = 20|'        "$CFG/config.toml"
               sed -i 's|^max_num_inbound_peers = .*|max_num_inbound_peers = 10|'          "$CFG/config.toml"
-              # db_backend stays goleveldb, matching the image tag. Setting
-              # rocksdb here would make the node unable to open its own store.
-              sed -i 's|^db_backend = .*|db_backend = "goleveldb"|'                       "$CFG/config.toml"
+              # db_backend MUST match the binary. This is the rocksdb build, so
+              # anything else makes the node unable to open its own store.
+              # It also matches the production VM, which is the whole reason
+              # this test runs on rocksdb rather than goleveldb.
+              sed -i 's|^db_backend = .*|db_backend = "rocksdb"|'                         "$CFG/config.toml"
 
               # ---- STATE SYNC ---------------------------------------------
               # Computed fresh at every boot. Harmless once synced: CometBFT
@@ -399,7 +410,7 @@ spec:
 
       containers:
         - name: kava-node          # Container name — matches docker-compose service name
-          image: kava/kava:v0.28.2-goleveldb   # Official public image, version-matched to the live network
+          image: kava/kava:v0.28.0-rocksdb   # Official public image, version-matched to the live network
           imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 1000        # Matches fsGroup 1000 so restored files are writable
