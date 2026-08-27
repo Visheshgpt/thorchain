@@ -69,11 +69,26 @@ spec:
 
       initContainers:
 
-        # --- 1. Snapshot restore -------------------------------------------
-        # The ONLY root container, and only because the image has no lz4 and
-        # `apk add` needs root. Capabilities are fully dropped, so this root
-        # can neither read, write nor chmod anything it does not own.
-        - name: restore-snapshot
+        # --- 1. Prepare volume for STATE SYNC -------------------------------
+        # WHY STATE SYNC AND NOT A SNAPSHOT RESTORE:
+        #   The Polkachu snapshot restores a 44 GB store (32.4 GB
+        #   application.db + 8.4 GB state.db). Opening that store needed more
+        #   memory than this cluster can give: measured at 10Gi -> 90%,
+        #   20Gi -> 98.5%, 24Gi -> still insufficient, each attempt reading
+        #   26+ GB off a flat-500-IOPS disk over ~2 hours before dying.
+        #   Kava's own docs ask for 64 GB on a pruned node and they are right.
+        #
+        #   State sync sidesteps it entirely: the node fetches only CURRENT
+        #   app state from a snapshot-serving peer. No 35 GiB download, no
+        #   44 GB store to open, a far smaller working set, and CometBFT
+        #   starts the RPC listener BEFORE state sync runs -- so the startup
+        #   probe passes in minutes instead of never.
+        #
+        # The wipe below is deliberate and ONE-SHOT, keyed on
+        # RESET_FOR_STATESYNC. The token is recorded on the volume once
+        # honoured, so a crashloop cannot re-wipe. To force another reset,
+        # change the value.
+        - name: prepare-statesync
           image: kava/kava:v0.28.2-goleveldb
           securityContext:
             runAsUser: 0
@@ -81,30 +96,23 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
           env:
-            # FORCE_RESTORE — the ONLY supported way to wipe and re-pull. A
-            # TOKEN, not a boolean: the value is recorded on the volume once
-            # honoured, so leaving it set cannot cause a re-wipe loop.
-            - { name: FORCE_RESTORE,  value: "" }
-            # ADOPT_EXISTING — treat chain data already on the volume as
-            # legitimate and use it as-is. Only ever ADDS the sentinel; never
-            # deletes. This is the switch for a prod-data migration.
-            - { name: ADOPT_EXISTING, value: "false" }
-          resources:               # MUST NOT exceed the main container's requests:
-            requests:              # pod effective request = max(init, sum(app))
-              cpu: "250m"
-              memory: "1Gi"
+            # Changing this value wipes data/ once and lets state sync run again.
+            - { name: RESET_FOR_STATESYNC, value: "switch-to-statesync-1" }
+            # ADOPT_EXISTING=true -> never wipe, use whatever is on the volume.
+            # This is the switch for a prod-data migration.
+            - { name: ADOPT_EXISTING,      value: "false" }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
             limits:
-              memory: "2Gi"
+              memory: "1Gi"
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
               HOME_DIR=/kava/.kava
-              SENTINEL="$HOME_DIR/.snapshot-restored"
-              INPROGRESS="$HOME_DIR/.restore-in-progress"
-              TOKENFILE="$HOME_DIR/.force-restore-token"
-              SNAP_PAGE="https://polkachu.com/tendermint_snapshots/kava"
-              SNAP_BASE="https://snapshots.polkachu.com/snapshots/kava"
+              TOKENFILE="$HOME_DIR/.statesync-reset-token"
 
               mkdir -p "$HOME_DIR"
 
@@ -114,111 +122,38 @@ spec:
               nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
               kava:x:1000:1000:kava:/kava:/bin/sh
               PASSWD
-              echo "[restore] passwd shim written"
+              echo "[prepare] passwd shim written"
 
-              # -- forced re-restore, one shot per distinct token -----------
-              FORCE="${FORCE_RESTORE:-}"
-              SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
-              if [ -n "$FORCE" ] && [ "$FORCE" != "$SEEN" ]; then
-                echo "[restore] FORCE_RESTORE token '$FORCE' is new -- wiping and re-pulling"
-                rm -rf "$HOME_DIR/data"
-                rm -f "$SENTINEL"
-                printf '%s' "$FORCE" > "$TOKENFILE"
-              elif [ -n "$FORCE" ]; then
-                echo "[restore] FORCE_RESTORE token '$FORCE' already honoured -- ignoring"
-              fi
-
-              if [ -f "$SENTINEL" ]; then
-                echo "[restore] already restored at height $(cat "$SENTINEL")"
+              if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
+                echo "[prepare] ADOPT_EXISTING=true -- leaving the volume untouched"
                 exit 0
               fi
 
-              # DO NOT DELETE DATA WE DID NOT PUT THERE. INPROGRESS tells our
-              # own interrupted attempt apart from someone else's chain dir.
-              if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
-                if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
-                  echo "[restore] ADOPT_EXISTING=true -- adopting the data already on this volume"
-                  echo "adopted" > "$SENTINEL"
-                  rm -f "$INPROGRESS"
-                  exit 0
-                fi
-                if [ -f "$INPROGRESS" ]; then
-                  echo "[restore] partial extract from a previous attempt -- clearing"
-                  rm -rf "$HOME_DIR/data"
-                else
-                  echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
-                  echo "[restore] Refusing to overwrite data this script did not create."
-                  echo "[restore] Good data?  set ADOPT_EXISTING=true"
-                  echo "[restore] Junk data?  set FORCE_RESTORE to any new value"
-                  exit 1
-                fi
+              TOKEN="${RESET_FOR_STATESYNC:-}"
+              SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
+              if [ -z "$TOKEN" ]; then
+                echo "[prepare] RESET_FOR_STATESYNC empty -- leaving the volume untouched"
+                exit 0
+              fi
+              if [ "$TOKEN" = "$SEEN" ]; then
+                echo "[prepare] reset token '$TOKEN' already honoured -- nothing to do"
+                exit 0
               fi
 
-              echo "[restore] installing lz4"
-              apk add --no-cache lz4 tar >/dev/null
-
-              # Polkachu keeps ONE snapshot and deletes yesterday's, so the
-              # filename changes daily and a hardcoded URL 404s within 24h.
-              echo "[restore] discovering current snapshot"
-              FILE=$(curl -fsSL --retry 5 --max-time 120 "$SNAP_PAGE" \
-                     | grep -oE 'kava_[0-9]+\.tar\.lz4' | head -1)
-              if [ -z "$FILE" ]; then
-                echo "[restore] FATAL: could not discover a snapshot filename."
-                exit 1
-              fi
-              HEIGHT=$(echo "$FILE" | sed -n 's/kava_\([0-9]*\)\.tar\.lz4/\1/p')
-              echo "[restore] selected $FILE (height $HEIGHT, ~35 GiB)"
-
-              touch "$INPROGRESS"
-              ATTEMPT=0
-              while : ; do
-                ATTEMPT=$((ATTEMPT + 1))
-                if [ "$ATTEMPT" -gt 5 ]; then
-                  echo "[restore] FATAL: failed after 5 attempts"
-                  exit 1
-                fi
-                echo "[restore] streaming attempt $ATTEMPT (~20-40 min for 35 GiB)"
-                # Streamed, never staged: the tarball is never written down, so
-                # the PVC needs no download+extract peak.
-                #
-                # --no-same-owner is REQUIRED. The tarball's files carry the
-                # producer's uid; tar as root defaults to --same-owner and
-                # tries to chown each one back. Capabilities are dropped here
-                # so there is no CAP_CHOWN, every chown fails, and GNU tar
-                # treats that as an ERROR and exits 2 -- which would send this
-                # `if` down the failure branch and delete the 35 GiB it just
-                # wrote, five times over.
-                if curl -fL --retry 3 --retry-delay 10 "$SNAP_BASE/$FILE" \
-                     | lz4 -dc - | tar -x --no-same-owner -C "$HOME_DIR" ; then
-                  # POSIX sh has no pipefail, so tar can exit 0 on a truncated
-                  # stream. Verify the stores actually landed.
-                  OK=1
-                  for d in blockstore.db state.db application.db; do
-                    if [ ! -d "$HOME_DIR/data/$d" ]; then
-                      echo "[restore] missing data/$d after extract"
-                      OK=0
-                    fi
-                  done
-                  if [ "$OK" = "1" ]; then
-                    echo "[restore] extract verified"
-                    break
-                  fi
-                fi
-                echo "[restore] attempt $ATTEMPT failed -- retrying"
-                rm -rf "$HOME_DIR/data"
-                sleep 15
-              done
-
-              echo "$HEIGHT" > "$SENTINEL"
-              rm -f "$INPROGRESS"
-              # Extracted as root; everything after runs as UID 1000. CAP_CHOWN
-              # is dropped so chown is unavailable, but root can chmod its OWN
-              # files. Inside the restore branch only -- on a restart the
-              # sentinel short-circuits above.
-              echo "[restore] chmod -R a+rwX"
+              echo "[prepare] reset token '$TOKEN' is new -- clearing data/ for state sync"
+              echo "[prepare] state sync REQUIRES an empty data dir; CometBFT skips it otherwise"
+              du -sh "$HOME_DIR/data" 2>/dev/null || true
+              rm -rf "$HOME_DIR/data"
+              mkdir -p "$HOME_DIR/data"
+              # priv_validator_state.json must exist or the node refuses to start.
+              echo '{"height":"0","round":0,"step":0}' > "$HOME_DIR/data/priv_validator_state.json"
+              # addrbook from the old attempt is stale; let pex rebuild it.
+              rm -f "$HOME_DIR/config/addrbook.json" 2>/dev/null || true
               chmod -R a+rwX "$HOME_DIR"
+              printf '%s' "$TOKEN" > "$TOKENFILE"
+              chmod a+rw "$TOKENFILE"
               df -h "$HOME_DIR"
-              echo "[restore] DONE at height $HEIGHT"
+              echo "[prepare] DONE -- volume ready for state sync"
           volumeMounts:
             - { name: kava-data,  mountPath: /kava/.kava }
             - { name: passwd-vol, mountPath: /passwd-vol }
@@ -305,10 +240,48 @@ spec:
               sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"           "$CFG/config.toml"
               sed -i 's|^max_num_outbound_peers = .*|max_num_outbound_peers = 20|'        "$CFG/config.toml"
               sed -i 's|^max_num_inbound_peers = .*|max_num_inbound_peers = 10|'          "$CFG/config.toml"
-              # db_backend stays goleveldb, matching the image tag AND the
-              # snapshot. Setting rocksdb here would make the node unable to
-              # open its own store. See the header.
+              # db_backend stays goleveldb, matching the image tag. Setting
+              # rocksdb here would make the node unable to open its own store.
               sed -i 's|^db_backend = .*|db_backend = "goleveldb"|'                       "$CFG/config.toml"
+
+              # ---- STATE SYNC ---------------------------------------------
+              # Computed fresh at every boot. Harmless once synced: CometBFT
+              # detects existing state and skips state sync automatically, so
+              # this does not re-sync on restart.
+              #
+              # rpc_servers needs >= 2 entries for light-client cross-checking;
+              # duplicating one server is the documented, accepted practice and
+              # is what Polkachu's own guide does.
+              #
+              # trust_height is rounded DOWN to a multiple of 2000 because
+              # Polkachu's state-sync node runs snapshot-interval = 2000 --
+              # snapshots only exist at those heights.
+              SNAP_RPC="https://kava-rpc.polkachu.com:443"
+              # jq, NOT sed. A /block response has 2 "height" fields and 6
+              # "hash" fields; a greedy regex silently grabs the wrong one
+              # (verified: sed returned last_commit.height and a completely
+              # wrong hash). A bad trust_hash fails light-client verification
+              # and state sync never starts. The image ships jq -- use it.
+              LATEST=$(curl -fsSL --retry 5 --max-time 60 "$SNAP_RPC/block" \
+                       | jq -r '.result.block.header.height')
+              if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+                echo "[configure] FATAL: could not reach $SNAP_RPC for a trust point"
+                exit 1
+              fi
+              TRUST_HEIGHT=$(( (LATEST - 2000) / 2000 * 2000 ))
+              TRUST_HASH=$(curl -fsSL --retry 5 --max-time 60 "$SNAP_RPC/block?height=$TRUST_HEIGHT" \
+                           | jq -r '.result.block_id.hash')
+              if [ -z "$TRUST_HASH" ] || [ "$TRUST_HASH" = "null" ]; then
+                echo "[configure] FATAL: could not fetch trust hash at $TRUST_HEIGHT"
+                exit 1
+              fi
+              echo "[configure] state sync trust point: height=$TRUST_HEIGHT hash=$TRUST_HASH"
+
+              set_sec "$CFG/config.toml" statesync enable       true
+              set_sec "$CFG/config.toml" statesync rpc_servers  "\"$SNAP_RPC,$SNAP_RPC\""
+              set_sec "$CFG/config.toml" statesync trust_height "$TRUST_HEIGHT"
+              set_sec "$CFG/config.toml" statesync trust_hash   "\"$TRUST_HASH\""
+              set_sec "$CFG/config.toml" statesync trust_period '"168h0m0s"'
 
               # ---- app.toml ----------------------------------------------
               # minimum-gas-prices carries BOTH denoms — Kava is an Ethermint
@@ -337,6 +310,8 @@ spec:
 
               echo "[configure] ---- config.toml ----"
               grep -E '^(laddr|seeds|persistent_peers|external_address|db_backend|max_num_(out|in)bound_peers) ' "$CFG/config.toml" || true
+              echo "[configure] ---- statesync ----"
+              awk '/^\[statesync\]/{f=1} f&&/^(enable|rpc_servers|trust_height|trust_hash|trust_period) /{print} /^\[/&&!/statesync/{if(f&&++n>0)exit}' "$CFG/config.toml" || true
               echo "[configure] ---- app.toml ----"
               grep -E '^(minimum-gas-prices|pruning)' "$CFG/app.toml" || true
               echo "[configure] DONE"
@@ -383,10 +358,13 @@ spec:
           #   Non-kava pods use  ~2.7 GiB actual on this node
           #   => ~26 GiB is genuinely available to this pod
           #
-          # A 10Gi limit was the previous value and it was NOT enough: the node
-          # reached 9.0 GiB (90%) while still OPENING its store, before syncing
-          # had begun. 20Gi leaves the load peak real headroom and still keeps
-          # ~6 GiB clear on the node for everything else.
+          # MEASURED, twice, during the initial store open:
+          #   10Gi -> hit 9.0 GiB (90%) and was still loading.  Too small.
+          #   20Gi -> hit 20.2 GiB (98.5%) and was still loading. Too small.
+          # At 98.5% the cgroup is in continuous reclaim, which destroys the
+          # page cache the IAVL read path depends on -- reads collapsed to
+          # ~4.5 MB/s, so the memory ceiling was itself causing the slow load.
+          # 24Gi + ~2.9 GiB for everything else = ~27 GiB of 29 GiB allocatable.
           #
           # Kava's docs ask for 64 GB on a default-pruning node. That figure is
           # aimed at production validators under load; this is a pruned full
@@ -408,7 +386,7 @@ spec:
               cpu: "2"
               memory: "8Gi"
             limits:
-              memory: "20Gi"
+              memory: "24Gi"
           # All three probes hit CometBFT's own endpoints. A tcpSocket check on
           # 26656 (the previous config) reports healthy through a total freeze,
           # because the P2P listener never closes.
@@ -426,10 +404,14 @@ spec:
           # nothing (the pod simply stays not-Ready, and liveness/readiness
           # stay disabled until it passes). One that is too small is fatal:
           # the node can never finish starting. Err long.
+          # With state sync the RPC listener starts BEFORE the sync runs
+          # (CometBFT node.OnStart calls startRPC() first), so /health answers
+          # within minutes -- the 40-minute silent store-open is gone. 60 min
+          # is still generous: the 210 MB genesis is parsed before RPC starts.
           startupProbe:
             httpGet: { path: /health, port: rpc }
             periodSeconds: 30
-            failureThreshold: 360
+            failureThreshold: 120
           readinessProbe:
             httpGet: { path: /health, port: rpc }
             periodSeconds: 30
@@ -447,7 +429,7 @@ spec:
                 - -c
                 - |
                   H=$(curl -s --max-time 10 http://localhost:26657/status \
-                      | sed -n 's/.*"latest_block_height": *"\([0-9]*\)".*/\1/p')
+                      | jq -r '.result.sync_info.latest_block_height')
                   P=$(cat /tmp/last_height 2>/dev/null || echo 0)
                   echo "$H" > /tmp/last_height
                   [ -n "$H" ] && [ "$H" -gt "$P" ]
