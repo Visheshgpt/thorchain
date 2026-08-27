@@ -149,7 +149,14 @@ spec:
               echo '{"height":"0","round":0,"step":0}' > "$HOME_DIR/data/priv_validator_state.json"
               # addrbook from the old attempt is stale; let pex rebuild it.
               rm -f "$HOME_DIR/config/addrbook.json" 2>/dev/null || true
-              chmod -R a+rwX "$HOME_DIR"
+              # chmod ONLY data/, which this container just created and
+              # therefore owns. NOT -R on $HOME_DIR: config/ holds files
+              # written by the previous `configure` run as UID 1000, and this
+              # container is root with ALL capabilities dropped -- no
+              # CAP_FOWNER -- so it cannot chmod a file it does not own. A
+              # recursive chmod over $HOME_DIR fails there and, under `set -e`,
+              # kills the script. That is an Init:Error crashloop.
+              chmod -R a+rwX "$HOME_DIR/data"
               printf '%s' "$TOKEN" > "$TOKENFILE"
               chmod a+rw "$TOKENFILE"
               df -h "$HOME_DIR"
