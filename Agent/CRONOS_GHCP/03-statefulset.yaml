@@ -95,7 +95,7 @@ spec:
             # FORCE_RESTORE — wipe data and re-pull snapshot.
             # Token-based: set to a new string to trigger once. Leaving it
             # set after it fires is harmless (token is recorded on the PVC).
-            - { name: RESET_DATA,      value: "statesync-1" }
+            - { name: RESET_DATA,      value: "native-snapshot-1" }
             # ADOPT_EXISTING — treat data already on the PVC as legitimate
             # (migrated prod data). Set "true" after copying VM data to PVC.
             - { name: ADOPT_EXISTING, value: "false" }
@@ -110,90 +110,112 @@ spec:
             - |
               set -eu
               HOME_DIR=/data/.cronos
+              SENTINEL="$HOME_DIR/.snapshot-restored"
+              INPROGRESS="$HOME_DIR/.restore-in-progress"
               TOKENFILE="$HOME_DIR/.reset-token"
+              INDEX="https://snapshot.cronos.com/"
+              BASE="https://snapshot-download.cronos.com/cronos/mainnet-snapshot/leveldb/pruned"
               
               # ---------------------------------------------------------------
-              # Cronos EVM has NO public snapshot or state-sync provider.
-              # Polkachu / quicksync / kjnodes all 404 for this chain, so the old
-              # snapshot-download logic here was dead code pointing at a URL that
-              # does not exist. This container now does one job: make sure the
-              # data directory is in a state the node can actually open.
+              # NATIVE SNAPSHOT, not state sync.
+              #
+              # State sync does not work for Cronos EVM from this cluster. The
+              # only reachable light-client RPC (rpc.cronos.com) retains just
+              # ~278k blocks, from 90,850,001. Peers offer snapshots at heights
+              # BELOW that -- 89.96M, 89.95M, 85.2M -- so the light client
+              # cannot fetch snapshot_height+1 to verify the app hash and every
+              # one is rejected with "light block not found". Cronos' own docs
+              # say to use native snapshots when state sync will not take.
+              #
+              # leveldb-pruned matches db_backend=goleveldb + pruning=custom.
+              # Files are dated and retained 14 days, so the name is discovered
+              # from the index at run time -- never hardcode it.
               # ---------------------------------------------------------------
               mkdir -p "$HOME_DIR"
               
               if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
-                echo "[prepare] ADOPT_EXISTING=true -- using the data already on this volume"
+                echo "[restore] ADOPT_EXISTING=true -- using data already on this volume"
                 exit 0
               fi
               
-              # RESET_DATA -- one shot per distinct token. The value is recorded on
-              # the volume once honoured, so a crashloop cannot re-wipe. Change the
-              # value to force another reset.
-              #
-              # WHY THIS EXISTS: a half-written store is not recoverable in place.
-              # Repeated mid-write crashes left data/ corrupt, and RocksDB segfaults
-              # on a truncated store (exit 139, no Go stack trace) rather than
-              # failing cleanly. Switching db_backend on top of it gave
-              # "failed to initialize database: EOF". Both need a clean directory.
               TOKEN="${RESET_DATA:-}"
               SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
-              if [ -z "$TOKEN" ]; then
-                echo "[prepare] RESET_DATA empty -- leaving the volume untouched"
-                exit 0
-              fi
-              if [ "$TOKEN" = "$SEEN" ]; then
-                echo "[prepare] reset token $TOKEN already honoured -- nothing to do"
-                exit 0
-              fi
-              
-              echo "[prepare] reset token $TOKEN is new -- clearing data/"
-              du -sh "$HOME_DIR/data" 2>/dev/null || true
-              
-              # Clear WITHOUT depending on who owns what inside. Deleting a file
-              # needs write+execute on its PARENT directory, not ownership of the
-              # file -- and those dirs were created by different UIDs across runs.
-              # Renaming data/ only needs write on $HOME_DIR, which always works.
-              rm -rf "$HOME_DIR/data" 2>/dev/null || true
-              if [ -d "$HOME_DIR/data" ]; then
-                STAMP=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-8 || echo old)
-                echo "[prepare] rm blocked -- moving data/ aside as data.discard.$STAMP"
-                mv "$HOME_DIR/data" "$HOME_DIR/data.discard.$STAMP"
+              if [ -n "$TOKEN" ] && [ "$TOKEN" != "$SEEN" ]; then
+                echo "[restore] reset token $TOKEN is new -- clearing data/"
+                rm -rf "$HOME_DIR/data" 2>/dev/null || true
+                if [ -d "$HOME_DIR/data" ]; then
+                  STAMP=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-8 || echo old)
+                  mv "$HOME_DIR/data" "$HOME_DIR/data.discard.$STAMP"
+                fi
+                rm -f "$SENTINEL"
+                printf '%s' "$TOKEN" > "$TOKENFILE"
               fi
               for d in "$HOME_DIR"/data.discard.*; do
-                if [ -d "$d" ]; then
-                  echo "[prepare] reclaiming $d"
-                  rm -rf "$d" 2>/dev/null || echo "[prepare] could not fully remove $d"
-                fi
+                [ -d "$d" ] && rm -rf "$d" 2>/dev/null || true
               done
               
-              # A stale genesis.json from a failed init is worse than none: the
-              # configure step re-downloads it when it is missing or too small.
-              rm -f "$HOME_DIR/config/genesis.json" 2>/dev/null || true
-              rm -f "$HOME_DIR/config/addrbook.json" 2>/dev/null || true
+              if [ -f "$SENTINEL" ]; then
+                echo "[restore] already restored from $(cat "$SENTINEL")"
+                exit 0
+              fi
               
-              # `cronosd init` is skipped whenever config.toml already exists, so
-              # wiping data/ leaves priv_validator_state.json missing and the node
-              # exits with:
-              #   open .../data/priv_validator_state.json: no such file or directory
-              # height 0 is the correct value for a fresh node.
-              mkdir -p "$HOME_DIR/data"
-              echo '{"height":"0","round":0,"step":0}' > "$HOME_DIR/data/priv_validator_state.json"
-
-              # printf '%s' -- NOT the '"'"' escaping that was here, which
-              # evaluated to printf "'%s'" and wrote the token wrapped in literal
-              # quotes. $SEEN then never matched $TOKEN and the wipe fired on
-              # EVERY restart, re-syncing from genesis each time.
-              printf '%s' "$TOKEN" > "$TOKENFILE"
+              if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
+                if [ -f "$INPROGRESS" ]; then
+                  echo "[restore] partial extract from a previous attempt -- clearing"
+                  rm -rf "$HOME_DIR/data"
+                else
+                  echo "[restore] FATAL: data/ populated with no sentinel."
+                  echo "[restore] Good data?  ADOPT_EXISTING=true.  Junk?  new RESET_DATA."
+                  exit 1
+                fi
+              fi
+              
+              echo "[restore] installing curl + lz4"
+              apk add --no-cache curl ca-certificates lz4 tar >/dev/null
+              
+              echo "[restore] discovering newest leveldb-pruned snapshot"
+              FILE=$(curl -fsSL --retry 5 --max-time 120 "$INDEX" \
+                     | grep -oE 'cronosmainnet_25-1_leveldb-pruned-[0-9]+\.tar\.lz4' \
+                     | sort -r | head -1)
+              if [ -z "$FILE" ]; then
+                echo "[restore] FATAL: no leveldb-pruned snapshot found at $INDEX"
+                exit 1
+              fi
+              echo "[restore] selected $FILE (~29 GB)"
+              
+              touch "$INPROGRESS"
+              ATTEMPT=0
+              while : ; do
+                ATTEMPT=$((ATTEMPT + 1))
+                if [ "$ATTEMPT" -gt 5 ]; then
+                  echo "[restore] FATAL: failed after 5 attempts"; exit 1
+                fi
+                echo "[restore] streaming attempt $ATTEMPT (~20-40 min)"
+                # Streamed: the 29 GB archive is never written down, so the PVC
+                # needs no download+extract peak.
+                # --no-same-owner: the archive carries the producer's uid and this
+                # container has capabilities dropped, so chown fails and GNU tar
+                # would exit 2 on an otherwise good extract.
+                if curl -fL --retry 3 --retry-delay 10 "$BASE/$FILE" \
+                     | lz4 -dc - | tar -x --no-same-owner -C "$HOME_DIR" ; then
+                  OK=1
+                  for d in blockstore.db state.db application.db; do
+                    if [ ! -d "$HOME_DIR/data/$d" ]; then
+                      echo "[restore] missing data/$d after extract"; OK=0
+                    fi
+                  done
+                  if [ "$OK" = "1" ]; then echo "[restore] extract verified"; break; fi
+                fi
+                echo "[restore] attempt $ATTEMPT failed -- retrying"
+                rm -rf "$HOME_DIR/data"
+                sleep 15
+              done
+              
+              echo "$FILE" > "$SENTINEL"
+              rm -f "$INPROGRESS"
+              chmod -R a+rwX "$HOME_DIR/data" 2>/dev/null || true
               df -h "$HOME_DIR" 2>/dev/null || true
-              echo "[prepare] DONE -- data/ cleared, node will start from genesis"
-          # volumeMounts -- THIS WAS MISSING. Without it this container ran
-          # entirely in its own ephemeral overlay filesystem: the wipe cleared
-          # nothing on the PVC and priv_validator_state.json was written to a
-          # layer that is discarded when the container exits. `df -h` gave it
-          # away by reporting 'overlay' instead of the Azure disk.
-          volumeMounts:
-            - name: cronos-data
-              mountPath: /data
+              echo "[restore] DONE -- restored from $FILE"
 
         - name: install-cronosd
           image: ubuntu:22.04
@@ -368,7 +390,10 @@ spec:
                 sed -i -E 's#^(pruning[[:space:]]*=[[:space:]]*).*$#\1"custom"#'                    "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(pruning-keep-recent[[:space:]]*=[[:space:]]*).*$#\1"100"#'            "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(pruning-interval[[:space:]]*=[[:space:]]*).*$#\1"10"#'                "$CRONOS_HOME/config/app.toml"
-                sed -i -E 's#^(minimum-gas-prices[[:space:]]*=[[:space:]]*).*$#\1"0.025basecro"#'   "$CRONOS_HOME/config/app.toml"
+                # 46000000000000basecro -- the value in Cronos' own node docs.
+                # 0.025basecro (the CronosPOS value) was wrong for Cronos EVM: this is
+                # an EVM chain and basecro is 18-decimal, so 0.025 is effectively zero.
+                sed -i -E 's#^(minimum-gas-prices[[:space:]]*=[[:space:]]*).*$#\1"46000000000000basecro"#'   "$CRONOS_HOME/config/app.toml"
                 # goleveldb, matching db_backend below. See the note there: rocksdb
                 # SEGFAULTS with this release binary.
                 sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"goleveldb"#'          "$CRONOS_HOME/config/app.toml"
@@ -412,6 +437,9 @@ spec:
                 # Same node IDs, but these are the ones Cronos publishes for state sync.
                 PPEERS="0d5cf1394a1cfde28dc8f023567222abc0f47534@seed-0.cronos.com:26656,3032073adc06d710dd512240281637c1bd0c8a7b@seed-1.cronos.com:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@seed-2.cronos.com:26656"
                 sed -i 's|^pex = .*|pex = true|'                                            "$CRONOS_HOME/config/config.toml"
+                # Consensus timing from Cronos' own node docs.
+                sed -i -E 's#^(create_empty_blocks_interval[[:space:]]*=[[:space:]]*).*$#\1"5s"#'  "$CRONOS_HOME/config/config.toml"
+                sed -i -E 's#^(timeout_commit[[:space:]]*=[[:space:]]*).*$#\1"5s"#'                "$CRONOS_HOME/config/config.toml"
                 sed -i "s|^seeds = .*|seeds = \"$SEEDS\"|"                                   "$CRONOS_HOME/config/config.toml"
                 sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"             "$CRONOS_HOME/config/config.toml"
                 # ---- STATE SYNC ---------------------------------------------
@@ -455,7 +483,13 @@ spec:
                   ' "$f" > "$f.tmp"
                   mv "$f.tmp" "$f"
                 }
-                set_sec "$CRONOS_HOME/config/config.toml" statesync enable       true
+                # state sync DISABLED: we restore a native snapshot instead. It was
+                # tried and cannot work here -- the only reachable light-client RPC
+                # retains ~278k blocks and peers only offer snapshots below that, so
+                # every one is rejected with "light block not found". The trust point
+                # is still computed above and left in the config, harmless and handy
+                # if a better RPC appears.
+                set_sec "$CRONOS_HOME/config/config.toml" statesync enable       false
                 set_sec "$CRONOS_HOME/config/config.toml" statesync rpc_servers  "\"$SNAP_RPC,$SNAP_RPC\""
                 set_sec "$CRONOS_HOME/config/config.toml" statesync trust_height "$TRUST_HEIGHT"
                 set_sec "$CRONOS_HOME/config/config.toml" statesync trust_hash   "\"$TRUST_HASH\""
