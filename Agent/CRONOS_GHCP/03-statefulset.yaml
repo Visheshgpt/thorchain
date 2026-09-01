@@ -223,15 +223,33 @@ spec:
               mkdir -p "$BIN_DIR"
 
 
+              echo "[install] apt-get install (mirrors Dockerfile RUN block)"
+              apt-get update -qq
+              apt-get install -y -q --no-install-recommends curl wget jq tar ca-certificates
+              # Stage the CA bundle on the PVC.
+              #
+              # The MAIN container is a bare ubuntu:22.04 with an EMPTY trust store --
+              # the apt-get above installs ca-certificates into THIS container only,
+              # and that filesystem is discarded when the init container exits.
+              # Without this, state sync fails immediately with:
+              #   tls: failed to verify certificate: x509: certificate signed by
+              #   unknown authority
+              # on the very first HTTPS call to the light-client RPC server.
+              # The main container points at this file via SSL_CERT_FILE.
+              mkdir -p /data/certs
+              if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+                cp /etc/ssl/certs/ca-certificates.crt /data/certs/ca-certificates.crt
+                echo "[install] CA bundle staged ($(wc -l < /data/certs/ca-certificates.crt) lines)"
+              else
+                echo "[install] FATAL: no CA bundle in the init image -- TLS will fail"; exit 1
+              fi
+
               if [ -x "$BIN_DIR/cronosd" ]; then
                 echo "[install] cronosd already present -- skipping"
                 exit 0
               fi
 
 
-              echo "[install] apt-get install (mirrors Dockerfile RUN block)"
-              apt-get update -qq
-              apt-get install -y -q --no-install-recommends curl wget jq tar ca-certificates
 
 
               echo "[install] downloading $ASSET (mirrors Dockerfile wget)"
@@ -388,11 +406,11 @@ spec:
                 # prevents fatal exit when address book is empty") had it backwards --
                 # the address book was empty BECAUSE the seeds had been blanked.
                 # Seeds from the cosmos chain-registry for cronosmainnet_25-1.
-                SEEDS="0d5cf1394a1cfde28dc8f023567222abc0f47534@cronos-seed-0.crypto.org:26656,3032073adc06d710dd512240281637c1bd0c8a7b@cronos-seed-1.crypto.org:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@cronos-seed-2.crypto.org:26656,337377dcda43d79c537d2c4d93ad3b698ce9452e@bd-cronos-mainnet-seed-node-01.bdnodes.net:26656,abedfe94dd5731e9750e045ca8d8e40aa6d3c60b@seed.cronos.jerrychong.com:26656,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656"
+                SEEDS="0d5cf1394a1cfde28dc8f023567222abc0f47534@cronos-seed-0.crypto.org:26656,3032073adc06d710dd512240281637c1bd0c8a7b@cronos-seed-1.crypto.org:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@cronos-seed-2.crypto.org:26656,abedfe94dd5731e9750e045ca8d8e40aa6d3c60b@seed.cronos.jerrychong.com:26656,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656"
                 # persistent_peers straight from the official Cronos state-sync doc.
                 # NOTE the hostnames: seed-N.cronos.com, NOT cronos-seed-N.crypto.org.
                 # Same node IDs, but these are the ones Cronos publishes for state sync.
-                PPEERS="0d5cf1394a1cfde28dc8f023567222abc0f47534@seed-0.cronos.com:26656,3032073adc06d710dd512240281637c1bd0c8a7b@seed-1.cronos.com:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@seed-2.cronos.com:26656,337377dcda43d79c537d2c4d93ad3b698ce9452e@bd-cronos-mainnet-seed-node-01.bdnodes.net:26656"
+                PPEERS="0d5cf1394a1cfde28dc8f023567222abc0f47534@seed-0.cronos.com:26656,3032073adc06d710dd512240281637c1bd0c8a7b@seed-1.cronos.com:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@seed-2.cronos.com:26656"
                 sed -i 's|^pex = .*|pex = true|'                                            "$CRONOS_HOME/config/config.toml"
                 sed -i "s|^seeds = .*|seeds = \"$SEEDS\"|"                                   "$CRONOS_HOME/config/config.toml"
                 sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"             "$CRONOS_HOME/config/config.toml"
@@ -449,7 +467,7 @@ spec:
               grep -E '^(pruning|minimum-gas-prices|app-db-backend|query-gas-limit)' "$CRONOS_HOME/config/app.toml" || true
               grep -A2 '^\[json-rpc\]' "$CRONOS_HOME/config/app.toml" | grep enable || true
               echo "[configure] ---- config.toml ----"
-              grep -E '^(db_backend|laddr|pex|seeds|persistent_peers|enable|rpc_servers|trust_height) ' "$CRONOS_HOME/config/config.toml" || true
+              grep -E '^(db_backend|laddr|pex|seeds|persistent_peers|enable|rpc_servers|trust_height|trust_hash|trust_period) ' "$CRONOS_HOME/config/config.toml" || true
               echo "[configure] DONE"
           volumeMounts:
             - name: cronos-data
@@ -483,6 +501,9 @@ spec:
           env:
             - { name: MONIKER,      value: "pegasus-node" }
             - { name: CRONOS_HOME,  value: "/data/.cronos" }
+            # Go's crypto/x509 honours SSL_CERT_FILE. Points at the bundle staged
+            # on the PVC by install-cronosd -- see the note there.
+            - { name: SSL_CERT_FILE,  value: "/data/certs/ca-certificates.crt" }
             - { name: GOTRACEBACK,  value: "crash" }  # Force full CGO goroutine dump on SIGSEGV
           ports:
             - name: p2p
