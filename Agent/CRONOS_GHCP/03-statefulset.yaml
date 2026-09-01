@@ -186,6 +186,15 @@ spec:
               printf '%s' "$TOKEN" > "$TOKENFILE"
               df -h "$HOME_DIR" 2>/dev/null || true
               echo "[prepare] DONE -- data/ cleared, node will start from genesis"
+          # volumeMounts -- THIS WAS MISSING. Without it this container ran
+          # entirely in its own ephemeral overlay filesystem: the wipe cleared
+          # nothing on the PVC and priv_validator_state.json was written to a
+          # layer that is discarded when the container exits. `df -h` gave it
+          # away by reporting 'overlay' instead of the Azure disk.
+          volumeMounts:
+            - name: cronos-data
+              mountPath: /data
+
         - name: install-cronosd
           image: ubuntu:22.04
           securityContext:
