@@ -1,0 +1,157 @@
+# =============================================================================
+# 04-node_cronos_service.yaml — THREE services for Cronos EVM
+#
+# Service 1: node-cronos        — Headless ClusterIP (required by StatefulSet)
+# Service 2: node-cronos-lb     — Internal LB for P2P (port 5332 → 26656)
+# Service 3: node-cronos-rpc-lb — Internal LB for all API/RPC ports
+#
+# LB LISTENER PORT STRATEGY (same pattern as node_cronospos):
+#   LB listener ports = compose host ports — not the container ports.
+#   This ensures this node's port set is DISJOINT from other Cosmos/EVM
+#   chains and allows safe IP sharing on a shared ILB if needed.
+#
+#   compose host → LB listener → container (targetPort)
+#   5332          → 5332        → 26656   P2P
+#   2332          → 2332        → 26657   CometBFT RPC
+#   4332          → 4332        → 1317    Cosmos REST API
+#   8555          → 8555        → 8545    EVM JSON-RPC HTTP
+#   9090          → 9090        → 9090    Cosmos gRPC (not in compose — standard port)
+#   8546          → 8546        → 8546    EVM JSON-RPC WebSocket (not in compose)
+#
+# IP SHARING NOTE:
+#   Cronos EVM P2P is fixed at 26656. Using LB listener 5332 means this node
+#   can share an ILB IP with another Cosmos chain only if that chain also does
+#   NOT use listener port 5332.
+#
+# FIREWALL:
+#   External P2P access requires a port enable request via DevOps/firewall team.
+#   Do NOT remove the azure-load-balancer-internal annotation without approval.
+# =============================================================================
+---
+# --- Service 1: Headless ClusterIP -------------------------------------------
+# Required by StatefulSet for stable pod DNS.
+# Pod DNS: node-cronos-0.node-cronos.cronos.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-cronos                 # Headless service — must match StatefulSet.spec.serviceName
+  namespace: cronos                 # Must match namespace in 00-node_cronos_namespace.yaml
+  labels:
+    blockchain: cronos
+    node: node_cronos
+    managed-by: manifest-generator
+spec:
+  clusterIP: None                   # Headless — DNS resolves directly to pod IP
+  publishNotReadyAddresses: true    # Required: readinessProbe uses CometBFT /health which stays
+                                    # false during sync. Without this the pod has no DNS record
+                                    # for hours while syncing, breaking StatefulSet stable identity.
+  selector:
+    node: node_cronos               # Routes to pods with this label
+  ports:
+    - name: p2p
+      port: 26656
+      targetPort: 26656
+      protocol: TCP
+    - name: rpc
+      port: 26657
+      targetPort: 26657
+      protocol: TCP
+    - name: cosmos-api
+      port: 1317
+      targetPort: 1317
+      protocol: TCP
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+    - name: evm-rpc
+      port: 8545
+      targetPort: 8545
+      protocol: TCP
+    - name: evm-ws
+      port: 8546
+      targetPort: 8546
+      protocol: TCP
+    - name: prometheus
+      port: 26660
+      targetPort: 26660
+      protocol: TCP
+---
+# --- Service 2: Internal LoadBalancer — P2P ----------------------------------
+# Exposes the CometBFT P2P port via Azure Internal Load Balancer.
+# External P2P access requires a port enable request via DevOps/firewall team —
+# do NOT remove the internal annotation without approval.
+#
+# LB listener port 5332 (compose host port) → container 26656.
+# Using the compose host port as the LB listener keeps this node's port set
+# disjoint from other nodes on the same ILB IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-cronos-lb              # Primary LB service name
+  namespace: cronos
+  labels:
+    blockchain: cronos
+    node: node_cronos
+    managed-by: manifest-generator
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # Private VNet IP — MUST NOT be removed
+spec:
+  type: LoadBalancer
+  selector:
+    node: node_cronos
+  ports:
+    - name: p2p
+      port: 5332                    # LB listener port (compose host port) — unique on shared ILB IP
+      targetPort: 26656             # Container port — protocol-fixed, never change
+      protocol: TCP
+---
+# --- Service 3: Internal LoadBalancer — RPC / API / EVM ----------------------
+# Exposes all non-P2P ports via Azure Internal Load Balancer.
+# These ports must NEVER be exposed publicly — VNet access only.
+#
+# REVIEW NOTE — non-standard LB listener ports (2332, 4332, 8555) are CORRECT:
+#   They mirror the compose host ports. Every Cosmos+EVM chain defaults to
+#   26657/1317/8545 as container ports; sharing the same LB listener port as
+#   another chain would put two services on the same (IP, port) pair and cause
+#   SyncLoadBalancerFailed. targetPort stays the real container port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-cronos-rpc-lb          # RPC/API LB service name
+  namespace: cronos
+  labels:
+    blockchain: cronos
+    node: node_cronos
+    managed-by: manifest-generator
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # Private VNet IP — required for all API ports
+spec:
+  type: LoadBalancer
+  selector:
+    node: node_cronos
+  ports:
+    - name: rpc
+      port: 2332                    # LB listener (compose host port)
+      targetPort: 26657             # Container port — CometBFT RPC
+      protocol: TCP
+    - name: cosmos-api
+      port: 4332                    # LB listener (compose host port)
+      targetPort: 1317              # Container port — Cosmos REST API
+      protocol: TCP
+    - name: evm-rpc
+      port: 8555                    # LB listener (compose host port)
+      targetPort: 8545              # Container port — EVM JSON-RPC HTTP (eth_, debug_trace*)
+      protocol: TCP
+    - name: grpc
+      port: 9090                    # LB listener = container port (not in compose, use standard)
+      targetPort: 9090              # Container port — Cosmos gRPC
+      protocol: TCP
+    - name: evm-ws
+      port: 8546                    # LB listener = container port (not in compose, use standard)
+      targetPort: 8546              # Container port — EVM JSON-RPC WebSocket
+      protocol: TCP
+
+
+
+

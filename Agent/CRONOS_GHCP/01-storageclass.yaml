@@ -1,0 +1,18 @@
+apiVersion: storage.k8s.io/v1       # Stable API version for StorageClass resources
+kind: StorageClass
+metadata:
+  name: node-cronos-storage         # StorageClass name — referenced by PVC in 02-node_cronos_pvc.yaml
+  labels:
+    blockchain: cronos              # Identifies the blockchain this StorageClass belongs to
+    node: node_cronos               # Node identifier for label selectors
+    managed-by: manifest-generator  # Tracks origin of this resource
+provisioner: disk.csi.azure.com     # Azure Disk CSI driver — verified provisioner for AKS
+reclaimPolicy: Retain               # RETAIN — blockchain node data is irreplaceable; NEVER use Delete
+volumeBindingMode: WaitForFirstConsumer  # Provision disk in same AZ as the scheduled pod
+allowVolumeExpansion: true          # Required for pvc-watcher auto-expansion to work
+parameters:
+  skuName: Premium_LRS              # Premium SSD — archive node requires sustained high IOPS
+                                    # RocksDB random reads on 4.5–6T dataset need P_LRS throughput
+
+
+

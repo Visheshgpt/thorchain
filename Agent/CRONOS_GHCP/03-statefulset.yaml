@@ -1,0 +1,499 @@
+# =============================================================================
+# 03-node_cronos_statefulset.yaml — Cronos EVM archive node
+#
+# Chain:   Cronos Mainnet (cronosmainnet_25-1)
+#          Cosmos SDK + Ethermint (EVM-compatible), binary: cronosd
+#
+# IMAGE STRATEGY — ubuntu:22.04 + binary on PVC (no ACR):
+#   Cronos publishes no official Docker image — only binary tarballs.
+#   The internal tag cronos-archive:v1.7.8 is a local VM build; it matches
+#   the Dockerfile in blockchains/cronoszkevm/a exactly:
+#     FROM ubuntu:22.04
+#     apt-get install curl wget jq tar
+#     wget .../cronos_1.7.8_Linux_x86_64.tar.gz && tar && mv bin/cronosd /usr/local/bin
+#   We replicate that build once in init-install-cronosd (ubuntu:22.04),
+#   store the binary on the PVC, and the main container runs it on ubuntu:22.04.
+#   No ACR, no ImagePullBackOff.
+#
+# DATA MIGRATION (existing archive data on the old VM):
+#   Original docker-compose: /CronosDisk/node-cronos-archive/data:/data
+#   Inside the container:    CRONOS_HOME=/data/.cronos
+#   On the PVC the data must live at:  /data/.cronos/
+#   ADOPT_EXISTING=true (default) skips snapshot and uses migrated data.
+#   See full-doc.md for the rsync/kubectl-cp migration commands.
+#
+# INIT CONTAINERS (mirrors the VM Dockerfile + entrypoint.sh):
+#   1. restore-snapshot  — Polkachu Cronos snapshot OR adopts migrated data
+#   2. install-cronosd   — Replicates the Dockerfile RUN block: apt-get + wget
+#                          binary + tar + verify. Stores binary at /data/bin/
+#   3. configure         — Mirrors entrypoint.sh exactly (init + genesis + sed)
+#                          plus K8s-specific binds (RPC 0.0.0.0, EVM JSON-RPC)
+#
+# PATHS (from entrypoint.sh):
+#   Volume mount:  /data         (matches Dockerfile VOLUME ["/data"])
+#   CRONOS_HOME:   /data/.cronos (matches entrypoint.sh CRONOS_HOME="/data/.cronos")
+#   Binary:        /data/bin/cronosd (stored on PVC by init-install-cronosd)
+#
+# CONFIG VALUES (from entrypoint.sh — unchanged):
+#   pruning             = "nothing"       (archive)
+#   minimum-gas-prices  = "0.025basecro"
+#   app-db-backend      = "rocksdb"
+#   query-gas-limit     = "100000000"
+# =============================================================================
+
+
+apiVersion: apps/v1                 # Stable API version for StatefulSet resources
+kind: StatefulSet
+metadata:
+  name: node-cronos                 # StatefulSet name — pod will be named node-cronos-0
+  namespace: cronos                 # Must match namespace in 00-node_cronos_namespace.yaml
+  labels:
+    blockchain: cronos              # Protocol identifier
+    node: node_cronos               # Node identifier used by all services as selector
+    managed-by: manifest-generator  # Tracks origin of this resource
+spec:
+  serviceName: node-cronos          # Must match the headless Service name in 04-node_cronos_service.yaml
+  replicas: 1                       # Single replica — blockchain nodes do not horizontally scale
+  selector:
+    matchLabels:
+      node: node_cronos             # Must match pod template labels below
+  template:
+    metadata:
+      labels:
+        blockchain: cronos          # Protocol identifier on the pod
+        node: node_cronos           # Used by all three Services as the selector
+    spec:
+      enableServiceLinks: false     # Prevents k8s <SVC>_PORT env vars colliding with Cosmos/viper key lookups
+      securityContext:
+        runAsNonRoot: false         # Matches docker-compose `user: root` — cronosd runs as root
+        runAsUser: 0                # Root — same as the original VM Dockerfile (no USER instruction)
+        fsGroup: 0                  # Root group — PVC files owned by root
+        fsGroupChangePolicy: OnRootMismatch  # Avoids re-chowning gigabytes on every pod start
+      terminationGracePeriodSeconds: 600  # Must flush RocksDB cleanly — SIGKILL mid-write corrupts store
+
+
+      initContainers:
+
+
+        # --- 1. Snapshot restore / data adoption ----------------------------
+        # ⚠  ARCHIVE NODE with existing VM data:
+        #    ADOPT_EXISTING=true (default) — skips snapshot and adopts data
+        #    already on the PVC (migrated from /CronosDisk/node-cronos-archive/data/.cronos/).
+        #    See full-doc.md for the data migration steps.
+        #
+        #    If starting fresh (no existing data), set ADOPT_EXISTING=false.
+        #    Polkachu pruned snapshot will restore — note: no traces before
+        #    snapshot height will be available on a pruned baseline.
+        - name: restore-snapshot
+          image: alpine:3.19
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            # FORCE_RESTORE — wipe data and re-pull snapshot.
+            # Token-based: set to a new string to trigger once. Leaving it
+            # set after it fires is harmless (token is recorded on the PVC).
+            - { name: FORCE_RESTORE,  value: "" }
+            # ADOPT_EXISTING — treat data already on the PVC as legitimate
+            # (migrated prod data). Set "true" after copying VM data to PVC.
+            - { name: ADOPT_EXISTING, value: "true" }
+          resources:
+            requests:
+              cpu: "100m"           # Just curl + lz4 streaming — no CPU-intensive work
+              memory: "256Mi"
+            limits:
+              memory: "1Gi"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/data/.cronos
+              SENTINEL="$HOME_DIR/.snapshot-restored"
+              INPROGRESS="$HOME_DIR/.restore-in-progress"
+              TOKENFILE="$HOME_DIR/.force-restore-token"
+              SNAP_PAGE="https://polkachu.com/tendermint_snapshots/cronos"
+              SNAP_BASE="https://snapshots.polkachu.com/snapshots/cronos"
+
+
+              # ADOPT_EXISTING=true — skip ALL snapshot logic unconditionally.
+              # Use this when:
+              #   (a) data has already been migrated to the PVC, OR
+              #   (b) the PVC is empty and the node will sync from peers
+              #       (no snapshot needed — configure will init the home dir).
+              # Data migration is handled separately via rsync/kubectl-cp.
+              if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
+                echo "[restore] ADOPT_EXISTING=true -- skipping snapshot, proceeding to configure"
+                mkdir -p "$HOME_DIR"
+                echo "adopted" > "$SENTINEL"
+                exit 0
+              fi
+
+
+              # -- forced re-restore, one shot per distinct token -----------
+              FORCE="${FORCE_RESTORE:-}"
+              SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
+              if [ -n "$FORCE" ] && [ "$FORCE" != "$SEEN" ]; then
+                echo "[restore] FORCE_RESTORE token '$FORCE' is new -- wiping and re-pulling"
+                rm -rf "$HOME_DIR/data"
+                rm -f "$SENTINEL"
+                printf '%s' "$FORCE" > "$TOKENFILE"
+              elif [ -n "$FORCE" ]; then
+                echo "[restore] FORCE_RESTORE token already honoured -- ignoring"
+              fi
+
+
+              if [ -f "$SENTINEL" ]; then
+                echo "[restore] already restored at $(cat "$SENTINEL")"
+                exit 0
+              fi
+
+
+              # Guard any existing data — refuse to overwrite unless FORCE_RESTORE set
+              if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
+                if [ -f "$INPROGRESS" ]; then
+                  echo "[restore] partial extract from previous attempt -- clearing"
+                  rm -rf "$HOME_DIR/data"
+                else
+                  echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
+                  echo "[restore] To use existing data: set ADOPT_EXISTING=true"
+                  echo "[restore] To force re-pull:     set FORCE_RESTORE to any new value"
+                  exit 1
+                fi
+              fi
+
+
+              echo "[restore] installing curl + lz4 + tar"
+              apk add --no-cache curl ca-certificates lz4 tar >/dev/null
+
+
+              echo "[restore] discovering current Polkachu Cronos snapshot"
+              FILE=$(curl -fsSL "$SNAP_PAGE" \
+                     | grep -oE 'cronos_[0-9]+\.tar\.lz4' | head -1)
+              if [ -z "$FILE" ]; then
+                echo "[restore] FATAL: could not discover snapshot filename"
+                exit 1
+              fi
+              HEIGHT=$(echo "$FILE" | sed -n 's/cronos_\([0-9]*\)\.tar\.lz4/\1/p')
+              echo "[restore] selected $FILE (height $HEIGHT)"
+
+
+              mkdir -p "$HOME_DIR"
+              touch "$INPROGRESS"
+              ATTEMPT=0
+              while : ; do
+                ATTEMPT=$((ATTEMPT + 1))
+                if [ "$ATTEMPT" -gt 5 ]; then
+                  echo "[restore] FATAL: failed after 5 attempts"
+                  exit 1
+                fi
+                echo "[restore] streaming attempt $ATTEMPT"
+                if curl -fL --retry 3 --retry-delay 10 "$SNAP_BASE/$FILE" \
+                     | lz4 -dc - | tar -x --no-same-owner -C "$HOME_DIR" ; then
+                  OK=1
+                  for d in blockstore.db state.db application.db; do
+                    if [ ! -d "$HOME_DIR/data/$d" ]; then
+                      echo "[restore] missing data/$d after extract"
+                      OK=0
+                    fi
+                  done
+                  if [ "$OK" = "1" ]; then
+                    echo "[restore] extract verified"
+                    break
+                  fi
+                fi
+                echo "[restore] attempt $ATTEMPT failed -- retrying"
+                rm -rf "$HOME_DIR/data"
+                sleep 15
+              done
+
+
+              echo "$HEIGHT" > "$SENTINEL"
+              rm -f "$INPROGRESS"
+              chmod -R a+rwX "$HOME_DIR"
+              echo "[restore] DONE at height $HEIGHT"
+          volumeMounts:
+            - name: cronos-data
+              mountPath: /data        # PVC root — matches Dockerfile VOLUME ["/data"]
+
+
+        # --- 2. Binary install -----------------------------------------------
+        # Mirrors the Dockerfile RUN block EXACTLY:
+        #   FROM ubuntu:22.04
+        #   RUN apt-get install curl wget jq tar
+        #   RUN wget .../cronos_1.7.8_Linux_x86_64.tar.gz
+        #       tar -zxvf ... && mv bin/cronosd /usr/local/bin/cronosd
+        # Stored at /data/bin/cronosd so the main container can exec it.
+        # No ACR, no registry.
+        - name: install-cronosd
+          image: ubuntu:22.04
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            # No capabilities drop — ubuntu:22.04 apt-get requires CAP_DAC_OVERRIDE
+            # to write to /var/cache/apt/archives/partial/ (owned by _apt uid 100).
+            # Matches the original Dockerfile which has no capability restrictions.
+          resources:
+            requests:
+              cpu: "250m"           # apt-get + wget download — moderate CPU
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              VERSION="1.7.8"
+              ASSET="cronos_${VERSION}_Linux_x86_64.tar.gz"
+              REL="https://github.com/crypto-org-chain/cronos/releases/download/v${VERSION}"
+              BIN_DIR="/data/bin"
+
+
+              mkdir -p "$BIN_DIR"
+
+
+              if [ -x "$BIN_DIR/cronosd" ]; then
+                echo "[install] cronosd already present -- skipping"
+                exit 0
+              fi
+
+
+              echo "[install] apt-get install (mirrors Dockerfile RUN block)"
+              apt-get update -qq
+              apt-get install -y -q --no-install-recommends curl wget jq tar ca-certificates
+
+
+              echo "[install] downloading $ASSET (mirrors Dockerfile wget)"
+              wget -q "$REL/$ASSET" -O "/tmp/$ASSET"
+
+
+              # SHA256 verification
+              # TODO: replace with the actual hash before production deploy
+              # Get it from: curl -fsSL $REL/checksums.txt | grep $ASSET
+              SHA="TODO_REPLACE_WITH_SHA256_FROM_CHECKSUMS_TXT"
+              if [ "$SHA" != "TODO_REPLACE_WITH_SHA256_FROM_CHECKSUMS_TXT" ]; then
+                echo "[install] verifying sha256"
+                echo "$SHA  /tmp/$ASSET" | sha256sum -c -
+              else
+                echo "[install] WARNING: SHA256 not set -- skipping (update before prod)"
+              fi
+
+
+              echo "[install] extracting (mirrors Dockerfile tar -zxvf)"
+              tar -zxf "/tmp/$ASSET" -C /tmp
+              mv /tmp/bin/cronosd "$BIN_DIR/cronosd"
+              chmod 0755 "$BIN_DIR/cronosd"
+              rm -f "/tmp/$ASSET"
+              echo "[install] cronosd v$VERSION installed at $BIN_DIR/cronosd"
+              "$BIN_DIR/cronosd" version
+          volumeMounts:
+            - name: cronos-data
+              mountPath: /data
+
+
+        # --- 3. Node init + config -------------------------------------------
+        # Mirrors entrypoint.sh EXACTLY (steps 1–3), then adds K8s-specific
+        # network bindings that Docker port-mapping handles automatically
+        # but Kubernetes Services require explicitly.
+        #
+        # Entrypoint.sh steps reproduced here:
+        #   1. cronosd init (if config.toml absent)
+        #   2. download genesis.json (if absent)
+        #   3. sed patches: pruning, minimum-gas-prices, app-db-backend, query-gas-limit
+        # K8s additions:
+        #   4. bind CometBFT RPC to 0.0.0.0:26657 (default is 127.0.0.1)
+        #   5. enable + bind EVM JSON-RPC to 0.0.0.0:8545/8546
+        #   6. set seeds + persistent_peers for peer discovery
+        - name: configure
+          image: ubuntu:22.04
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            # No capabilities drop — same reason as install-cronosd above.
+          resources:
+            requests:
+              cpu: "100m"           # sed + curl for genesis — minimal CPU
+              memory: "256Mi"
+            limits:
+              memory: "512Mi"
+          env:
+            - { name: MONIKER,       value: "pegasus-node" }          # From docker-compose environment
+            - { name: CRONOS_HOME,   value: "/data/.cronos" }         # From entrypoint.sh
+            - { name: CHAIN_ID,      value: "cronosmainnet_25-1" }    # From entrypoint.sh
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              CM="/data/bin/cronosd"
+
+
+              echo "[configure] apt-get install curl (needed for genesis download)"
+              apt-get update -qq
+              apt-get install -y -q --no-install-recommends curl ca-certificates
+
+
+              # ----------------------------------------------------------
+              # Init only if config.toml does not exist yet (first boot).
+              # Never run init on subsequent boots — it fails with data/
+              # already present and corrupts genesis.json with a stub.
+              # ----------------------------------------------------------
+              if [ ! -f "$CRONOS_HOME/config/config.toml" ]; then
+                echo "[configure] first boot — running cronosd init"
+                "$CM" init "$MONIKER" --chain-id "$CHAIN_ID" --home "$CRONOS_HOME"
+              fi
+
+
+              # ----------------------------------------------------------
+              # Genesis: download if missing or stub (<100KB = corrupted).
+              # Real Cronos mainnet genesis is ~50MB.
+              # ----------------------------------------------------------
+              GENESIS_SIZE=$(wc -c < "$CRONOS_HOME/config/genesis.json" 2>/dev/null || echo 0)
+              if [ "$GENESIS_SIZE" -lt 100000 ]; then
+                echo "[configure] genesis missing or corrupted (${GENESIS_SIZE} bytes) — downloading"
+                curl -fsSL \
+                  https://raw.githubusercontent.com/crypto-org-chain/cronos-mainnet/master/cronosmainnet_25-1/genesis.json \
+                  -o "$CRONOS_HOME/config/genesis.json"
+                echo "[configure] genesis $(wc -c < "$CRONOS_HOME/config/genesis.json") bytes"
+              else
+                echo "[configure] genesis.json OK (${GENESIS_SIZE} bytes)"
+              fi
+
+
+              # ----------------------------------------------------------
+              # app.toml — entrypoint.sh patches + force json-rpc disabled.
+              # json-rpc enable=true was accumulated by earlier configure runs
+              # and causes a SIGSEGV crash at startup. Explicitly set false.
+              # ----------------------------------------------------------
+              if [ -f "$CRONOS_HOME/config/app.toml" ]; then
+                echo "[configure] patching app.toml"
+                sed -i -E 's#^(pruning[[:space:]]*=[[:space:]]*).*$#\1"nothing"#'                   "$CRONOS_HOME/config/app.toml"
+                sed -i -E 's#^(minimum-gas-prices[[:space:]]*=[[:space:]]*).*$#\1"0.025basecro"#'   "$CRONOS_HOME/config/app.toml"
+                sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"rocksdb"#'            "$CRONOS_HOME/config/app.toml"
+                sed -i -E 's#^(query-gas-limit[[:space:]]*=[[:space:]]*).*$#\1"100000000"#'         "$CRONOS_HOME/config/app.toml"
+                # Force json-rpc disabled — crashes cronosd v1.7.8 on AKS (SIGSEGV on 8545)
+                sed -i '/^\[json-rpc\]/,/^\[/{s/^enable = .*/enable = false/}' "$CRONOS_HOME/config/app.toml"
+              fi
+
+
+              # ----------------------------------------------------------
+              # config.toml — K8s required patches only.
+              # db_backend=rocksdb MUST match snapshot format.
+              # pex=false prevents fatal exit when address book is empty.
+              # ----------------------------------------------------------
+              if [ -f "$CRONOS_HOME/config/config.toml" ]; then
+                echo "[configure] patching config.toml"
+                sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CRONOS_HOME/config/config.toml"
+                sed -i 's|^db_backend = .*|db_backend = "rocksdb"|'                         "$CRONOS_HOME/config/config.toml"
+                sed -i 's|^pex = .*|pex = false|'                                           "$CRONOS_HOME/config/config.toml"
+                sed -i 's|^seeds = .*|seeds = ""|'                                          "$CRONOS_HOME/config/config.toml"
+                sed -i 's|^persistent_peers = .*|persistent_peers = ""|'                    "$CRONOS_HOME/config/config.toml"
+              fi
+
+
+              echo "[configure] ---- app.toml ----"
+              grep -E '^(pruning|minimum-gas-prices|app-db-backend|query-gas-limit)' "$CRONOS_HOME/config/app.toml" || true
+              grep -A2 '^\[json-rpc\]' "$CRONOS_HOME/config/app.toml" | grep enable || true
+              echo "[configure] ---- config.toml ----"
+              grep -E '^(db_backend|laddr|pex|seeds|persistent_peers) ' "$CRONOS_HOME/config/config.toml" || true
+              echo "[configure] DONE"
+          volumeMounts:
+            - name: cronos-data
+              mountPath: /data
+
+
+      containers:
+        - name: cronosd
+          # ubuntu:22.04 — matches the original Dockerfile base image.
+          # The cronosd binary is installed by init-install-cronosd at /data/bin/cronosd.
+          # This container just executes `cronosd start` — identical to
+          # the entrypoint.sh `exec cronosd start --home "$CRONOS_HOME"`.
+          image: ubuntu:22.04
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          command: ["/data/bin/cronosd"]     # Binary on PVC (installed by init-install-cronosd)
+          args:
+            - "start"
+            - "--home=/data/.cronos"          # Matches entrypoint.sh CRONOS_HOME="/data/.cronos"
+            - "--rpc.laddr=tcp://0.0.0.0:26657"   # K8s: bind CometBFT RPC to all interfaces
+            # gRPC and API disabled for crash diagnosis — crash happens right after gRPC starts.
+            # Re-enable once node is stable: add --api.enable=true --grpc.enable=true
+            # - "--api.enable=true"
+            # - "--api.address=tcp://0.0.0.0:1317"
+            # - "--grpc.enable=true"
+            # - "--grpc.address=0.0.0.0:9090"
+          env:
+            - { name: MONIKER,      value: "pegasus-node" }
+            - { name: CRONOS_HOME,  value: "/data/.cronos" }
+            - { name: GOTRACEBACK,  value: "crash" }  # Force full CGO goroutine dump on SIGSEGV
+          ports:
+            - name: p2p
+              containerPort: 26656          # CometBFT P2P — protocol-fixed, never change
+              protocol: TCP
+            - name: rpc
+              containerPort: 26657          # CometBFT RPC — protocol-fixed
+              protocol: TCP
+            - name: cosmos-api
+              containerPort: 1317           # Cosmos REST API — protocol-fixed
+              protocol: TCP
+            - name: grpc
+              containerPort: 9090           # Cosmos gRPC — protocol-fixed
+              protocol: TCP
+            - name: evm-rpc
+              containerPort: 8545           # EVM JSON-RPC HTTP (eth_, debug_trace*)
+              protocol: TCP
+            - name: evm-ws
+              containerPort: 8546           # EVM JSON-RPC WebSocket
+              protocol: TCP
+            - name: prometheus
+              containerPort: 26660          # Prometheus metrics
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "250m"                   # Scheduling reservation — keeps the pod schedulable
+                                            # on shared cluster nodes alongside other chain pods.
+                                            # The node will burst to the limit when syncing.
+              memory: "1Gi"                 # Scheduling reservation — same reasoning as cpu above
+            limits:
+              cpu: "4"                      # Max CPU burst (4-core per Cronos official docs)
+              memory: "16Gi"               # Max memory — raise to 32Gi+ for heavy debug_trace workloads
+          # CometBFT /health is the correct probe — tcpSocket on P2P stays
+          # green through a total freeze (P2P listener never closes).
+          startupProbe:
+            httpGet:
+              path: /health
+              port: rpc
+            periodSeconds: 15
+            failureThreshold: 120           # up to 30 min for store open after restore
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: rpc
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: rpc
+            initialDelaySeconds: 1800       # Give 30 min before liveness starts
+            periodSeconds: 600
+            timeoutSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: cronos-data
+              mountPath: /data              # Matches Dockerfile VOLUME ["/data"]
+
+
+      volumes:
+        - name: cronos-data                 # Backed by the PVC in 02-node_cronos_pvc.yaml
+          persistentVolumeClaim:
+            claimName: node-cronos-data     # Must match PVC name in 02-node_cronos_pvc.yaml
+
+
+

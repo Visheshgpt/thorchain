@@ -1,0 +1,21 @@
+apiVersion: v1                      # Stable core API version for PersistentVolumeClaim resources
+kind: PersistentVolumeClaim
+metadata:
+  name: node-cronos-data            # PVC name — referenced by StatefulSet volume mount
+  namespace: cronos                 # Must match the namespace in 00-node_cronos_namespace.yaml
+  labels:
+    blockchain: cronos              # Identifies the blockchain this PVC belongs to
+    node: node_cronos               # Node identifier for label selectors
+    managed-by: manifest-generator  # Tracks origin of this resource
+spec:
+  accessModes:
+    - ReadWriteOnce                 # Azure Disk supports only single-node read-write access
+  storageClassName: node-cronos-storage  # Must match StorageClass in 01-node_cronos_storageclass.yaml
+  resources:
+    requests:
+      storage: 5000Gi              # Cronos archive node: ~4.5T (RocksDB) / ~6T (LevelDB)
+                                   # Source: https://docs.cronos.com/for-node-hosts/running-nodes/cronos-mainnet
+                                   # Start at 5000Gi; pvc-watcher auto-expands up to 8000Gi
+
+
+
