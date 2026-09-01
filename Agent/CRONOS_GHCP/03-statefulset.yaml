@@ -95,7 +95,7 @@ spec:
             # FORCE_RESTORE — wipe data and re-pull snapshot.
             # Token-based: set to a new string to trigger once. Leaving it
             # set after it fires is harmless (token is recorded on the PVC).
-            - { name: RESET_DATA,      value: "clean-start-1" }
+            - { name: RESET_DATA,      value: "goleveldb-1" }
             # ADOPT_EXISTING — treat data already on the PVC as legitimate
             # (migrated prod data). Set "true" after copying VM data to PVC.
             - { name: ADOPT_EXISTING, value: "false" }
@@ -142,11 +142,11 @@ spec:
                 exit 0
               fi
               if [ "$TOKEN" = "$SEEN" ]; then
-                echo "[prepare] reset token '"'"'$TOKEN'"'"' already honoured -- nothing to do"
+                echo "[prepare] reset token $TOKEN already honoured -- nothing to do"
                 exit 0
               fi
               
-              echo "[prepare] reset token '"'"'$TOKEN'"'"' is new -- clearing data/"
+              echo "[prepare] reset token $TOKEN is new -- clearing data/"
               du -sh "$HOME_DIR/data" 2>/dev/null || true
               
               # Clear WITHOUT depending on who owns what inside. Deleting a file
@@ -171,7 +171,19 @@ spec:
               rm -f "$HOME_DIR/config/genesis.json" 2>/dev/null || true
               rm -f "$HOME_DIR/config/addrbook.json" 2>/dev/null || true
               
-              printf '"'"'%s'"'"' "$TOKEN" > "$TOKENFILE"
+              # `cronosd init` is skipped whenever config.toml already exists, so
+              # wiping data/ leaves priv_validator_state.json missing and the node
+              # exits with:
+              #   open .../data/priv_validator_state.json: no such file or directory
+              # height 0 is the correct value for a fresh node.
+              mkdir -p "$HOME_DIR/data"
+              echo '{"height":"0","round":0,"step":0}' > "$HOME_DIR/data/priv_validator_state.json"
+
+              # printf '%s' -- NOT the '"'"' escaping that was here, which
+              # evaluated to printf "'%s'" and wrote the token wrapped in literal
+              # quotes. $SEEN then never matched $TOKEN and the wipe fired on
+              # EVERY restart, re-syncing from genesis each time.
+              printf '%s' "$TOKEN" > "$TOKENFILE"
               df -h "$HOME_DIR" 2>/dev/null || true
               echo "[prepare] DONE -- data/ cleared, node will start from genesis"
         - name: install-cronosd
@@ -326,10 +338,9 @@ spec:
                 sed -i -E 's#^(pruning-keep-recent[[:space:]]*=[[:space:]]*).*$#\1"100"#'            "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(pruning-interval[[:space:]]*=[[:space:]]*).*$#\1"10"#'                "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(minimum-gas-prices[[:space:]]*=[[:space:]]*).*$#\1"0.025basecro"#'   "$CRONOS_HOME/config/app.toml"
-                # rocksdb -- matches the production VM. Do not switch this to
-              # goleveldb: a goleveldb binary cannot open a RocksDB store, so a
-              # goleveldb test could never accept the prod data.
-                sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"rocksdb"#'            "$CRONOS_HOME/config/app.toml"
+                # goleveldb, matching db_backend below. See the note there: rocksdb
+                # SEGFAULTS with this release binary.
+                sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"goleveldb"#'          "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(query-gas-limit[[:space:]]*=[[:space:]]*).*$#\1"100000000"#'         "$CRONOS_HOME/config/app.toml"
                 # Force json-rpc disabled — crashes cronosd v1.7.8 on AKS (SIGSEGV on 8545)
                 sed -i '/^\[json-rpc\]/,/^\[/{s/^enable = .*/enable = false/}' "$CRONOS_HOME/config/app.toml"
@@ -345,16 +356,18 @@ spec:
               if [ -f "$CRONOS_HOME/config/config.toml" ]; then
                 echo "[configure] patching config.toml"
                 sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CRONOS_HOME/config/config.toml"
-                # db_backend: rocksdb -- MATCHES THE PRODUCTION VM, and must stay.
-                #   A goleveldb binary cannot open a RocksDB store. Testing on
-                #   goleveldb would validate the manifests while rehearsing a
-                #   configuration that could never accept the prod data.
-                #
-                #   NOTE: the release binary genuinely supports rocksdb -- verified
-                #   on the artifact: build tags include rocksdb + grocksdb_no_link,
-                #   CGO_ENABLED=1, and 10,607 linked rocksdb C++ symbols with no
-                #   undefined references. So rocksdb is not a missing-support issue.
-                sed -i 's|^db_backend = .*|db_backend = "rocksdb"|'                         "$CRONOS_HOME/config/config.toml"
+                # db_backend: goleveldb. NOT a preference -- rocksdb is PROVEN broken
+                # with this binary. Run by hand in the pod, same host, clean data dir:
+                #   --db_backend=rocksdb   -> Segmentation fault (core dumped), exit 139
+                #   --db_backend=goleveldb -> upgrades all 21 IAVL stores and reaches
+                #                             "starting node with ABCI CometBFT in-process"
+                # The app is fine; only the rocksdb path faults. This release binary
+                # is built with the grocksdb_no_link tag, so its rocksdb linkage
+                # differs from a self-built image -- which is why the prod VM (custom
+                # image from dockerfile-rocksdb) runs rocksdb and this does not.
+                # MIGRATION CONSEQUENCE: prod data is RocksDB and cannot be adopted
+                # by this node. That needs a self-built rocksdb image, as the VM has.
+                sed -i 's|^db_backend = .*|db_backend = "goleveldb"|'                       "$CRONOS_HOME/config/config.toml"
                 # PEERS -- the previous config blanked seeds AND persistent_peers AND
                 # set pex=false. That is not a workaround, it guarantees permanent
                 # isolation: no seeds, no peers, no peer exchange means the node can
