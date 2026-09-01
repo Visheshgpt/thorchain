@@ -95,7 +95,7 @@ spec:
             # FORCE_RESTORE — wipe data and re-pull snapshot.
             # Token-based: set to a new string to trigger once. Leaving it
             # set after it fires is harmless (token is recorded on the PVC).
-            - { name: RESET_DATA,      value: "goleveldb-1" }
+            - { name: RESET_DATA,      value: "statesync-1" }
             # ADOPT_EXISTING — treat data already on the PVC as legitimate
             # (migrated prod data). Set "true" after copying VM data to PVC.
             - { name: ADOPT_EXISTING, value: "false" }
@@ -300,7 +300,7 @@ spec:
 
               echo "[configure] apt-get install curl (needed for genesis download)"
               apt-get update -qq
-              apt-get install -y -q --no-install-recommends curl ca-certificates
+              apt-get install -y -q --no-install-recommends curl ca-certificates jq
 
 
               # ----------------------------------------------------------
@@ -330,6 +330,10 @@ spec:
                   https://raw.githubusercontent.com/crypto-org-chain/cronos-mainnet/master/cronosmainnet_25-1/genesis.json \
                   -o "$CRONOS_HOME/config/genesis.json"
                 echo "[configure] genesis $(wc -c < "$CRONOS_HOME/config/genesis.json") bytes"
+                # Published sha256 from the official Cronos docs. The genesis is only
+                # 19,442 bytes and that is CORRECT -- verified against this hash.
+                GEN_SHA="58f17545056267f57a2d95f4c9c00ac1d689a580e220c5d4de96570fbbc832e1"
+                echo "$GEN_SHA  $CRONOS_HOME/config/genesis.json" | sha256sum -c -
               else
                 echo "[configure] genesis.json OK (${GENESIS_SIZE} bytes)"
               fi
@@ -385,10 +389,59 @@ spec:
                 # the address book was empty BECAUSE the seeds had been blanked.
                 # Seeds from the cosmos chain-registry for cronosmainnet_25-1.
                 SEEDS="0d5cf1394a1cfde28dc8f023567222abc0f47534@cronos-seed-0.crypto.org:26656,3032073adc06d710dd512240281637c1bd0c8a7b@cronos-seed-1.crypto.org:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@cronos-seed-2.crypto.org:26656,337377dcda43d79c537d2c4d93ad3b698ce9452e@bd-cronos-mainnet-seed-node-01.bdnodes.net:26656,abedfe94dd5731e9750e045ca8d8e40aa6d3c60b@seed.cronos.jerrychong.com:26656,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656"
-                PPEERS="0d5cf1394a1cfde28dc8f023567222abc0f47534@cronos-seed-0.crypto.org:26656,3032073adc06d710dd512240281637c1bd0c8a7b@cronos-seed-1.crypto.org:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@cronos-seed-2.crypto.org:26656,337377dcda43d79c537d2c4d93ad3b698ce9452e@bd-cronos-mainnet-seed-node-01.bdnodes.net:26656"
+                # persistent_peers straight from the official Cronos state-sync doc.
+                # NOTE the hostnames: seed-N.cronos.com, NOT cronos-seed-N.crypto.org.
+                # Same node IDs, but these are the ones Cronos publishes for state sync.
+                PPEERS="0d5cf1394a1cfde28dc8f023567222abc0f47534@seed-0.cronos.com:26656,3032073adc06d710dd512240281637c1bd0c8a7b@seed-1.cronos.com:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@seed-2.cronos.com:26656,337377dcda43d79c537d2c4d93ad3b698ce9452e@bd-cronos-mainnet-seed-node-01.bdnodes.net:26656"
                 sed -i 's|^pex = .*|pex = true|'                                            "$CRONOS_HOME/config/config.toml"
                 sed -i "s|^seeds = .*|seeds = \"$SEEDS\"|"                                   "$CRONOS_HOME/config/config.toml"
                 sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"             "$CRONOS_HOME/config/config.toml"
+                # ---- STATE SYNC ---------------------------------------------
+                # THIS IS WHAT MAKES CRONOS BOOTABLE AT ALL.
+                #
+                # Starting from genesis is IMPOSSIBLE with a modern binary. The
+                # mainnet genesis (sha256 verified above) carries the 2021-era
+                # gov module layout -- deposit_params / voting_params /
+                # tally_params. cosmos-sdk v0.47 consolidated those into a single
+                # `params` object, and cronosd v1.7.8 runs cosmos-sdk v0.53.4, so
+                # x/gov InitGenesis does:
+                #     err = k.Params.Set(ctx, *data.Params)     genesis.go:21
+                # data.Params is nil -> nil pointer dereference -> SIGSEGV.
+                #
+                # State sync never calls InitChain: the node applies a snapshot
+                # instead of initialising from genesis, so that code path is
+                # never reached. It is also the only option -- there is no public
+                # tarball snapshot provider for Cronos EVM.
+                #
+                # Per the official docs, trust_height = latest - 1000.
+                SNAP_RPC="https://rpc.cronos.com:443"
+                LATEST=$(curl -fsSL --retry 5 --max-time 60 "$SNAP_RPC/block" | jq -r .result.block.header.height)
+                if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+                  echo "[configure] FATAL: cannot reach $SNAP_RPC for a trust point"; exit 1
+                fi
+                TRUST_HEIGHT=$((LATEST - 1000))
+                TRUST_HASH=$(curl -fsSL --retry 5 --max-time 60 "$SNAP_RPC/block?height=$TRUST_HEIGHT" | jq -r .result.block_id.hash)
+                if [ -z "$TRUST_HASH" ] || [ "$TRUST_HASH" = "null" ]; then
+                  echo "[configure] FATAL: cannot fetch trust hash at $TRUST_HEIGHT"; exit 1
+                fi
+                echo "[configure] state sync trust point: height=$TRUST_HEIGHT hash=$TRUST_HASH"
+                
+                # Section-aware setter: `enable` appears in more than one section,
+                # so a bare sed would corrupt unrelated settings. The doc's own
+                # one-liner is not section-scoped; this is.
+                set_sec() {
+                  f="$1"; sec="$2"; key="$3"; val="$4"
+                  awk -v sec="[$sec]" -v key="$key" -v val="$val" '"'"'
+                    /^\[/ { cur = $1 }
+                    { if (cur == sec && $0 ~ "^"key"[ ]*=") { print key " = " val; next } print }
+                  '"'"' "$f" > "$f.tmp"
+                  mv "$f.tmp" "$f"
+                }
+                set_sec "$CRONOS_HOME/config/config.toml" statesync enable       true
+                set_sec "$CRONOS_HOME/config/config.toml" statesync rpc_servers  "\"$SNAP_RPC,$SNAP_RPC\""
+                set_sec "$CRONOS_HOME/config/config.toml" statesync trust_height "$TRUST_HEIGHT"
+                set_sec "$CRONOS_HOME/config/config.toml" statesync trust_hash   "\"$TRUST_HASH\""
+                set_sec "$CRONOS_HOME/config/config.toml" statesync trust_period '"'"'"168h0m0s"'"'"'
               fi
 
 
@@ -396,7 +449,7 @@ spec:
               grep -E '^(pruning|minimum-gas-prices|app-db-backend|query-gas-limit)' "$CRONOS_HOME/config/app.toml" || true
               grep -A2 '^\[json-rpc\]' "$CRONOS_HOME/config/app.toml" | grep enable || true
               echo "[configure] ---- config.toml ----"
-              grep -E '^(db_backend|laddr|pex|seeds|persistent_peers) ' "$CRONOS_HOME/config/config.toml" || true
+              grep -E '^(db_backend|laddr|pex|seeds|persistent_peers|enable|rpc_servers|trust_height) ' "$CRONOS_HOME/config/config.toml" || true
               echo "[configure] DONE"
           volumeMounts:
             - name: cronos-data
