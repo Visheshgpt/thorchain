@@ -272,13 +272,13 @@ spec:
               # SHA256 verification
               # TODO: replace with the actual hash before production deploy
               # Get it from: curl -fsSL $REL/checksums.txt | grep $ASSET
-              SHA="TODO_REPLACE_WITH_SHA256_FROM_CHECKSUMS_TXT"
-              if [ "$SHA" != "TODO_REPLACE_WITH_SHA256_FROM_CHECKSUMS_TXT" ]; then
-                echo "[install] verifying sha256"
-                echo "$SHA  /tmp/$ASSET" | sha256sum -c -
-              else
-                echo "[install] WARNING: SHA256 not set -- skipping (update before prod)"
-              fi
+              # Verified against upstream checksums.txt for v1.7.8, re-hashed locally.
+              SHA="3840147724054449e3b8dd9a3829b88979da628686720dc16a9f39a5fbc911d4"
+              # Always verify. There is no "skip" branch on purpose: an unverified
+              # binary is worse than a failed boot. sha256sum -c exits non-zero on
+              # mismatch and `set -e` stops the container.
+              echo "[install] verifying sha256"
+              echo "$SHA  /tmp/$ASSET" | sha256sum -c -
 
 
               echo "[install] extracting (mirrors Dockerfile tar -zxvf)"
@@ -350,7 +350,12 @@ spec:
               # Real Cronos mainnet genesis is ~50MB.
               # ----------------------------------------------------------
               GENESIS_SIZE=$(wc -c < "$CRONOS_HOME/config/genesis.json" 2>/dev/null || echo 0)
-              if [ "$GENESIS_SIZE" -lt 100000 ]; then
+              # 10000, NOT 100000. The real cronosmainnet_25-1 genesis is 19,442
+              # bytes (verified: HTTP 200, valid JSON, initial_height 1). Cronos EVM
+              # launched fresh in 2021, so a small genesis is CORRECT. The old
+              # "~50MB" assumption made this test ALWAYS true, so genesis was
+              # re-downloaded on every boot.
+              if [ "$GENESIS_SIZE" -lt 10000 ]; then
                 echo "[configure] genesis missing or corrupted (${GENESIS_SIZE} bytes) — downloading"
                 curl -fsSL \
                   https://raw.githubusercontent.com/crypto-org-chain/cronos-mainnet/master/cronosmainnet_25-1/genesis.json \
@@ -368,9 +373,13 @@ spec:
               # ----------------------------------------------------------
               if [ -f "$CRONOS_HOME/config/app.toml" ]; then
                 echo "[configure] patching app.toml"
-                sed -i -E 's#^(pruning[[:space:]]*=[[:space:]]*).*$#\1"nothing"#'                   "$CRONOS_HOME/config/app.toml"
+                # pruned, not archive: this is a TEST node proving the stack runs.
+                sed -i -E 's#^(pruning[[:space:]]*=[[:space:]]*).*$#\1"custom"#'                    "$CRONOS_HOME/config/app.toml"
+                sed -i -E 's#^(pruning-keep-recent[[:space:]]*=[[:space:]]*).*$#\1"100"#'            "$CRONOS_HOME/config/app.toml"
+                sed -i -E 's#^(pruning-interval[[:space:]]*=[[:space:]]*).*$#\1"10"#'                "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(minimum-gas-prices[[:space:]]*=[[:space:]]*).*$#\1"0.025basecro"#'   "$CRONOS_HOME/config/app.toml"
-                sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"rocksdb"#'            "$CRONOS_HOME/config/app.toml"
+                # goleveldb, NOT rocksdb -- see the db_backend note below.
+                sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"goleveldb"#'          "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(query-gas-limit[[:space:]]*=[[:space:]]*).*$#\1"100000000"#'         "$CRONOS_HOME/config/app.toml"
                 # Force json-rpc disabled — crashes cronosd v1.7.8 on AKS (SIGSEGV on 8545)
                 sed -i '/^\[json-rpc\]/,/^\[/{s/^enable = .*/enable = false/}' "$CRONOS_HOME/config/app.toml"
@@ -379,16 +388,35 @@ spec:
 
               # ----------------------------------------------------------
               # config.toml — K8s required patches only.
-              # db_backend=rocksdb MUST match snapshot format.
-              # pex=false prevents fatal exit when address book is empty.
+              # db_backend must match whatever the data on disk was written with.
+              # pex=true + real seeds -- see the block below for why the old
+              # pex=false/empty-seeds combination could never sync.
               # ----------------------------------------------------------
               if [ -f "$CRONOS_HOME/config/config.toml" ]; then
                 echo "[configure] patching config.toml"
                 sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CRONOS_HOME/config/config.toml"
-                sed -i 's|^db_backend = .*|db_backend = "rocksdb"|'                         "$CRONOS_HOME/config/config.toml"
-                sed -i 's|^pex = .*|pex = false|'                                           "$CRONOS_HOME/config/config.toml"
-                sed -i 's|^seeds = .*|seeds = ""|'                                          "$CRONOS_HOME/config/config.toml"
-                sed -i 's|^persistent_peers = .*|persistent_peers = ""|'                    "$CRONOS_HOME/config/config.toml"
+                # db_backend: goleveldb, NOT rocksdb.
+                #   The node was dying with exit 139 (SIGSEGV) ~5s after
+                #   "starting node with ABCI CometBFT in-process", with NO Go stack
+                #   trace despite GOTRACEBACK=crash. A silent segfault that bypasses
+                #   the Go handler points at a crash inside C code, and RocksDB is the
+                #   only cgo component in play (build tags include rocksdb +
+                #   grocksdb_no_link, CGO_ENABLED=1). goleveldb is pure Go, so a
+                #   native crash becomes impossible. Revert to rocksdb only after the
+                #   node is proven to start.
+                sed -i 's|^db_backend = .*|db_backend = "goleveldb"|'                       "$CRONOS_HOME/config/config.toml"
+                # PEERS -- the previous config blanked seeds AND persistent_peers AND
+                # set pex=false. That is not a workaround, it guarantees permanent
+                # isolation: no seeds, no peers, no peer exchange means the node can
+                # never discover anyone and can never sync. The old comment ("pex=false
+                # prevents fatal exit when address book is empty") had it backwards --
+                # the address book was empty BECAUSE the seeds had been blanked.
+                # Seeds from the cosmos chain-registry for cronosmainnet_25-1.
+                SEEDS="0d5cf1394a1cfde28dc8f023567222abc0f47534@cronos-seed-0.crypto.org:26656,3032073adc06d710dd512240281637c1bd0c8a7b@cronos-seed-1.crypto.org:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@cronos-seed-2.crypto.org:26656,337377dcda43d79c537d2c4d93ad3b698ce9452e@bd-cronos-mainnet-seed-node-01.bdnodes.net:26656,abedfe94dd5731e9750e045ca8d8e40aa6d3c60b@seed.cronos.jerrychong.com:26656,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656"
+                PPEERS="0d5cf1394a1cfde28dc8f023567222abc0f47534@cronos-seed-0.crypto.org:26656,3032073adc06d710dd512240281637c1bd0c8a7b@cronos-seed-1.crypto.org:26656,04f43116b4c6c70054d9c2b7485383df5b1ed1da@cronos-seed-2.crypto.org:26656,337377dcda43d79c537d2c4d93ad3b698ce9452e@bd-cronos-mainnet-seed-node-01.bdnodes.net:26656"
+                sed -i 's|^pex = .*|pex = true|'                                            "$CRONOS_HOME/config/config.toml"
+                sed -i "s|^seeds = .*|seeds = \"$SEEDS\"|"                                   "$CRONOS_HOME/config/config.toml"
+                sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"             "$CRONOS_HOME/config/config.toml"
               fi
 
 
