@@ -431,17 +431,17 @@ spec:
                 # one-liner is not section-scoped; this is.
                 set_sec() {
                   f="$1"; sec="$2"; key="$3"; val="$4"
-                  awk -v sec="[$sec]" -v key="$key" -v val="$val" '"'"'
+                  awk -v sec="[$sec]" -v key="$key" -v val="$val" '
                     /^\[/ { cur = $1 }
                     { if (cur == sec && $0 ~ "^"key"[ ]*=") { print key " = " val; next } print }
-                  '"'"' "$f" > "$f.tmp"
+                  ' "$f" > "$f.tmp"
                   mv "$f.tmp" "$f"
                 }
                 set_sec "$CRONOS_HOME/config/config.toml" statesync enable       true
                 set_sec "$CRONOS_HOME/config/config.toml" statesync rpc_servers  "\"$SNAP_RPC,$SNAP_RPC\""
                 set_sec "$CRONOS_HOME/config/config.toml" statesync trust_height "$TRUST_HEIGHT"
                 set_sec "$CRONOS_HOME/config/config.toml" statesync trust_hash   "\"$TRUST_HASH\""
-                set_sec "$CRONOS_HOME/config/config.toml" statesync trust_period '"'"'"168h0m0s"'"'"'
+                set_sec "$CRONOS_HOME/config/config.toml" statesync trust_period '"168h0m0s"'
               fi
 
 
