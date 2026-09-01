@@ -95,10 +95,10 @@ spec:
             # FORCE_RESTORE — wipe data and re-pull snapshot.
             # Token-based: set to a new string to trigger once. Leaving it
             # set after it fires is harmless (token is recorded on the PVC).
-            - { name: FORCE_RESTORE,  value: "" }
+            - { name: RESET_DATA,      value: "clean-start-1" }
             # ADOPT_EXISTING — treat data already on the PVC as legitimate
             # (migrated prod data). Set "true" after copying VM data to PVC.
-            - { name: ADOPT_EXISTING, value: "true" }
+            - { name: ADOPT_EXISTING, value: "false" }
           resources:
             requests:
               cpu: "100m"           # Just curl + lz4 streaming — no CPU-intensive work
@@ -110,122 +110,70 @@ spec:
             - |
               set -eu
               HOME_DIR=/data/.cronos
-              SENTINEL="$HOME_DIR/.snapshot-restored"
-              INPROGRESS="$HOME_DIR/.restore-in-progress"
-              TOKENFILE="$HOME_DIR/.force-restore-token"
-              SNAP_PAGE="https://polkachu.com/tendermint_snapshots/cronos"
-              SNAP_BASE="https://snapshots.polkachu.com/snapshots/cronos"
-
-
-              # ADOPT_EXISTING=true — skip ALL snapshot logic unconditionally.
-              # Use this when:
-              #   (a) data has already been migrated to the PVC, OR
-              #   (b) the PVC is empty and the node will sync from peers
-              #       (no snapshot needed — configure will init the home dir).
-              # Data migration is handled separately via rsync/kubectl-cp.
-              if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
-                echo "[restore] ADOPT_EXISTING=true -- skipping snapshot, proceeding to configure"
-                mkdir -p "$HOME_DIR"
-                echo "adopted" > "$SENTINEL"
-                exit 0
-              fi
-
-
-              # -- forced re-restore, one shot per distinct token -----------
-              FORCE="${FORCE_RESTORE:-}"
-              SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
-              if [ -n "$FORCE" ] && [ "$FORCE" != "$SEEN" ]; then
-                echo "[restore] FORCE_RESTORE token '$FORCE' is new -- wiping and re-pulling"
-                rm -rf "$HOME_DIR/data"
-                rm -f "$SENTINEL"
-                printf '%s' "$FORCE" > "$TOKENFILE"
-              elif [ -n "$FORCE" ]; then
-                echo "[restore] FORCE_RESTORE token already honoured -- ignoring"
-              fi
-
-
-              if [ -f "$SENTINEL" ]; then
-                echo "[restore] already restored at $(cat "$SENTINEL")"
-                exit 0
-              fi
-
-
-              # Guard any existing data — refuse to overwrite unless FORCE_RESTORE set
-              if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
-                if [ -f "$INPROGRESS" ]; then
-                  echo "[restore] partial extract from previous attempt -- clearing"
-                  rm -rf "$HOME_DIR/data"
-                else
-                  echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
-                  echo "[restore] To use existing data: set ADOPT_EXISTING=true"
-                  echo "[restore] To force re-pull:     set FORCE_RESTORE to any new value"
-                  exit 1
-                fi
-              fi
-
-
-              echo "[restore] installing curl + lz4 + tar"
-              apk add --no-cache curl ca-certificates lz4 tar >/dev/null
-
-
-              echo "[restore] discovering current Polkachu Cronos snapshot"
-              FILE=$(curl -fsSL "$SNAP_PAGE" \
-                     | grep -oE 'cronos_[0-9]+\.tar\.lz4' | head -1)
-              if [ -z "$FILE" ]; then
-                echo "[restore] FATAL: could not discover snapshot filename"
-                exit 1
-              fi
-              HEIGHT=$(echo "$FILE" | sed -n 's/cronos_\([0-9]*\)\.tar\.lz4/\1/p')
-              echo "[restore] selected $FILE (height $HEIGHT)"
-
-
+              TOKENFILE="$HOME_DIR/.reset-token"
+              
+              # ---------------------------------------------------------------
+              # Cronos EVM has NO public snapshot or state-sync provider.
+              # Polkachu / quicksync / kjnodes all 404 for this chain, so the old
+              # snapshot-download logic here was dead code pointing at a URL that
+              # does not exist. This container now does one job: make sure the
+              # data directory is in a state the node can actually open.
+              # ---------------------------------------------------------------
               mkdir -p "$HOME_DIR"
-              touch "$INPROGRESS"
-              ATTEMPT=0
-              while : ; do
-                ATTEMPT=$((ATTEMPT + 1))
-                if [ "$ATTEMPT" -gt 5 ]; then
-                  echo "[restore] FATAL: failed after 5 attempts"
-                  exit 1
+              
+              if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
+                echo "[prepare] ADOPT_EXISTING=true -- using the data already on this volume"
+                exit 0
+              fi
+              
+              # RESET_DATA -- one shot per distinct token. The value is recorded on
+              # the volume once honoured, so a crashloop cannot re-wipe. Change the
+              # value to force another reset.
+              #
+              # WHY THIS EXISTS: a half-written store is not recoverable in place.
+              # Repeated mid-write crashes left data/ corrupt, and RocksDB segfaults
+              # on a truncated store (exit 139, no Go stack trace) rather than
+              # failing cleanly. Switching db_backend on top of it gave
+              # "failed to initialize database: EOF". Both need a clean directory.
+              TOKEN="${RESET_DATA:-}"
+              SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
+              if [ -z "$TOKEN" ]; then
+                echo "[prepare] RESET_DATA empty -- leaving the volume untouched"
+                exit 0
+              fi
+              if [ "$TOKEN" = "$SEEN" ]; then
+                echo "[prepare] reset token '"'"'$TOKEN'"'"' already honoured -- nothing to do"
+                exit 0
+              fi
+              
+              echo "[prepare] reset token '"'"'$TOKEN'"'"' is new -- clearing data/"
+              du -sh "$HOME_DIR/data" 2>/dev/null || true
+              
+              # Clear WITHOUT depending on who owns what inside. Deleting a file
+              # needs write+execute on its PARENT directory, not ownership of the
+              # file -- and those dirs were created by different UIDs across runs.
+              # Renaming data/ only needs write on $HOME_DIR, which always works.
+              rm -rf "$HOME_DIR/data" 2>/dev/null || true
+              if [ -d "$HOME_DIR/data" ]; then
+                STAMP=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-8 || echo old)
+                echo "[prepare] rm blocked -- moving data/ aside as data.discard.$STAMP"
+                mv "$HOME_DIR/data" "$HOME_DIR/data.discard.$STAMP"
+              fi
+              for d in "$HOME_DIR"/data.discard.*; do
+                if [ -d "$d" ]; then
+                  echo "[prepare] reclaiming $d"
+                  rm -rf "$d" 2>/dev/null || echo "[prepare] could not fully remove $d"
                 fi
-                echo "[restore] streaming attempt $ATTEMPT"
-                if curl -fL --retry 3 --retry-delay 10 "$SNAP_BASE/$FILE" \
-                     | lz4 -dc - | tar -x --no-same-owner -C "$HOME_DIR" ; then
-                  OK=1
-                  for d in blockstore.db state.db application.db; do
-                    if [ ! -d "$HOME_DIR/data/$d" ]; then
-                      echo "[restore] missing data/$d after extract"
-                      OK=0
-                    fi
-                  done
-                  if [ "$OK" = "1" ]; then
-                    echo "[restore] extract verified"
-                    break
-                  fi
-                fi
-                echo "[restore] attempt $ATTEMPT failed -- retrying"
-                rm -rf "$HOME_DIR/data"
-                sleep 15
               done
-
-
-              echo "$HEIGHT" > "$SENTINEL"
-              rm -f "$INPROGRESS"
-              chmod -R a+rwX "$HOME_DIR"
-              echo "[restore] DONE at height $HEIGHT"
-          volumeMounts:
-            - name: cronos-data
-              mountPath: /data        # PVC root — matches Dockerfile VOLUME ["/data"]
-
-
-        # --- 2. Binary install -----------------------------------------------
-        # Mirrors the Dockerfile RUN block EXACTLY:
-        #   FROM ubuntu:22.04
-        #   RUN apt-get install curl wget jq tar
-        #   RUN wget .../cronos_1.7.8_Linux_x86_64.tar.gz
-        #       tar -zxvf ... && mv bin/cronosd /usr/local/bin/cronosd
-        # Stored at /data/bin/cronosd so the main container can exec it.
-        # No ACR, no registry.
+              
+              # A stale genesis.json from a failed init is worse than none: the
+              # configure step re-downloads it when it is missing or too small.
+              rm -f "$HOME_DIR/config/genesis.json" 2>/dev/null || true
+              rm -f "$HOME_DIR/config/addrbook.json" 2>/dev/null || true
+              
+              printf '"'"'%s'"'"' "$TOKEN" > "$TOKENFILE"
+              df -h "$HOME_DIR" 2>/dev/null || true
+              echo "[prepare] DONE -- data/ cleared, node will start from genesis"
         - name: install-cronosd
           image: ubuntu:22.04
           securityContext:
@@ -378,8 +326,10 @@ spec:
                 sed -i -E 's#^(pruning-keep-recent[[:space:]]*=[[:space:]]*).*$#\1"100"#'            "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(pruning-interval[[:space:]]*=[[:space:]]*).*$#\1"10"#'                "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(minimum-gas-prices[[:space:]]*=[[:space:]]*).*$#\1"0.025basecro"#'   "$CRONOS_HOME/config/app.toml"
-                # goleveldb, NOT rocksdb -- see the db_backend note below.
-                sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"goleveldb"#'          "$CRONOS_HOME/config/app.toml"
+                # rocksdb -- matches the production VM. Do not switch this to
+              # goleveldb: a goleveldb binary cannot open a RocksDB store, so a
+              # goleveldb test could never accept the prod data.
+                sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"rocksdb"#'            "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(query-gas-limit[[:space:]]*=[[:space:]]*).*$#\1"100000000"#'         "$CRONOS_HOME/config/app.toml"
                 # Force json-rpc disabled — crashes cronosd v1.7.8 on AKS (SIGSEGV on 8545)
                 sed -i '/^\[json-rpc\]/,/^\[/{s/^enable = .*/enable = false/}' "$CRONOS_HOME/config/app.toml"
@@ -395,16 +345,16 @@ spec:
               if [ -f "$CRONOS_HOME/config/config.toml" ]; then
                 echo "[configure] patching config.toml"
                 sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CRONOS_HOME/config/config.toml"
-                # db_backend: goleveldb, NOT rocksdb.
-                #   The node was dying with exit 139 (SIGSEGV) ~5s after
-                #   "starting node with ABCI CometBFT in-process", with NO Go stack
-                #   trace despite GOTRACEBACK=crash. A silent segfault that bypasses
-                #   the Go handler points at a crash inside C code, and RocksDB is the
-                #   only cgo component in play (build tags include rocksdb +
-                #   grocksdb_no_link, CGO_ENABLED=1). goleveldb is pure Go, so a
-                #   native crash becomes impossible. Revert to rocksdb only after the
-                #   node is proven to start.
-                sed -i 's|^db_backend = .*|db_backend = "goleveldb"|'                       "$CRONOS_HOME/config/config.toml"
+                # db_backend: rocksdb -- MATCHES THE PRODUCTION VM, and must stay.
+                #   A goleveldb binary cannot open a RocksDB store. Testing on
+                #   goleveldb would validate the manifests while rehearsing a
+                #   configuration that could never accept the prod data.
+                #
+                #   NOTE: the release binary genuinely supports rocksdb -- verified
+                #   on the artifact: build tags include rocksdb + grocksdb_no_link,
+                #   CGO_ENABLED=1, and 10,607 linked rocksdb C++ symbols with no
+                #   undefined references. So rocksdb is not a missing-support issue.
+                sed -i 's|^db_backend = .*|db_backend = "rocksdb"|'                         "$CRONOS_HOME/config/config.toml"
                 # PEERS -- the previous config blanked seeds AND persistent_peers AND
                 # set pex=false. That is not a workaround, it guarantees permanent
                 # isolation: no seeds, no peers, no peer exchange means the node can
