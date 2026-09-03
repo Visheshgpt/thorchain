@@ -1,55 +1,47 @@
 # node_cronos — AKS Manifests
 
-
 | Field | Value |
 |---|---|
-| **Blockchain** | Cronos Mainnet (`cronosmainnet_25-1`) |
-| **Node type** | Archive node (`pruning = "nothing"`, `app-db-backend = "rocksdb"`) |
-| **Daemon** | `cronosd` **v1.7.8** — latest upstream release (Jun 2026) |
-| **Container image** | `ubuntu:22.04` + binary on PVC — no ACR, no registry |
-| **Namespace** | `cronos` |
-| **Node folder** | `blockchains/cronos/aks/` |
-| **Volume mount** | `/data` → CRONOS_HOME `/data/.cronos` |
-| **Storage** | `5000Gi` Premium_LRS · auto-expands to `8000Gi` via pvc-watcher |
+| **Blockchain** | Cronos EVM — `cronosmainnet_25-1` |
+| **Daemon** | `cronosd` **v1.7.8** (release binary on `ubuntu:22.04`) |
+| **DB backend** | **`rocksdb`** — matches the production VM |
+| **Bootstrap** | Cronos native `rocksdb-pruned` snapshot (~22 GB) |
+| **Namespace** | `cronos` · pod `node-cronos-0` · container `cronosd` |
+| **Data mount** | `/data` → `CRONOS_HOME=/data/.cronos` |
+| **Storage** | `256Gi` StandardSSD_LRS · `reclaimPolicy: Delete` |
 
-
-> **Why not `cronos-archive:v1.7.8`?**
-> Local VM build tag — not pullable in AKS. The `install-cronosd` init container replicates
-> the VM Dockerfile exactly (`ubuntu:22.04` + `apt-get` + `wget` binary from GitHub Releases).
-> No ACR required.
-
-
-> ⚠️  **Before first deploy**: replace `SHA=TODO` in `03-node_cronos_statefulset.yaml`
-> with the actual checksum from the v1.7.8 release `checksums.txt`.
-
+> **`reclaimPolicy: Delete` is TEST-ONLY.** Deleting the PVC destroys the disk with it.
+> Switch back to `Retain` before this ever holds migrated prod data.
 
 ## Apply Order
 
-
 ```bash
-kubectl apply -f 00-node_cronos_namespace.yaml
-kubectl apply -f 01-node_cronos_storageclass.yaml
-kubectl apply -f 02-node_cronos_pvc.yaml
-kubectl apply -f 03-node_cronos_statefulset.yaml
-kubectl apply -f 04-node_cronos_service.yaml
+kubectl apply -f 00-namespace.yaml
+kubectl apply -f 01-storageclass.yaml
+kubectl apply -f 02-pvc.yaml
+kubectl apply -f 03-statefulset.yaml
+kubectl apply -f 04-service.yaml
 ```
 
+Three init containers run first: `restore-snapshot` (~22 GB, 20–25 min) →
+`install-cronosd` → `configure`.
 
-First boot: 3 init containers → `restore-snapshot` (adopts migrated data) →
-`install-cronosd` (mirrors Dockerfile) → `configure` (mirrors entrypoint.sh).
+> **A StatefulSet will not roll a pod that is not Ready.** During startup `kubectl apply`
+> silently does nothing — always follow it with `kubectl delete pod node-cronos-0 -n cronos`.
 
+## Switching DB backend
 
-## Services
+`DB_BACKEND` drives both the snapshot source and the config, so they cannot diverge:
 
+```bash
+kubectl set env statefulset/node-cronos -n cronos -c restore-snapshot DB_BACKEND=goleveldb RESET_DATA=switch-1
+kubectl set env statefulset/node-cronos -n cronos -c configure DB_BACKEND=goleveldb
+kubectl delete pod node-cronos-0 -n cronos
+```
 
-| Service | Type | Listener → Container |
+| value | snapshot | size |
 |---|---|---|
-| `node-cronos` | Headless ClusterIP | 26656, 26657, 1317, 9090, 8545, 8546, 26660 |
-| `node-cronos-lb` | Internal LB | 5332 → 26656 (P2P) |
-| `node-cronos-rpc-lb` | Internal LB | 2332→26657, 4332→1317, 8555→8545, 9090→9090, 8546→8546 |
+| `rocksdb` | Cronos native `rocksdb-pruned` | ~22 GB |
+| `goleveldb` | PublicNode `cronos-pruned` | ~20 GB |
 
-
-See [full-doc.md](./full-doc.md) for data migration, verification commands, and pvc-watcher config.
-
-
-
+See [fulldoc.md](./fulldoc.md) for verification, RPC commands, and the sync proof.
