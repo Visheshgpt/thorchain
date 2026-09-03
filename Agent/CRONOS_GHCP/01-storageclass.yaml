@@ -7,7 +7,21 @@ metadata:
     node: node_cronos               # Node identifier for label selectors
     managed-by: manifest-generator  # Tracks origin of this resource
 provisioner: disk.csi.azure.com     # Azure Disk CSI driver — verified provisioner for AKS
-reclaimPolicy: Retain               # RETAIN — blockchain node data is irreplaceable; NEVER use Delete
+# Delete -- TEST CLUSTER ONLY.
+#
+# Deleting the PVC now destroys the Azure disk with it. That is the
+# behaviour you want while iterating: no Released PVs to chase, no
+# orphaned disks quietly billing. The data here is a public snapshot
+# that re-downloads in ~11 minutes, so it is cheap to lose.
+#
+# >> SWITCH BACK TO Retain BEFORE PRODUCTION, and certainly before
+#    adopting migrated prod data. With Delete, one `kubectl delete pvc`
+#    is unrecoverable -- there is no Released PV to re-bind. <<
+#
+# reclaimPolicy is IMMUTABLE on a StorageClass (the API server forbids
+# updates to it), so changing this needs the SC deleted and recreated.
+# An existing PV's policy CAN be patched in place, though -- see runbook.
+reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer  # Provision disk in same AZ as the scheduled pod
 allowVolumeExpansion: true          # Required for pvc-watcher auto-expansion to work
 parameters:
