@@ -13,7 +13,20 @@ spec:
   storageClassName: node-cronos-storage  # Must match StorageClass in 01-node_cronos_storageclass.yaml
   resources:
     requests:
-      storage: 5000Gi              # Cronos archive node: ~4.5T (RocksDB) / ~6T (LevelDB)
+      # 256Gi, NOT 5000Gi.
+      #
+      #   leveldb-pruned snapshot   24.8 GB compressed
+      #   extracted                 ~35 GB
+      #   + 12 months growth        ~95 GB
+      #
+      # 5000Gi was sized for an ARCHIVE node (pruning = "nothing"). This is a
+      # PRUNED node, so ~98% of that disk was waste -- and on Premium_LRS,
+      # 5000Gi bills at the P60 (8 TiB) tier.
+      #
+      # On StandardSSD_LRS, IOPS are FLAT (~500) regardless of size, so 256Gi
+              # is a pure capacity decision. pvc-watcher expands it if needed.
+      # Azure disks can be grown but NEVER shrunk, so start small on purpose.
+      storage: 256Gi
                                    # Source: https://docs.cronos.com/for-node-hosts/running-nodes/cronos-mainnet
                                    # Start at 5000Gi; pvc-watcher auto-expands up to 8000Gi
 

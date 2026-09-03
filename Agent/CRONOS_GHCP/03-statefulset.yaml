@@ -95,7 +95,12 @@ spec:
             # FORCE_RESTORE — wipe data and re-pull snapshot.
             # Token-based: set to a new string to trigger once. Leaving it
             # set after it fires is harmless (token is recorded on the PVC).
-            - { name: RESET_DATA,      value: "native-snapshot-1" }
+            - { name: RESET_DATA,      value: "rocksdb-try-1" }
+            # rocksdb | goleveldb. Drives BOTH the snapshot source above
+            # and db_backend/app-db-backend in the configure step -- they
+            # must never diverge. Changing this needs a new RESET_DATA too,
+            # since the on-disk format changes.
+            - { name: DB_BACKEND,    value: "rocksdb" }
             # ADOPT_EXISTING — treat data already on the PVC as legitimate
             # (migrated prod data). Set "true" after copying VM data to PVC.
             - { name: ADOPT_EXISTING, value: "false" }
@@ -113,8 +118,6 @@ spec:
               SENTINEL="$HOME_DIR/.snapshot-restored"
               INPROGRESS="$HOME_DIR/.restore-in-progress"
               TOKENFILE="$HOME_DIR/.reset-token"
-              INDEX="https://snapshot.cronos.com/"
-              BASE="https://snapshot-download.cronos.com/cronos/mainnet-snapshot/leveldb/pruned"
               
               # ---------------------------------------------------------------
               # NATIVE SNAPSHOT, not state sync.
@@ -173,15 +176,47 @@ spec:
               echo "[restore] installing curl + lz4"
               apk add --no-cache curl ca-certificates lz4 tar >/dev/null
               
-              echo "[restore] discovering newest leveldb-pruned snapshot"
-              FILE=$(curl -fsSL --retry 5 --max-time 120 "$INDEX" \
-                     | grep -oE 'cronosmainnet_25-1_leveldb-pruned-[0-9]+\.tar\.lz4' \
-                     | sort -r | head -1)
+              # SNAPSHOT SOURCE follows DB_BACKEND -- they MUST match. A rocksdb
+              # binary cannot open a goleveldb store or vice versa.
+              #
+              #   rocksdb    Cronos native rocksdb-pruned, ~23.7 GB.
+              #              Matches the PRODUCTION VM backend.
+              #              WARNING: the release binary is built with
+              #              grocksdb_no_link and SEGFAULTS on rocksdb in this
+              #              environment -- measured, clean data dir, exit 139.
+              #              A restored store may behave differently (open vs
+              #              create), which is what this switch lets you test.
+              #              If it segfaults, flip DB_BACKEND to goleveldb.
+              #
+              #   goleveldb  PublicNode cronos-pruned, ~19.9 GB and freshest.
+              #              Known-good with this binary.
+              #              'cronos-pruned-' deliberately excludes
+              #              'cronos-pos-pruned-' -- that is a DIFFERENT CHAIN.
+              case "${DB_BACKEND:-rocksdb}" in
+                rocksdb)
+                  INDEX="https://snapshot.cronos.com/"
+                  BASE="https://snapshot-download.cronos.com/cronos/mainnet-snapshot/rocksdb/pruned"
+                  echo "[restore] backend=rocksdb -- discovering Cronos native rocksdb-pruned"
+                  FILE=$(curl -fsSL --retry 5 --max-time 120 "$INDEX" \
+                         | grep -oE 'cronosmainnet_25-1_rocksdb-pruned-[0-9]+\.tar\.lz4' \
+                         | sort -r | head -1)
+                  ;;
+                goleveldb)
+                  INDEX="https://www.publicnode.com/snapshots"
+                  BASE="https://snapshots.publicnode.com"
+                  echo "[restore] backend=goleveldb -- discovering PublicNode cronos-pruned"
+                  FILE=$(curl -fsSL --retry 5 --max-time 120 "$INDEX" \
+                         | grep -oE 'cronos-pruned-[0-9]+-[0-9]+\.tar\.lz4' \
+                         | sort -t- -k3 -n -r | head -1)
+                  ;;
+                *)
+                  echo "[restore] FATAL: DB_BACKEND must be rocksdb or goleveldb"; exit 1 ;;
+              esac
               if [ -z "$FILE" ]; then
                 echo "[restore] FATAL: no leveldb-pruned snapshot found at $INDEX"
                 exit 1
               fi
-              echo "[restore] selected $FILE (~29 GB)"
+              echo "[restore] selected $FILE (~20 GB)"
               
               touch "$INPROGRESS"
               ATTEMPT=0
@@ -330,7 +365,8 @@ spec:
           env:
             - { name: MONIKER,       value: "pegasus-node" }          # From docker-compose environment
             - { name: CRONOS_HOME,   value: "/data/.cronos" }         # From entrypoint.sh
-            - { name: CHAIN_ID,      value: "cronosmainnet_25-1" }    # From entrypoint.sh
+            - { name: CHAIN_ID,      value: "cronosmainnet_25-1" }
+            - { name: DB_BACKEND,    value: "rocksdb" }    # From entrypoint.sh
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -396,7 +432,7 @@ spec:
                 sed -i -E 's#^(minimum-gas-prices[[:space:]]*=[[:space:]]*).*$#\1"46000000000000basecro"#'   "$CRONOS_HOME/config/app.toml"
                 # goleveldb, matching db_backend below. See the note there: rocksdb
                 # SEGFAULTS with this release binary.
-                sed -i -E 's#^(app-db-backend[[:space:]]*=[[:space:]]*).*$#\1"goleveldb"#'          "$CRONOS_HOME/config/app.toml"
+                sed -i -E "s#^(app-db-backend[[:space:]]*=[[:space:]]*).*\$#\1\"${DB_BACKEND:-rocksdb}\"#"          "$CRONOS_HOME/config/app.toml"
                 sed -i -E 's#^(query-gas-limit[[:space:]]*=[[:space:]]*).*$#\1"100000000"#'         "$CRONOS_HOME/config/app.toml"
                 # Force json-rpc disabled — crashes cronosd v1.7.8 on AKS (SIGSEGV on 8545)
                 sed -i '/^\[json-rpc\]/,/^\[/{s/^enable = .*/enable = false/}' "$CRONOS_HOME/config/app.toml"
@@ -423,7 +459,7 @@ spec:
                 # image from dockerfile-rocksdb) runs rocksdb and this does not.
                 # MIGRATION CONSEQUENCE: prod data is RocksDB and cannot be adopted
                 # by this node. That needs a self-built rocksdb image, as the VM has.
-                sed -i 's|^db_backend = .*|db_backend = "goleveldb"|'                       "$CRONOS_HOME/config/config.toml"
+                sed -i "s|^db_backend = .*|db_backend = \"${DB_BACKEND:-rocksdb}\"|"                       "$CRONOS_HOME/config/config.toml"
                 # PEERS -- the previous config blanked seeds AND persistent_peers AND
                 # set pex=false. That is not a workaround, it guarantees permanent
                 # isolation: no seeds, no peers, no peer exchange means the node can

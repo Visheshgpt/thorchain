@@ -11,7 +11,16 @@ reclaimPolicy: Retain               # RETAIN — blockchain node data is irrepla
 volumeBindingMode: WaitForFirstConsumer  # Provision disk in same AZ as the scheduled pod
 allowVolumeExpansion: true          # Required for pvc-watcher auto-expansion to work
 parameters:
-  skuName: Premium_LRS              # Premium SSD — archive node requires sustained high IOPS
+  # StandardSSD_LRS -- matches node-cronospos-storage and node-kava-storage.
+  #
+  # Was Premium_LRS, sized for an ARCHIVE node. This is a PRUNED node
+  # restoring a ~20-24 GB snapshot, so the Premium IOPS curve buys nothing
+  # and costs roughly double.
+  #
+  # StorageClass parameters are IMMUTABLE: `kubectl apply` on a changed
+  # skuName silently does NOTHING. Changing it requires deleting the
+  # StorageClass and the PVC/PV bound to it. See the runbook order.
+  skuName: StandardSSD_LRS
                                     # RocksDB random reads on 4.5–6T dataset need P_LRS throughput
 
 
