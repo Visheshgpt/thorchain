@@ -1,0 +1,11 @@
+apiVersion: v1                      # Stable core API version for Namespace resources
+kind: Namespace
+metadata:
+  name: terra2                      # Namespace name — derived from node name (Terra2.0 → terra2)
+  labels:
+    blockchain: terra2              # Identifies the blockchain protocol running in this namespace
+    node: node_terra2               # Unique node identifier used for label selectors across all resources
+    managed-by: manifest-generator  # Tracks that this resource was created by the AKS Manifest Generator
+
+
+

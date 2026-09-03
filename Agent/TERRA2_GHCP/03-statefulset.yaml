@@ -1,0 +1,885 @@
+# =============================================================================
+# 03-node_terra2_statefulset.yaml — Terra 2.0 (phoenix-1) archive node
+#
+# ROOT-CAUSE FIX (v3) — the image was dead AND the wrong consensus version
+# -----------------------------------------------------------------------------
+#   v1 declared `terraformlabs/cosmovisor:terra-mainnet-edge` — a local build
+#   tag from the source VM; the org does not exist on Docker Hub, so every AKS
+#   pull was ImagePullBackOff.
+#
+#   v2 replaced it with `ghcr.io/terra-money/core:2.12.4`. That image pulls,
+#   but it CANNOT sync phoenix-1:
+#     - terra-money/core is ABANDONED. main was frozen 2024-03-07 and its tags
+#       stop at 2.12.4; its upgrade handlers only reach v2.10.
+#     - Terra 2 development moved to github.com/phoenix-directive/core, which
+#       the Cosmos chain-registry lists as phoenix-1's `codebase.git_repo`.
+#     - Live phoenix-1 reports app version **v2.20.0** via /abci_info. A 2.12.4
+#       binary restored onto a tip snapshot halts immediately — eight releases
+#       of upgrade handlers are missing.
+#
+#   Fix (v3): phoenix-directive publishes NO container image, so init 1
+#   downloads the official release binary onto the PVC and verifies it:
+#     terra_2.20.0_Linux_x86_64.tar.gz
+#     sha256 1fcb6c616e1cae83ad9083b904ac27b0b1290c1b4352f45295915a610143f563
+#   The binary is fully static (no PT_INTERP; wasmvm linked in), so the
+#   containers run plain alpine:3.19 and exec it from /app/bin/terrad.
+#
+#   Because Alpine has no CMD of its own, the main container now declares
+#   `command`/`args` EXPLICITLY. v2 relied on the old image's
+#   CMD ["terrad","--home","/app","start"]; that inheritance is gone.
+#
+# GENESIS — deliberately the 8 KB stub, NOT the 747 MB official file
+# -----------------------------------------------------------------------------
+#   phoenix-1's original genesis is 747,446,522 bytes (genesis_time
+#   2022-05-28). The network does NOT run it. Both Polkachu and publicnode
+#   serve a 7,988-byte genesis (genesis_time 2023-08-10) — /genesis_chunked
+#   returns total=1 on both, so every operating node uses the stub.
+#
+#   This matters because CometBFT 0.38 stores the genesis hash in state.db and
+#   compares it on every subsequent start. A snapshot restored from Polkachu
+#   carries the STUB's hash, so installing the "official" 747 MB genesis would
+#   fail with `genesis doc hash in db does not match loaded genesis doc`.
+#   Keep the stub. It is the correct file for this snapshot.
+#
+# CHAIN UPGRADES ARE MANUAL
+# -----------------------------------------------------------------------------
+#   Cosmovisor is not used. To roll a new release, bump VER + SHA in the
+#   install-terrad init container and restart the pod; the version sentinel
+#   forces a reinstall whenever VER changes.
+#
+# INIT CONTAINER CHAIN — snapshot restore approach
+# -----------------------------------------------------------------------------
+#   1. restore-snapshot (alpine:3.19, root, drop:ALL) — downloads the current
+#      Polkachu Terra snapshot (~28 GB compressed), streams through lz4 + tar
+#      directly into /app. Runs FIRST on a fresh volume so no UID-1000 files
+#      exist yet — root doesn't need CAP_DAC_OVERRIDE (that was the trap that
+#      broke the earlier reversed-order attempt). At the end, chmod -R a+rwX
+#      makes everything readable/writable by the UID 1000 init containers.
+#      Idempotent via .snapshot-restored sentinel.
+#   3. terrad-init      (alpine:3.19) — `/app/bin/terrad init` to
+#      generate config.toml, app.toml, node_key.json, priv_validator_key.json.
+#      Snapshot does NOT include these — Polkachu only ships /data DBs.
+#      Also writes /app/data/priv_validator_state.json (the snapshot omits it).
+#   3. install-genesis  (curlimages/curl:8.10.1)       — downloads the phoenix-1
+#      genesis stub from Polkachu's mirror (~17 KB). CometBFT reads genesis
+#      at boot to pin chain_id + consensus params.
+#   4. configure        (curlimages/curl:8.10.1)       — patches config.toml
+#      (persistent_peers, seeds, RPC laddr, no external_address) and app.toml
+#      (pruning="nothing", min-gas-prices, API+gRPC listeners). No state-sync
+#      config — the snapshot is the state source.
+#
+# WHY SNAPSHOT RESTORE, NOT STATE-SYNC?
+#   State-sync depends on live P2P snapshot providers advertising snapshots
+#   within CometBFT's 168h trust window. Verified empirically (2026-09): the
+#   Terra 2.0 network has NO active state-sync provider — every discovered
+#   snapshot was at height 14M (~8 M blocks stale, outside the trust window).
+#   Polkachu themselves point Terra operators to their tarball, not their
+#   state-sync config. So we mirror that: pull the tarball, restore, done.
+#
+# ARCHIVE vs PRUNED — HONESTY:
+#   The Polkachu snapshot is pruned (pruning-keep-recent=100). This node will
+#   be an archive going forward from the snapshot height, but `/block?height=N`
+#   for N below that height will return "block not available". For true
+#   archive back to block 1, migrate the source VM's /1Disk116/node-terra/data
+#   per full-doc §2.3 (set ADOPT_EXISTING=true so restore-snapshot skips).
+#
+# LOGIC FIXES vs compose (preserved from v1)
+# -----------------------------------------------------------------------------
+#   - terminationGracePeriodSeconds: 300  (compose stop_grace_period: 5m)
+#   - HTTP /health probes on 26657 (not tcpSocket on 26656 — that stays green
+#     through a total consensus freeze because the P2P listener never closes)
+#   - HEIGHT-PROGRESS liveness (restart only on genuine stall, not just behind)
+#   - fsGroupChangePolicy: OnRootMismatch  (avoids re-chowning millions of
+#     archive files on every restart)
+#   - ulimits.nofile: 65535 in compose is NOT PORTABLE to pod spec; controlled
+#     by AKS node kernel (kubelet). Terra rarely hits the fd ceiling.
+# =============================================================================
+apiVersion: apps/v1                 # Stable API version for StatefulSet resources
+kind: StatefulSet
+metadata:
+  name: node-terra2                 # StatefulSet name — pod will be named node-terra2-0
+  namespace: terra2                 # Must match namespace in 00-node_terra2_namespace.yaml
+  labels:
+    blockchain: terra2              # Protocol identifier
+    node: node_terra2               # Node identifier used by all services as selector
+    managed-by: manifest-generator  # Tracks origin of this resource
+spec:
+  serviceName: node-terra2          # Must match the headless Service name in 04-node_terra2_service.yaml
+  replicas: 1                       # Single replica — blockchain nodes do not horizontally scale
+  selector:
+    matchLabels:
+      node: node_terra2             # Must match pod template labels below
+  template:
+    metadata:
+      labels:
+        blockchain: terra2          # Protocol identifier on the pod
+        node: node_terra2           # Used by all three Services as the selector
+    spec:
+      enableServiceLinks: false     # Avoid k8s <SVC>_PORT env vars colliding with cosmos/viper key lookups
+      securityContext:
+        # Pod-level: NOT setting runAsNonRoot here because the `restore-snapshot`
+        # init needs UID 0 to `apk add lz4 tar` (writing to /var/cache/apk in the
+        # image rootfs, which is root-owned — no volume-side permission issue).
+        # Every OTHER container sets runAsNonRoot: true individually, and the
+        # main `terra` container enforces it explicitly.
+        fsGroup: 1000               # Ensures the mounted PVC is writable by the container user (UID 1000)
+        fsGroupChangePolicy: OnRootMismatch  # Avoids re-chowning archive data (~millions of files) on every restart
+      terminationGracePeriodSeconds: 300  # Mapped from compose `stop_grace_period: 5m` — terrad must flush cleanly
+
+
+      initContainers:
+
+
+        # --- 1. Restore Polkachu snapshot into /app -----------------------
+        # Downloads the current Polkachu Terra snapshot (dynamic filename —
+        # rotates as new heights land) to a LOCAL FILE on the PVC, verifies
+        # its byte size against the server's Content-Length, THEN extracts
+        # from that verified static file. Tarball is deleted immediately
+        # after successful extraction to reclaim space.
+        #
+        # WHY DOWNLOAD-THEN-EXTRACT (NOT A LIVE STREAMING PIPE)?
+        #   An earlier version piped `curl | lz4 -d | tar -x` directly from
+        #   the network. That pattern silently corrupted on a real run:
+        #   POSIX sh (Alpine's /bin/sh, no pipefail) only checks tar's exit
+        #   status, never curl's. When the single ~28 GB download's TCP
+        #   connection dropped partway through (curl's --retry, with no
+        #   -C - resume, opens a NEW connection and restarts from byte 0
+        #   into the SAME live pipe tar is reading), tar hit an unexpected
+        #   EOF/boundary and exited 0 anyway, having extracted only a
+        #   PARTIAL store. Our own post-extract check only verified that
+        #   blockstore.db / state.db / application.db existed as
+        #   DIRECTORIES (true even for a partial extract), so this
+        #   corruption went undetected until the main `terra` container
+        #   crashed with: "failed to load latest version: failed to load
+        #   store: no versions found while trying to load <height>".
+        #   Verified root cause: restore-snapshot showed Restart Count 0 /
+        #   Exit 0 (looked fine), while terra crashed identically on 6/6
+        #   restarts with the same height-specific IAVL error — consistent
+        #   with a deterministically incomplete store, not a transient bug.
+        #   Downloading to a local file with `-C -` resume + explicit byte-
+        #   count verification eliminates this failure mode: extraction
+        #   only ever runs against a file already proven byte-complete.
+        #
+        # PEAK DISK USAGE: ~28 GB tarball coexists with the extracted data
+        # until the tarball is deleted post-extract. The exact extracted
+        # size isn't knowable ahead of time (Polkachu's snapshot rotates
+        # daily), so the PVC is sized with comfortable headroom over the
+        # tarball size — see 02-node_terra2_pvc.yaml sizing note.
+        #
+        # RUNS AS ROOT (drop:ALL, add DAC_OVERRIDE/FOWNER/CHOWN only) —
+        # required for `apk add lz4 tar` and to extract some finalized
+        # LevelDB .ldb files that ship with restrictive archived
+        # permissions (see securityContext comment below). At the end,
+        # chmod -R a+rwX makes everything readable/writable by the
+        # UID-1000 init containers that come next (matches Cronos POS's
+        # exact pattern).
+        #
+        # IDEMPOTENCY:
+        #   - .snapshot-restored sentinel (stores the height) — skip
+        #   - .restore-in-progress sentinel — protects against a partial
+        #     extract from a previous crash
+        #   - ADOPT_EXISTING=true env: keep pre-existing /app/data (the
+        #     switch for the VM data migration in full-doc §2.3)
+        #   - FORCE_RESTORE=<new-value> env: wipe and re-pull. Token-based,
+        #     so leaving it set does NOT loop.
+        - name: restore-snapshot
+          image: alpine:3.19
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            # NOTE: UID 0 alone does NOT bypass Unix permission checks —
+            # that specific power comes from CAP_DAC_OVERRIDE, which
+            # `drop: ["ALL"]` removes. Without it, "root" is checked
+            # against normal file mode bits just like any other user.
+            # The Polkachu tarball ships some finalized LevelDB .ldb
+            # files with restrictive archived permissions (commonly
+            # 0444, sometimes a non-zero archived owner); extracting
+            # those without DAC_OVERRIDE produces exactly the observed
+            # "tar: ...: Cannot open: Permission denied" on a SUBSET of
+            # files (the ones with restrictive archived modes), not all.
+            # FOWNER + CHOWN are added so the final `chmod -R a+rwX`
+            # also succeeds unconditionally regardless of archived
+            # ownership. Everything else stays dropped — no NET_ADMIN,
+            # SYS_ADMIN, SYS_PTRACE, etc.
+            capabilities: { drop: ["ALL"], add: ["DAC_OVERRIDE", "FOWNER", "CHOWN"] }
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              memory: "1Gi"
+          env:
+            - { name: FORCE_RESTORE,  value: "" }
+            - { name: ADOPT_EXISTING, value: "false" }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/app
+              SENTINEL="$HOME_DIR/.snapshot-restored"
+              INPROGRESS="$HOME_DIR/.restore-in-progress"
+              TOKENFILE="$HOME_DIR/.force-restore-token"
+              SNAP_PAGE="https://polkachu.com/tendermint_snapshots/terra"
+              SNAP_BASE="https://snapshots.polkachu.com/snapshots/terra"
+
+
+              # -- forced re-restore, one shot per distinct token -----------
+              FORCE="${FORCE_RESTORE:-}"
+              SEEN="$(cat "$TOKENFILE" 2>/dev/null || true)"
+              if [ -n "$FORCE" ] && [ "$FORCE" != "$SEEN" ]; then
+                echo "[restore] FORCE_RESTORE token '$FORCE' is new -- wiping and re-pulling"
+                rm -rf "$HOME_DIR/data"
+                rm -f "$SENTINEL"
+                mkdir -p "$HOME_DIR"
+                printf '%s' "$FORCE" > "$TOKENFILE"
+              elif [ -n "$FORCE" ]; then
+                echo "[restore] FORCE_RESTORE token '$FORCE' already honoured -- ignoring"
+              fi
+
+
+              if [ -f "$SENTINEL" ]; then
+                echo "[restore] already restored at height $(cat "$SENTINEL")"
+                exit 0
+              fi
+
+
+              # Protect any pre-existing data ? do NOT delete data we did
+              # not put there. INPROGRESS distinguishes our own wreckage
+              # from someone else's data.
+              if [ -d "$HOME_DIR/data" ] && [ -n "$(ls -A "$HOME_DIR/data" 2>/dev/null || true)" ]; then
+                if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
+                  echo "[restore] ADOPT_EXISTING=true -- adopting the data already on this volume"
+                  echo "adopted" > "$SENTINEL"
+                  rm -f "$INPROGRESS"
+                  exit 0
+                fi
+                if [ -f "$INPROGRESS" ]; then
+                  echo "[restore] partial extract from a previous attempt -- clearing"
+                  rm -rf "$HOME_DIR/data"
+                else
+                  echo "[restore] FATAL: $HOME_DIR/data is populated but has no sentinel."
+                  echo "[restore] Refusing to overwrite data this script did not create."
+                  echo "[restore] Good data?  set ADOPT_EXISTING=true"
+                  echo "[restore] Junk data?  set FORCE_RESTORE to any new value"
+                  ls -la "$HOME_DIR/data" | head -20
+                  exit 1
+                fi
+              fi
+
+
+              echo "[restore] installing curl + lz4 + tar"
+              apk add --no-cache curl ca-certificates lz4 tar >/dev/null
+
+
+              # Polkachu keeps ONE snapshot and rotates the filename daily.
+              # Scrape the page rather than hardcoding ? a hardcoded URL
+              # 404s within 24 h.
+              echo "[restore] discovering current snapshot filename"
+              FILE=$(curl -fsSL --retry 5 --max-time 60 -A "Mozilla/5.0" "$SNAP_PAGE"                      | grep -oE 'terra_[0-9]+\.tar\.lz4' | head -1)
+              if [ -z "$FILE" ]; then
+                echo "[restore] FATAL: could not discover a snapshot filename from $SNAP_PAGE"
+                exit 1
+              fi
+              HEIGHT=$(echo "$FILE" | sed -n 's/terra_\([0-9]*\)\.tar\.lz4/\1/p')
+              echo "[restore] selected $FILE (height $HEIGHT, ~28 GB compressed)"
+
+
+              mkdir -p "$HOME_DIR"
+              touch "$INPROGRESS"
+              TARBALL="$HOME_DIR/.snapshot-download.tar.lz4"
+              URL="$SNAP_BASE/$FILE"
+
+
+              # ---- Determine expected size via HEAD -------------------------
+              # This is the reference we verify the download against BEFORE
+              # ever touching tar. Root cause of the earlier corruption: a
+              # live `curl | lz4 | tar` pipe has no way to detect a mid-
+              # transfer network drop, because POSIX sh (no pipefail) only
+              # checks tar's exit status, and curl's --retry (without -C -)
+              # restarts a FRESH request into the SAME pipe on any drop,
+              # silently corrupting the stream tar is still reading. tar
+              # then hits EOF early, exits 0, and only a PARTIAL store gets
+              # written — exactly what produced "no versions found while
+              # trying to load 22654054" in the main container.
+              echo "[restore] checking expected download size via HEAD"
+              EXPECTED_SIZE=$(curl -fsSL --connect-timeout 15 --max-time 30 -A "Mozilla/5.0" -I "$URL" \
+                              | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}' | tail -1)
+              if [ -z "$EXPECTED_SIZE" ]; then
+                echo "[restore] FATAL: could not determine expected size via HEAD $URL"
+                exit 1
+              fi
+              echo "[restore] expected size: $EXPECTED_SIZE bytes"
+
+
+              # ---- Download to a LOCAL FILE with resume, verified by byte count ----
+              # -C - resumes from wherever $TARBALL currently is (0 on first
+              # attempt). This is the fix: if a connection drops partway,
+              # the NEXT attempt continues from the last confirmed byte
+              # instead of restarting a fresh stream into a live tar pipe.
+              ATTEMPT=0
+              while : ; do
+                ATTEMPT=$((ATTEMPT + 1))
+                if [ "$ATTEMPT" -gt 8 ]; then
+                  echo "[restore] FATAL: download did not complete after 8 attempts"
+                  exit 1
+                fi
+                echo "[restore] download attempt $ATTEMPT (resumable, typical 20-60 min for 28 GB)"
+                curl -fL -C - --retry 3 --retry-delay 10 --connect-timeout 15 -A "Mozilla/5.0" \
+                     -o "$TARBALL" "$URL" || true
+                # stat -c%s reads the size from filesystem metadata (instant,
+                # O(1)) — NOT `wc -c`, which on this file (~29 GB) forces a
+                # full read of the file's CONTENT just to count bytes. On a
+                # Standard SSD-tier disk (~60 MB/s baseline throughput) that
+                # full re-read alone would take ~8 minutes and look exactly
+                # like another silent stall right after a perfectly good
+                # download finished.
+                ACTUAL_SIZE=$(stat -c%s "$TARBALL" 2>/dev/null || echo 0)
+                echo "[restore] downloaded so far: $ACTUAL_SIZE / $EXPECTED_SIZE bytes"
+                if [ "$ACTUAL_SIZE" = "$EXPECTED_SIZE" ]; then
+                  echo "[restore] download complete and byte-verified"
+                  break
+                fi
+                echo "[restore] incomplete download after attempt $ATTEMPT -- retrying (resumed) in 15s"
+                sleep 15
+              done
+
+
+              # ---- Extract from the verified LOCAL file, not the network ----
+              # The source is now a static, complete file — no network
+              # flakiness can corrupt this step. --no-same-owner avoids
+              # chown-per-file attempts (ownership is irrelevant, we run
+              # as UID 0 regardless). --no-same-permissions prevents some
+              # finalized LevelDB .ldb files with restrictive archived
+              # modes (e.g. 0444) from becoming unwritable mid-extraction.
+              echo "[restore] extracting verified tarball into $HOME_DIR"
+              if ! lz4 -dc "$TARBALL" | tar -x --no-same-owner --no-same-permissions -C "$HOME_DIR"; then
+                echo "[restore] FATAL: tar extraction failed even though the source tarball was byte-verified complete"
+                exit 1
+              fi
+
+
+              OK=1
+              for d in blockstore.db state.db application.db; do
+                if [ ! -d "$HOME_DIR/data/$d" ]; then
+                  echo "[restore] missing data/$d after extract"
+                  OK=0
+                fi
+              done
+              if [ "$OK" != "1" ]; then
+                echo "[restore] FATAL: extraction completed but expected DB directories are missing"
+                exit 1
+              fi
+              echo "[restore] extract verified (source was byte-confirmed complete before extraction)"
+
+
+              # Reclaim the ~28 GB tarball now that extraction succeeded —
+              # required so the PVC has headroom; see 02-node_terra2_pvc.yaml
+              # sizing note for the peak-usage calculation.
+              rm -f "$TARBALL"
+              echo "[restore] removed tarball, disk space reclaimed"
+
+
+              echo "$HEIGHT" > "$SENTINEL"
+              rm -f "$INPROGRESS"
+              # Extracted as root; UID 1000 containers next need to read
+              # and write. Root can chmod its OWN files without CAP_FOWNER;
+              # runs only inside the restore branch (a restart hits the
+              # sentinel short-circuit above).
+              echo "[restore] chmod -R a+rwX (makes files usable by UID 1000)"
+              chmod -R a+rwX "$HOME_DIR"
+              df -h "$HOME_DIR" || true
+              echo "[restore] DONE at height $HEIGHT"
+          volumeMounts:
+            - name: chain-data
+              mountPath: /app
+
+
+
+
+        # --- 2. /app/bin/terrad init — create baseline config files -----------------
+        # Runs FIRST because `terrad init` UNCONDITIONALLY overwrites
+        # genesis.json with an empty-validator placeholder (standard Cosmos
+        # SDK behaviour — no --skip-genesis flag exists). If this ran AFTER
+        # install-genesis it would nuke the real phoenix-1 genesis and the
+        # main container would crash with "no validators in genesis".
+        #
+        # Creates: config.toml, app.toml, client.toml, node_key.json,
+        #          priv_validator_key.json, priv_validator_state.json,
+        #          genesis.json (PLACEHOLDER — replaced in init 2).
+        # ------------------------------------------------------------------
+        # INIT 1 - install-terrad: fetch the terrad binary the LIVE network runs.
+        #
+        # WHY THIS EXISTS: terra-money/core is abandoned (main frozen 2024-03-07,
+        # tags stop at 2.12.4). Terra 2 development moved to
+        # github.com/phoenix-directive/core, which the Cosmos chain-registry
+        # lists as phoenix-1's git_repo. Live phoenix-1 reports app version
+        # v2.20.0 via /abci_info, so a 2.12.4 node CANNOT follow the chain from
+        # a tip snapshot. phoenix-directive publishes no container image, so the
+        # release binary is downloaded and checksum-verified onto the PVC.
+        #
+        # The binary is fully static (no PT_INTERP, wasmvm linked in), so it
+        # runs unmodified on Alpine/musl.
+        # ------------------------------------------------------------------
+        - name: install-terrad
+          image: curlimages/curl:8.10.1          # Has curl + busybox sha256sum/tar; already used by init 2 and 3
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              set -eu
+              VER=2.20.0
+              SHA=1fcb6c616e1cae83ad9083b904ac27b0b1290c1b4352f45295915a610143f563
+              BIN_DIR=/app/bin
+              TERRAD="$BIN_DIR/terrad"
+              TMP=/app/.terrad-download.tar.gz
+              URL="https://github.com/phoenix-directive/core/releases/download/v${VER}/terra_${VER}_Linux_x86_64.tar.gz"
+
+              mkdir -p "$BIN_DIR"
+
+              # Idempotent: a restart re-runs every init container, so skip the
+              # 36 MB download when this exact version is already on the volume.
+              # Gated on a sentinel we write ourselves rather than on parsing
+              # `terrad version` -- different Cosmos builds print the version
+              # with or without a leading "v", and to stdout or stderr. A
+              # sentinel is exact, so an upgrade (VER change) always reinstalls.
+              STAMP="$BIN_DIR/.terrad-version"
+              if [ -x "$TERRAD" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$VER" ]; then
+                echo "[install-terrad] terrad $VER already installed -- skipping"
+                exit 0
+              fi
+
+              echo "[install-terrad] downloading terrad $VER"
+              rm -f "$TMP"
+              curl -fL --retry 5 --retry-delay 5 --connect-timeout 15 -o "$TMP" "$URL"
+
+              # Verify BEFORE installing. An unverified consensus binary is the
+              # one thing that must never be allowed to run.
+              echo "[install-terrad] verifying sha256"
+              if ! echo "$SHA  $TMP" | sha256sum -c - ; then
+                echo "[install-terrad] FATAL: checksum mismatch -- refusing to install"
+                rm -f "$TMP"
+                exit 1
+              fi
+
+              tar xzf "$TMP" -C "$BIN_DIR" terrad
+              chmod +x "$TERRAD"
+              rm -f "$TMP"
+
+              # Prove the binary actually runs here before stamping it good --
+              # a tarball can be intact yet the binary unusable on this base image.
+              if ! "$TERRAD" version >/dev/null 2>&1; then
+                echo "[install-terrad] FATAL: terrad is installed but will not execute"
+                exit 1
+              fi
+              echo "$VER" > "$STAMP"
+              echo "[install-terrad] installed terrad $VER ($("$TERRAD" version 2>&1 | head -1))"
+          volumeMounts:
+            - name: chain-data
+              mountPath: /app
+        - name: terrad-init
+          image: alpine:3.19                     # terrad v2.20.0 comes from the PVC (init 1)
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+          env:
+            - { name: HOME, value: "/app" }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/app
+              CFG="$HOME_DIR/config"
+
+
+              if [ -f "$CFG/config.toml" ] && [ -f "$CFG/node_key.json" ]; then
+                echo "[terrad-init] baseline config already present — skipping"
+                exit 0
+              fi
+
+
+              echo "[terrad-init] running: /app/bin/terrad init terra-archive-prod --chain-id phoenix-1 --home $HOME_DIR"
+              /app/bin/terrad init "terra-archive-prod" --chain-id "phoenix-1" --home "$HOME_DIR"
+              echo "[terrad-init] DONE — genesis.json is now a placeholder and will be replaced by init 2"
+          volumeMounts:
+            - name: chain-data
+              mountPath: /app
+
+
+        # --- 3. Download the REAL phoenix-1 genesis ------------------------
+        # Runs SECOND, AFTER terrad-init has written the placeholder genesis.
+        # This container overwrites that placeholder with the real network
+        # genesis (validators, gentxs, initial state).
+        #
+        # Uses `curlimages/curl` because the upstream terra image has no
+        # curl or wget. Runs as UID 1000 — never root, never DAC_OVERRIDE.
+        #
+        # SIZE CHECK — critical: the placeholder from `/app/bin/terrad init --chain-id
+        # phoenix-1` ALSO contains the string `"chain_id":"phoenix-1"`, so
+        # chain_id alone is not enough to distinguish placeholder from real.
+        # The real phoenix-1 genesis is ~7988 bytes; the placeholder is
+        # <1KB. Skip download only if BOTH chain_id matches AND size > 5000.
+        - name: install-genesis
+          image: curlimages/curl:8.10.1
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              memory: "256Mi"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              CFG=/app/config
+              GENESIS="$CFG/genesis.json"
+              # Polkachu mirrors the phoenix-1 genesis — verified chain_id: phoenix-1,
+              # initial_height: 1, size ~7988 bytes. Refresh the URL from
+              # https://polkachu.com/networks/terra if the response ever changes shape.
+              GENESIS_URL="https://snapshots.polkachu.com/genesis/terra/genesis.json"
+
+
+              mkdir -p "$CFG"
+
+
+              if [ -s "$GENESIS" ]; then
+                SZ=$(wc -c < "$GENESIS")
+                if grep -q '"chain_id": *"phoenix-1"' "$GENESIS" && [ "$SZ" -gt 5000 ]; then
+                  echo "[install-genesis] real phoenix-1 genesis already present ($SZ bytes) — skipping download"
+                  exit 0
+                fi
+                echo "[install-genesis] existing genesis is a placeholder or malformed ($SZ bytes) — replacing"
+                rm -f "$GENESIS"
+              fi
+
+
+              echo "[install-genesis] downloading real phoenix-1 genesis"
+              curl -fsSL --retry 3 --retry-delay 5 --max-time 60 \
+                   -o "$GENESIS.tmp" "$GENESIS_URL"
+
+
+              DL_SZ=$(wc -c < "$GENESIS.tmp")
+              if ! grep -q '"chain_id": *"phoenix-1"' "$GENESIS.tmp"; then
+                echo "[install-genesis] FATAL: downloaded file is not the phoenix-1 genesis"
+                head -c 400 "$GENESIS.tmp"
+                exit 1
+              fi
+              if [ "$DL_SZ" -lt 5000 ]; then
+                echo "[install-genesis] FATAL: downloaded genesis is suspiciously small ($DL_SZ bytes) — refusing to use"
+                exit 1
+              fi
+              mv "$GENESIS.tmp" "$GENESIS"
+              echo "[install-genesis] wrote $DL_SZ bytes to $GENESIS"
+          volumeMounts:
+            - name: chain-data
+              mountPath: /app
+
+
+        # --- 4. Patch config.toml and app.toml -----------------------------
+        # Runs LAST. Snapshot restore already provided /app/data DBs, so
+        # this container has NOTHING to do with data ? pure config patching.
+        # No state-sync setup, no /app/data cleanup, no trust-anchor fetch.
+        # Everything here is idempotent (sed / awk on specific keys).
+        - name: configure
+          image: curlimages/curl:8.10.1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              memory: "256Mi"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/app
+              CFG="$HOME_DIR/config"
+
+
+              # Persistent peers ? original compose 5 + chain-registry Terra
+              # peers. Helps the node stay well-connected once syncing forward
+              # from the snapshot height.
+              PPEERS="8ba6ed0725ed5d4d30fec866f32ac5cee5e1a32b@65.109.106.210:11756,6224fdc8f977f3fb5c35ac6e99271c1c101bb4f3@167.235.119.53:26656,3cdd6a83946969dc4d5a104af7a7519098425447@135.181.164.13:26756,15d8ae2a5bc80485b5bde6056f98eaf9b0ba1cf4@142.132.147.125:26656,9f217be3b0bada98024f2a23225fb794177e399a@142.132.216.134:26656,1e2c5d6884197b4a27d5fa300fa5aa10af1ff27a@23.88.75.75:11756,9038d63588e0ab421fa71582720c1efb1ee867f6@108.181.106.114:27656,fe999045177c6c995ba07859b72e1179f847b4af@164.152.163.10:26656,5ffd9dd0ad195563338ab112b1a0b281e77308d5@162.55.245.149:2020,e78af14bf49c7737553b8f26b04196f25d87763b@176.9.122.142:26656,e3eef60f923cfb56c3c979435bbbe092fc12a3cd@65.21.12.122:26656,40ad6fb23fbe619c05755b9ba63c68357f32f1c6@167.150.153.240:26657,3029ad51c96ef337426bd596257258f7bf50ed89@134.65.194.136:26656,4ebf87085c2a3cc65d09549938985cf72a3c7734@65.108.97.229:26656,44f045e7d4e9204a4e6e524c346f5c28c8f57c81@23.227.220.127:26656,879ee21d791817f9bdb3c8b48b416971758af8aa@162.55.88.190:26656,e726816f42831689eab9378d5d577f1d06d25716@169.155.171.21:26656,d3a6aa05c2a13875fe782bbbdeb4a199fcfaa83a@169.155.171.74:26656,0926c9c1438276d08899ca932f646af09ed9c66f@65.108.207.104:40156,89757803f40da51678451735445ad40d5b15e059@164.152.161.49:26656,ac70351693cbd02389c4779d18f8bacc448d6751@37.27.50.161:20056,231c585900827a9e595f4483dcf45e3fa9b03868@162.55.237.11:26656"
+
+
+              # Seeds ? PEX-based peer discovery.
+              SEEDS="406bcf90a7b29df6ae475a1f94abe04ebde805af@phoenix.seed.stakebin.io:16656,ade4d8bc8cbe014af6ebdf3cb7b1e9ad36f412c0@seeds.polkachu.com:11756,20e1000e88125698264454a884812746c2eb4807@seeds.lavenderfive.com:11756,ebc272824924ea1a27ea3183dd0b9ba713494f83@terra-mainnet-seed.autostake.com:27486,8542cd7e6bf9d260fef543bc49e59be5a3fa9074@seed.publicnode.com:26656,a8d12536bdcc210ac35a9f092f3295360b97830d@seed-terra-01.stakeflow.io:33007"
+
+
+              UNCOND="8ba6ed0725ed5d4d30fec866f32ac5cee5e1a32b,6224fdc8f977f3fb5c35ac6e99271c1c101bb4f3,3cdd6a83946969dc4d5a104af7a7519098425447,15d8ae2a5bc80485b5bde6056f98eaf9b0ba1cf4,9f217be3b0bada98024f2a23225fb794177e399a,0f1096278efafcf3f0d3bd5b6544e6b8dcc36a0e,9038d63588e0ab421fa71582720c1efb1ee867f6,f2069012aec5ced4e88e7e4311391eabe72bb5a3,ebc272824924ea1a27ea3183dd0b9ba713494f83,86bd5cb6e762f673f1706e5889e039d5406b4b90,a8d12536bdcc210ac35a9f092f3295360b97830d,a87a406c31a3cc6a240c594277039011272ab67c"
+
+
+              # Sanity ? init 2 (terrad-init) must have produced these files.
+              if [ ! -f "$CFG/config.toml" ] || [ ! -f "$CFG/app.toml" ]; then
+                echo "[configure] FATAL: config.toml or app.toml missing ? init 2 (terrad-init) did not run correctly"
+                ls -la "$CFG" || true
+                exit 1
+              fi
+
+
+              # Sanity ? init 3 (install-genesis) must have written the real stub.
+              GEN_SZ=$(wc -c < "$CFG/genesis.json")
+              if [ "$GEN_SZ" -lt 5000 ]; then
+                echo "[configure] FATAL: genesis.json is only $GEN_SZ bytes ? init 3 (install-genesis) did not replace the placeholder"
+                exit 1
+              fi
+
+
+              # Sanity ? init 1 (restore-snapshot) must have populated /app/data.
+              # (If ADOPT_EXISTING=true was used, the sentinel says "adopted".)
+              if [ ! -f "$HOME_DIR/.snapshot-restored" ]; then
+                echo "[configure] FATAL: /app/.snapshot-restored missing ? init 1 (restore-snapshot) did not run"
+                exit 1
+              fi
+              if [ ! -d "$HOME_DIR/data/blockstore.db" ]; then
+                echo "[configure] FATAL: /app/data/blockstore.db missing ? snapshot did not extract correctly"
+                ls -la "$HOME_DIR/data" || true
+                exit 1
+              fi
+              SNAP_HEIGHT=$(cat "$HOME_DIR/.snapshot-restored")
+              echo "[configure] snapshot restored at height $SNAP_HEIGHT"
+
+
+              # Section-aware TOML setter ? `enable` and `address` appear
+              # under multiple sections; awk with section tracking targets
+              # the exact one.
+              set_sec() {
+                f="$1"; sec="$2"; key="$3"; val="$4"
+                awk -v sec="[$sec]" -v key="$key" -v val="$val" '
+                  /^\[/ { cur = $1 }
+                  { if (cur == sec && $0 ~ "^"key"[ ]*=") { print key " = " val; next } print }
+                ' "$f" > "$f.tmp"
+                mv "$f.tmp" "$f"
+              }
+
+
+              # ---- config.toml ---------------------------------------------
+              # Bind RPC to all interfaces; default 127.0.0.1 is unreachable
+              # from a Service. Match the port (26657) to disambiguate from
+              # [p2p] laddr which also ends in `laddr`.
+              sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CFG/config.toml"
+              sed -i "s|^persistent_peers = .*|persistent_peers = \"$PPEERS\"|"           "$CFG/config.toml"
+              sed -i "s|^seeds = .*|seeds = \"$SEEDS\"|"                                  "$CFG/config.toml"
+              sed -i "s|^unconditional_peer_ids = .*|unconditional_peer_ids = \"$UNCOND\"|" "$CFG/config.toml"
+              # Do NOT advertise an external_address ? the P2P LB is internal.
+              sed -i 's|^external_address = .*|external_address = ""|'                    "$CFG/config.toml"
+              sed -i 's|^max_num_outbound_peers = .*|max_num_outbound_peers = 40|'        "$CFG/config.toml"
+              sed -i 's|^max_num_inbound_peers = .*|max_num_inbound_peers = 20|'          "$CFG/config.toml"
+
+
+              # Explicitly disable state-sync ? with snapshot restore, the
+              # DBs are populated so state-sync would be a no-op, but tidier
+              # to keep the config off.
+              set_sec "$CFG/config.toml" statesync enable false
+
+
+              # ---- app.toml ------------------------------------------------
+              # Archive-forward: keep everything from the snapshot height on.
+              sed -i 's|^minimum-gas-prices = .*|minimum-gas-prices = "0.015uluna"|'      "$CFG/app.toml"
+              sed -i 's|^pruning = .*|pruning = "nothing"|'                               "$CFG/app.toml"
+              sed -i 's|^min-retain-blocks = .*|min-retain-blocks = 0|'                   "$CFG/app.toml"
+
+
+              set_sec "$CFG/app.toml" api        enable  true
+              set_sec "$CFG/app.toml" api        address '"tcp://0.0.0.0:1317"'
+              set_sec "$CFG/app.toml" api        swagger true
+              set_sec "$CFG/app.toml" grpc       enable  true
+              set_sec "$CFG/app.toml" grpc       address '"0.0.0.0:9090"'
+              set_sec "$CFG/app.toml" grpc-web   enable  false
+              # Do NOT serve state-sync snapshots to other nodes.
+              set_sec "$CFG/app.toml" state-sync snapshot-interval 0
+
+
+              echo "[configure] ---- config.toml (key lines) ----"
+              grep -E '^(laddr|persistent_peers|seeds|unconditional_peer_ids|external_address|max_num_(out|in)bound_peers) ' "$CFG/config.toml" || true
+              echo "[configure] ---- app.toml ----"
+              grep -E '^(minimum-gas-prices|pruning|min-retain-blocks)' "$CFG/app.toml" || true
+              echo "[configure] genesis.json = $GEN_SZ bytes (real phoenix-1 stub)"
+              echo "[configure] DONE ? main container will boot from snapshot at height $SNAP_HEIGHT"
+          volumeMounts:
+            - name: chain-data
+              mountPath: /app
+
+
+        # --- 5. Rollback recovery for torn/inconsistent snapshots -----------
+        # ROOT CAUSE (confirmed via TWO independent byte-verified-complete
+        # extractions of the same Polkachu snapshot, both producing the
+        # identical error at the identical height): Polkachu's automated
+        # snapshot pipeline archived this node's data directory with
+        # blockstore.db one height AHEAD of what application.db (the IAVL
+        # multi-store) actually has committed -- a "torn" snapshot, most
+        # likely from taking the archive without a fully-flushed graceful
+        # shutdown. This is NOT a download/network/extraction problem
+        # (ruled out: the tarball was verified byte-for-byte complete
+        # against the server's own Content-Length before extraction ever
+        # ran) -- it is baked into the snapshot file itself. It manifests as:
+        #   "failed to load latest version: failed to load store:
+        #    no versions found while trying to load <height>"
+        #
+        # /app/bin/terrad rollback is Cosmos SDK's official, built-in recovery
+        # command for exactly this class of block-store/app-store
+        # inconsistency. It decrements both stores by one height so they
+        # agree again; the node then re-syncs that single block from P2P
+        # peers in seconds once it boots normally.
+        - name: rollback-recovery
+          image: alpine:3.19                     # terrad v2.20.0 comes from the PVC (init 1)
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              memory: "2Gi"
+          env:
+            - { name: HOME, value: "/app" }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              HOME_DIR=/app
+              SENTINEL="$HOME_DIR/.rollback-attempted"
+
+
+              # One rollback attempt per snapshot restore. If a torn
+              # snapshot needed more than one height rolled back (rare --
+              # usually it is off-by-one), force a fresh restore via
+              # FORCE_RESTORE on restore-snapshot, which wipes /app/data and
+              # this sentinel along with it, allowing rollback to run again.
+              if [ -f "$SENTINEL" ]; then
+                echo "[rollback] already attempted for this data set -- skipping"
+                exit 0
+              fi
+
+
+              echo "[rollback] running /app/bin/terrad rollback --home $HOME_DIR"
+              echo "[rollback] (self-heals a snapshot where blockstore.db is ahead of application.db)"
+              /app/bin/terrad rollback --home "$HOME_DIR" 2>&1 || {
+                echo "[rollback] /app/bin/terrad rollback reported a non-zero exit."
+                echo "[rollback] If the store was already consistent, this is often harmless -- continuing."
+              }
+              touch "$SENTINEL"
+              echo "[rollback] DONE"
+          volumeMounts:
+            - name: chain-data
+              mountPath: /app
+
+
+      containers:
+        - name: terra                              # Container name — matches docker-compose service name
+          image: alpine:3.19                       # Runs the static terrad v2.20.0 installed on the PVC by init 1
+          # The old image carried CMD ["terrad","--home","/app","start"], which the
+          # manifest inherited. Alpine has no such CMD, so the entrypoint is now
+          # explicit — and it points at the verified v2.20.0 binary on the PVC.
+          command: ["/app/bin/terrad"]
+          args: ["start", "--home", "/app"]
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true                     # Main container MUST run non-root — upstream image ships UID 1000
+            runAsUser: 1000                        # `terra` user in the image
+            runAsGroup: 1000                       # `terra` group in the image
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          # Image CMD is `terrad --home /app start` — inherit it. No command/args override.
+          env:
+            - { name: HOME, value: "/app" }        # Ensures terrad's ~ expands under the PVC
+          ports:
+            - name: p2p                            # Cosmos P2P port — fixed by protocol, never change
+              containerPort: 26656
+              protocol: TCP
+            - name: rpc                            # Tendermint RPC — fixed by protocol
+              containerPort: 26657
+              protocol: TCP
+            - name: cosmos-api                     # Cosmos REST/LCD API — fixed by protocol
+              containerPort: 1317
+              protocol: TCP
+            - name: grpc                           # Cosmos gRPC — auto-added for all Cosmos SDK chains
+              containerPort: 9090
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "250m"                          # Guaranteed CPU — start minimal, scale up if needed
+              memory: "1Gi"                        # Guaranteed memory
+            limits:
+              # No CPU limit ON PURPOSE. A CPU limit is enforced by CFS
+              # throttling, which stalls block execution in fixed 100 ms
+              # windows during catch-up — the node falls further behind the
+              # harder it is throttled. The CPU *request* above still
+              # guarantees a share; bursting is what catch-up needs.
+              memory: "8Gi"                        # Terra 2 executes CosmWasm at tip; 4Gi risks OOM mid-replay
+          # Probes hit CometBFT's own /health endpoint on 26657.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: rpc
+            periodSeconds: 30
+            failureThreshold: 240   # Up to 2 h before first success — enough for a snapshot-populated archive to open its store.
+                                    # For sync-from-scratch (weeks), scale replicas to 0 first, pre-populate /app/data via a maintenance pod, then scale up.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: rpc
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          # HEIGHT-PROGRESS liveness — restarts a STALLED node, not merely a
+          # BEHIND one. Fires only when the height fails to move across three
+          # consecutive 10-minute checks (a 30-min stall).
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  H=$(wget -q -T 10 -O - http://localhost:26657/status 2>/dev/null \
+                      | sed -n 's/.*"latest_block_height": *"\([0-9]*\)".*/\1/p')
+                  P=$(cat /tmp/last_height 2>/dev/null || echo 0)
+                  echo "$H" > /tmp/last_height
+                  [ -n "$H" ] && [ "$H" -gt "$P" ]
+            initialDelaySeconds: 3600  # Give archive replay 1 h before liveness kicks in
+            periodSeconds: 600
+            timeoutSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - name: chain-data                     # Must match volume name in volumes section below
+              mountPath: /app                      # Matches docker-compose bind mount target and image WORKDIR
+      volumes:
+        - name: chain-data                         # Volume backed by the PVC in 02-node_terra2_pvc.yaml
+          persistentVolumeClaim:
+            claimName: node-terra2-data            # Must match PVC name in 02-node_terra2_pvc.yaml

@@ -1,0 +1,27 @@
+apiVersion: v1                      # Stable core API version for PersistentVolumeClaim resources
+kind: PersistentVolumeClaim
+metadata:
+  name: node-terra2-data            # PVC name — referenced by StatefulSet volume mount
+  namespace: terra2                 # Must match the namespace in 00-node_terra2_namespace.yaml
+  labels:
+    blockchain: terra2              # Identifies the blockchain this PVC belongs to
+    node: node_terra2               # Node identifier for label selectors
+    managed-by: manifest-generator  # Tracks origin of this resource
+spec:
+  accessModes:
+    - ReadWriteOnce                 # Azure Disk supports only single-node read-write access
+  storageClassName: node-terra2-storage  # Must match StorageClass in 01-node_terra2_storageclass.yaml
+  resources:
+    requests:
+      storage: 200Gi               # Initial disk size — bumped from 100Gi after a real bootstrap
+                                    # run needed to hold the ~28 GB Polkachu tarball AND the fully
+                                    # extracted DB simultaneously (tarball is deleted right after
+                                    # verified extraction, but both exist on disk at once during
+                                    # that window). The exact extracted size isn't knowable ahead
+                                    # of time (snapshot rotates daily), so 200Gi gives comfortable
+                                    # headroom over the ~28 GB tarball. pvc-watcher auto-expands
+                                    # further from here (up to 3000Gi) once wired into the shared
+                                    # ConfigMap — see full-doc.md §5. If 200Gi is ever insufficient
+                                    # before that, the StorageClass has allowVolumeExpansion: true,
+                                    # so `kubectl edit pvc node-terra2-data -n terra2` can resize it
+                                    # live without recreating the PVC.

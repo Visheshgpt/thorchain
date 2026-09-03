@@ -1,0 +1,36 @@
+apiVersion: storage.k8s.io/v1       # Stable API version for StorageClass resources
+kind: StorageClass
+metadata:
+  name: node-terra2-storage         # StorageClass name — referenced by PVC in 02-node_terra2_pvc.yaml
+  labels:
+    blockchain: terra2              # Identifies the blockchain this StorageClass belongs to
+    node: node_terra2               # Node identifier for label selectors
+    managed-by: manifest-generator  # Tracks origin of this resource
+provisioner: disk.csi.azure.com     # Azure Disk CSI driver — verified provisioner for AKS
+# ---------------------------------------------------------------------------
+# reclaimPolicy: Delete — TEMPORARY DEVIATION FROM THE NORMAL "Retain" RULE.
+#
+# This node is still in active bootstrap/debugging (repeated wipe-and-retry
+# cycles while fixing the snapshot-restore pipeline). Every PVC created here
+# holds data that is 100% reproducible from a public Polkachu snapshot — it
+# is NOT irreplaceable, so Retain's safety guarantee is not needed yet and
+# was actively counterproductive: 3 PVs were already stuck "Released" with
+# orphaned (still-billed) Azure Disks that required manual patching to
+# reclaim, because Retain never asks the CSI driver to delete the disk.
+#
+# *** REVERT THIS TO Retain ONCE THE NODE IS SYNCED AND STABLE IN PRODUCTION ***
+# StorageClass reclaimPolicy is IMMUTABLE once created — to go back to
+# Retain, delete this StorageClass and recreate it with reclaimPolicy:
+# Retain (existing PVs are unaffected by this; only NEW PVCs pick up the
+# StorageClass's current policy). Once reverted, an accidental
+# `kubectl delete pvc` will no longer be able to wipe live archive data.
+# ---------------------------------------------------------------------------
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer  # Provision disk in same AZ as the scheduled pod
+allowVolumeExpansion: true          # Required for pvc-watcher auto-expansion to work
+parameters:
+  skuName: StandardSSD_LRS          # Azure Disk SKU — Standard SSD (cluster default)
+                                    # NOTE: Terra 2.0 is an ARCHIVE node (PROFILE=archive, PRUNING_STRATEGY=nothing).
+                                    # If sync IO becomes a bottleneck once disk grows past ~1 TB, consider migrating
+                                    # to Premium_LRS via a new StorageClass + PVC clone. StandardSSD_LRS is adequate
+                                    # for initial bring-up and matches all other nodes in this cluster.

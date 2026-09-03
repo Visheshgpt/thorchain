@@ -1,0 +1,135 @@
+# =============================================================================
+# 04-node_terra2_service.yaml — THREE services for Terra 2.0 (phoenix-1)
+#
+# Service 1: node-terra2        — Headless ClusterIP (required by StatefulSet)
+# Service 2: node-terra2-lb     — Internal LB for P2P (port 26656)
+# Service 3: node-terra2-rpc-lb — Internal LB for all API/RPC ports
+#
+# EXTERNAL P2P (READ THIS BEFORE CHANGING ANY ANNOTATION):
+#   Terra 2.0 peers dial each other on the public internet; the compose file
+#   even sets PUBLIC_ADDRESS=13.86.34.113:26656 for that reason. HOWEVER, per
+#   generator policy the P2P LB is provisioned INTERNAL by default, and
+#   external inbound peering requires a DevOps/firewall port-enable request
+#   for TCP 26656. Do NOT remove the internal annotation or flip service type
+#   to expose a public IP without written firewall approval — outbound peering
+#   already works from the pod egress path and is enough for the node to sync.
+#
+# IP SHARING NOTE:
+#   Terra 2.0 P2P is fixed at 26656 (Cosmos SDK protocol). This port CANNOT be
+#   shared with any other Cosmos SDK chain on the same IP (Cronos POS, Kava,
+#   Mantra, etc. — they all use 26656). IP sharing is only valid when the
+#   other node uses completely different ports (e.g. Bitcoin 8333, Litecoin
+#   9333). Use --p2p-lb-ip only in that case, never between Cosmos chains.
+# =============================================================================
+---
+# --- Service 1: Headless ClusterIP -------------------------------------------
+# Required by StatefulSet for stable pod DNS.
+# Pod DNS: node-terra2-0.node-terra2.terra2.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-terra2                 # Headless service — must match StatefulSet.spec.serviceName
+  namespace: terra2                 # Must match namespace in 00-node_terra2_namespace.yaml
+  labels:
+    blockchain: terra2
+    node: node_terra2
+    managed-by: manifest-generator
+spec:
+  clusterIP: None                   # Headless — no virtual IP; DNS resolves directly to pod IP
+  publishNotReadyAddresses: true    # Keep DNS record valid while readiness (/health) is still catching up.
+                                    # Terra archive replay can take hours; without this the pod has no
+                                    # DNS entry for that whole window and the StatefulSet identity is lost.
+  selector:
+    node: node_terra2               # Routes to pods with this label
+  ports:
+    - name: p2p                     # Cosmos P2P — protocol-fixed port
+      port: 26656
+      targetPort: 26656
+      protocol: TCP
+    - name: rpc                     # Tendermint RPC — protocol-fixed port
+      port: 26657
+      targetPort: 26657
+      protocol: TCP
+    - name: cosmos-api              # Cosmos REST/LCD API — protocol-fixed port
+      port: 1317
+      targetPort: 1317
+      protocol: TCP
+    - name: grpc                    # Cosmos gRPC — auto-added (not in compose, required for NextGen queries)
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+---
+# --- Service 2: Internal LoadBalancer — P2P ----------------------------------
+# Exposes the Cosmos P2P port (26656) via Azure Internal Load Balancer.
+# External P2P access requires a port enable request via DevOps/firewall team.
+# Do NOT remove the internal annotation or change service type to expose a
+# public IP without written firewall approval.
+#
+# HONEST REVIEW: an INTERNAL LB hands out an RFC1918 address. Terra peers on
+# the public internet cannot dial an RFC1918 address, so this LB provides no
+# inbound peering — outbound peering already works from the pod egress path.
+# The Service is kept so the DevOps port-enable request has a real Service
+# object to target. If that request is dropped, delete this Service to reclaim
+# the VNet IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-terra2-lb              # Primary LB service name
+  namespace: terra2
+  labels:
+    blockchain: terra2
+    node: node_terra2
+    managed-by: manifest-generator
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # Private VNet IP only — MUST NOT be removed
+spec:
+  type: LoadBalancer                # Azure provisions an Internal LB with a private VNet IP
+  selector:
+    node: node_terra2
+  ports:
+    - name: p2p                     # Cosmos P2P — fixed by protocol at 26656, never change
+      port: 26656                   # LB listener port (external:internal from compose = 26656:26656)
+      targetPort: 26656             # Container port
+      protocol: TCP
+---
+# --- Service 3: Internal LoadBalancer — RPC / API ----------------------------
+# Exposes RPC, REST, and gRPC via Azure Internal Load Balancer.
+# These ports must NEVER be exposed publicly — VNet access only.
+#
+# Ports mirror the compose declaration 1:1 (no remapping). If this node later
+# needs to share an ILB IP with another chain, remap listener ports here to
+# make the port set DISJOINT — targetPort must stay on the protocol-fixed
+# container port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-terra2-rpc-lb          # RPC/API LB service name
+  namespace: terra2
+  labels:
+    blockchain: terra2
+    node: node_terra2
+    managed-by: manifest-generator
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"  # Private VNet IP — required for all API ports
+spec:
+  type: LoadBalancer                # Azure provisions an Internal LB with a private VNet IP
+  selector:
+    node: node_terra2
+  ports:
+    - name: rpc                     # Tendermint RPC — protocol-fixed, from compose 26657:26657
+      port: 26657                   # LB listener port
+      targetPort: 26657             # Container port
+      protocol: TCP
+    - name: cosmos-api              # Cosmos REST/LCD API — balance, tx, staking queries
+                                    # from compose 1317:1317
+      port: 1317                    # LB listener port
+      targetPort: 1317              # Container port — protocol-fixed
+      protocol: TCP
+    - name: grpc                    # Cosmos gRPC — auto-added for all Cosmos SDK chains
+                                    # (not in compose; required for NextGen balance/tx/staking queries)
+      port: 9090                    # LB listener port
+      targetPort: 9090              # Container port — protocol-fixed
+      protocol: TCP
+
+
+
