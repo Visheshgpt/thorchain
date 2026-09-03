@@ -430,6 +430,14 @@ spec:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
+          env:
+            # terrad derives its default home from the OS user's home dir.
+            # The old ghcr.io/terra-money/core image shipped a real uid-1000
+            # user, so the runtime resolved HOME for us. alpine:3.19 and
+            # curlimages/curl (whose own user is uid 100) have NO passwd
+            # entry for uid 1000, so HOME came out unset. Set it explicitly
+            # -- the main container already does.
+            - { name: HOME, value: "/app" }
           command:
             - /bin/sh
             - -c
@@ -474,14 +482,33 @@ spec:
               chmod +x "$TERRAD"
               rm -f "$TMP"
 
-              # Prove the binary actually runs here before stamping it good --
-              # a tarball can be intact yet the binary unusable on this base image.
-              if ! "$TERRAD" version >/dev/null 2>&1; then
-                echo "[install-terrad] FATAL: terrad is installed but will not execute"
+              # Probe the binary, but judge it on the RIGHT signal. A shell
+              # reports 126 when a file cannot be executed (noexec mount, wrong
+              # architecture, missing loader) and 127 when it is not found.
+              # ANY OTHER non-zero exit means terrad DID execute and merely
+              # disliked its arguments or environment -- which says nothing
+              # about whether the binary is usable, and must not be fatal.
+              #
+              # The previous version of this check treated every non-zero exit
+              # as "will not execute" AND discarded stderr, so it killed the
+              # pod while hiding the reason.
+              set +e
+              PROBE="$("$TERRAD" version 2>&1)"
+              RC=$?
+              set -e
+              echo "[install-terrad] probe: exit=$RC output=${PROBE:-(none)}"
+
+              if [ "$RC" -eq 126 ] || [ "$RC" -eq 127 ]; then
+                echo "[install-terrad] FATAL: terrad cannot be executed (exit $RC)"
+                echo "[install-terrad]   whoami : $(id)"
+                echo "[install-terrad]   binary : $(ls -l "$TERRAD")"
+                echo "[install-terrad]   fs     : $(df -P "$BIN_DIR" | awk 'NR==2{print $1"  on  "$6}')"
+                echo "[install-terrad]   mount  : $(grep -E " $(df -P "$BIN_DIR" | awk 'NR==2{print $6}') " /proc/mounts || true)"
                 exit 1
               fi
+
               echo "$VER" > "$STAMP"
-              echo "[install-terrad] installed terrad $VER ($("$TERRAD" version 2>&1 | head -1))"
+              echo "[install-terrad] installed terrad $VER"
           volumeMounts:
             - name: chain-data
               mountPath: /app
