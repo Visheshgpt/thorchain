@@ -135,6 +135,22 @@ spec:
               # from the index at run time -- never hardcode it.
               # ---------------------------------------------------------------
               mkdir -p "$HOME_DIR"
+              # FAIL FAST IF THE PVC IS NOT MOUNTED.
+              #
+              # This container has silently lost its volumeMount twice. Without it
+              # the whole restore runs against the container's ephemeral overlay:
+              # 22 GB downloads, "extract verified" prints, DONE prints -- and the
+              # PVC is still empty, so the node opens an empty store and falls
+              # through to InitChain. Every log line looks like success.
+              # The tell was `df` reporting "overlay" instead of the Azure disk.
+              case "$(df -P "$HOME_DIR" | awk 'NR==2{print $1}')" in
+                overlay|tmpfs|none)
+                  echo "[restore] FATAL: $HOME_DIR is NOT on a persistent volume."
+                  df -h "$HOME_DIR"
+                  echo "[restore] The cronos-data volumeMount is missing from this container."
+                  exit 1 ;;
+              esac
+              echo "[restore] PVC confirmed: $(df -h "$HOME_DIR" | awk 'NR==2{print $1" "$2}')"
               
               if [ "${ADOPT_EXISTING:-false}" = "true" ]; then
                 echo "[restore] ADOPT_EXISTING=true -- using data already on this volume"
@@ -251,6 +267,10 @@ spec:
               chmod -R a+rwX "$HOME_DIR/data" 2>/dev/null || true
               df -h "$HOME_DIR" 2>/dev/null || true
               echo "[restore] DONE -- restored from $FILE"
+          volumeMounts:
+            - name: cronos-data
+              mountPath: /data
+
 
         - name: install-cronosd
           image: ubuntu:22.04
