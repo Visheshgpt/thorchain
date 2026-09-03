@@ -60,6 +60,54 @@ genesis doc hash in db does not match loaded genesis doc
 - **Memory limit 4Gi → 8Gi.** Terra 2 executes CosmWasm at tip; 4Gi risks an
   OOM mid-replay. This is a ceiling, not a reservation.
 
+### Two further defects, found during bring-up
+
+Both were introduced by the `install-terrad` container added above, and both
+are worth recording because they are easy to repeat.
+
+**`HOME` was unset.** `terrad` derives its default home from the OS user's home
+directory. The retired `ghcr.io/terra-money/core` image shipped a real uid-1000
+user (`terra`), so the container runtime resolved `HOME` from `/etc/passwd`
+automatically. `curlimages/curl`'s own user is `curl_user` at **uid 100**, so
+running it as uid 1000 leaves uid 1000 with **no passwd entry** and `HOME`
+empty — and `terrad` exits non-zero. The tell was already in the manifest:
+`terrad-init` and `rollback-recovery` both carried `HOME=/app`, set on exactly
+the containers that invoke `terrad`. Every container that runs `terrad` needs
+it — there is no image left to supply it.
+
+**The exec probe judged the wrong signal.** The first version was:
+
+```sh
+if ! "$TERRAD" version >/dev/null 2>&1; then
+  echo "FATAL: terrad is installed but will not execute"
+```
+
+That treats *any* non-zero exit as "cannot execute", when a binary that runs
+perfectly well and merely objects to its environment also exits non-zero — and
+`2>&1 >/dev/null` discarded the message naming the cause. The pod crash-looped
+16 times behind a diagnosis that pointed at the wrong thing entirely.
+
+A shell reports **126** when a file cannot be executed (noexec mount, wrong
+architecture, missing loader) and **127** when it is not found. Those two codes
+are the only ones that mean "unusable". Everything else means the binary ran.
+The probe now fails only on 126/127 and prints exit code plus output either
+way:
+
+```sh
+set +e
+PROBE="$("$TERRAD" version 2>&1)"
+RC=$?
+set -e
+echo "[install-terrad] probe: exit=$RC output=${PROBE:-(none)}"
+if [ "$RC" -eq 126 ] || [ "$RC" -eq 127 ]; then
+  ... print id, ls -l, and the mount line, then exit 1
+fi
+```
+
+**Rule of thumb:** a health check that discards stderr converts a one-line
+diagnosis into a blind hunt. If a guard can abort the pod, it must print what
+it saw.
+
 The 41.5 GB already restored on the PVC is **valid and reused** — only the
 binary was wrong. The restore sentinel short-circuits, so no 29.7 GB re-download.
 
@@ -70,7 +118,7 @@ binary was wrong. The restore sentinel short-circuits, so no 29.7 GB re-download
 | Field | Value |
 |---|---|
 | **Blockchain** | Terra 2.0 mainnet (chain-id `phoenix-1`) |
-| **Node type** | Archive (`PROFILE=archive`, `PRUNING_STRATEGY=nothing`, `MIN_RETAIN_BLOCKS=0`) |
+| **Node type** | **Pruned-snapshot restore, archive-forward.** `pruning = "nothing"` and `min-retain-blocks = 0` are set, so NO history is discarded from the restore point onward — but the node was seeded from Polkachu's **pruned** snapshot (`custom/100/10`) at height ~22,654,000, so it holds **no state below that height**. It is not an archive of the full chain. See [Historical depth](#step-7--historical-depth-what-this-node-can-and-cannot-answer). |
 | **Daemon** | `terrad` **v2.20.0** (matches live phoenix-1 — confirmed via `/abci_info`) |
 | **Container image** | `alpine:3.19` + verified `terrad` binary on the PVC — `phoenix-directive/core` publishes no image |
 | **Namespace** | `terra2` |
@@ -78,7 +126,7 @@ binary was wrong. The restore sentinel short-circuits, so no 29.7 GB re-download
 | **StatefulSet Pod** | `node-terra2-0` |
 | **Storage SKU** | `StandardSSD_LRS` |
 | **Initial PVC Size** | `200Gi` (bumped from 100Gi — see restore-snapshot init comments for why; auto-expands via pvc-watcher, max `3000Gi`) |
-| **Data Mount Path** | `/app` (matches compose bind mount and Cosmovisor `DAEMON_HOME`) |
+| **Data Mount Path** | `/app` (matches compose bind mount; also the `terrad --home`. Cosmovisor is not used) |
 | **Moniker** | `terra-archive-prod` |
 
 
@@ -115,15 +163,17 @@ kubectl config current-context
 ### 2.2 Data / Config Initialisation
 
 
-Four init containers get the node caught up in ~20–60 minutes (dominated by the snapshot download):
+Six init containers get the node caught up in ~20–60 minutes (dominated by the snapshot download):
 
 
 | # | Container | What it does |
 |---|---|---|
-| 1 | `restore-snapshot` (`alpine:3.19`, **UID 0, drop:ALL**) | Discovers the current Polkachu Terra snapshot filename by scraping `https://polkachu.com/tendermint_snapshots/terra`, streams `curl \| lz4 -dc \| tar -x --no-same-owner` directly into `/app`. ~28 GB compressed → ~40–60 GB extracted. Verifies `blockstore.db`, `state.db`, `application.db` all landed. `chmod -R a+rwX /app` at the end so the UID-1000 inits and main container can read/write. Runs FIRST on a fresh volume, so root never encounters UID-1000 files (that avoids the `CAP_DAC_OVERRIDE` trap that broke a previous ordering). |
-| 2 | `terrad-init` (`alpine:3.19`) | Runs `terrad init terra-archive-prod --chain-id phoenix-1 --home /app`. The Polkachu snapshot only ships `/app/data` DBs — configs aren't included. This init creates `config.toml`, `app.toml`, `node_key.json`, `priv_validator_key.json`, and `priv_validator_state.json`. Also writes a **placeholder** `genesis.json` (replaced in init 3). |
-| 3 | `install-genesis` (`curlimages/curl:8.10.1`) | Downloads the phoenix-1 genesis stub from Polkachu (~17 KB). CometBFT reads it at boot to pin `chain_id` and consensus params. |
-| 4 | `configure` (`curlimages/curl:8.10.1`) | Patches `config.toml` (`persistent_peers` — compose 5 + chain-registry 7, plus `seeds` and `unconditional_peer_ids`), and `app.toml` (`pruning="nothing"`, `minimum-gas-prices="0.015uluna"`, `[api]` on `0.0.0.0:1317`, `[grpc]` on `0.0.0.0:9090`). Explicitly disables state-sync — the snapshot is the state source. |
+| 1 | `restore-snapshot` (`alpine:3.19`, **UID 0, drop:ALL**) | Discovers the current Polkachu snapshot filename by scraping `https://polkachu.com/tendermint_snapshots/terra`, downloads it to disk, **byte-verifies the size against a `HEAD` request**, then extracts with `lz4 -dc \| tar -x --no-same-owner`. ~30 GB compressed → ~41 GB extracted. `--no-same-owner` is mandatory: GNU tar exits 2 on a chown failure, and an earlier revision read that as corruption and deleted 8.7 GB before retrying. Verifies `blockstore.db`, `state.db`, `application.db` all landed, then `chmod -R a+rwX /app`. Runs FIRST on a fresh volume so root never meets UID-1000 files — that avoids the `CAP_DAC_OVERRIDE` trap, since a capability-dropped root is *weaker* than a normal user for file ops. Idempotent via `.snapshot-restored`. |
+| 2 | `install-terrad` (`curlimages/curl:8.10.1`, UID 1000) | Downloads `terra_2.20.0_Linux_x86_64.tar.gz` from `phoenix-directive/core` and verifies sha256 `1fcb6c61…43f563` **before** installing to `/app/bin/terrad`. The binary is fully static (no `PT_INTERP`, wasmvm linked in), so it runs on Alpine/musl. Then probes it, treating **only** exit 126/127 as fatal. Reinstall is gated on `/app/bin/.terrad-version`, so bumping `VER` forces an upgrade. Needs `HOME=/app` — see [bring-up defects](#two-further-defects-found-during-bring-up). |
+| 3 | `terrad-init` (`alpine:3.19`, UID 1000) | Runs `/app/bin/terrad init terra-archive-prod --chain-id phoenix-1 --home /app`. The Polkachu snapshot ships only `/app/data` DBs — configs are not included. Creates `config.toml`, `app.toml`, `node_key.json`, `priv_validator_key.json` and `priv_validator_state.json`, plus a **placeholder** `genesis.json` replaced in init 4. Skips entirely if `config.toml` and `node_key.json` already exist. |
+| 4 | `install-genesis` (`curlimages/curl:8.10.1`, UID 1000) | Installs the **7,988-byte** phoenix-1 genesis from Polkachu's mirror. This is deliberately *not* the 747 MB official file — the operating network runs the stub, and CometBFT compares the genesis hash stored in `state.db` on every start. See [the genesis trap](#the-genesis-trap-that-was-avoided). |
+| 5 | `configure` (`curlimages/curl:8.10.1`, UID 1000) | Patches `config.toml` — **22 `persistent_peers`, every one TCP-verified reachable at build time** (the previous list had 7 of 12 dead, the same defect that stalled CronosPOS_GHCP), 6 `seeds`, RPC `laddr` on `0.0.0.0:26657`, empty `external_address` because the P2P LB is internal — and `app.toml` (`pruning="nothing"`, `minimum-gas-prices="0.015uluna"`, `[api]` on `0.0.0.0:1317`, `[grpc]` on `0.0.0.0:9090`). Explicitly disables state-sync: the snapshot is the state source. Idempotent `sed`/`awk` on specific keys. |
+| 6 | `rollback-recovery` (`alpine:3.19`, UID 1000) | Runs `/app/bin/terrad rollback` once per restore to self-heal a snapshot whose `blockstore.db` is one height ahead of `application.db`. Tolerates a non-zero exit (a consistent store makes this a no-op). Gated on `.rollback-attempted`; a `FORCE_RESTORE` clears it along with `/app/data`. |
 
 
 **Re-restoring or adopting existing data** — env switches on `restore-snapshot`:
@@ -140,8 +190,18 @@ kubectl set env statefulset/node-terra2 -n terra2 -c restore-snapshot FORCE_REST
 ```
 
 
-> **Cosmovisor is not part of the runtime.** Chain upgrades are manual:
+> **Cosmovisor is not part of the runtime.** Chain upgrades are manual, and
+> `kubectl set image` does **not** apply — the binary lives on the PVC, not in
+> the image. Edit the `install-terrad` init container in `03-statefulset.yaml`,
+> bump `VER` and `SHA` (from the release's `checksum.txt`), then:
 > ```bash
+> kubectl apply -f 03-statefulset.yaml
+> kubectl delete pod node-terra2-0 -n terra2   # apply alone will not roll it
+> ```
+> The sentinel at `/app/bin/.terrad-version` forces a reinstall when `VER`
+> changes. Track
+> [phoenix-directive/core releases](https://github.com/phoenix-directive/core/releases)
+> — **not** `terra-money/core`, which is abandoned.
 
 
 > ⚠️ **The snapshot is PRUNED.** The node keeps all blocks from the snapshot
@@ -215,23 +275,23 @@ Apply manifests in this exact order:
 
 ```bash
 # Step 1 — Create namespace
-kubectl apply -f 00-node_terra2_namespace.yaml
+kubectl apply -f 00-namespace.yaml
 
 
 # Step 2 — Create StorageClass (cluster-scoped, no namespace needed)
-kubectl apply -f 01-node_terra2_storageclass.yaml
+kubectl apply -f 01-storageclass.yaml
 
 
 # Step 3 — Create PVC
-kubectl apply -f 02-node_terra2_pvc.yaml
+kubectl apply -f 02-pvc.yaml
 
 
 # Step 4 — Deploy StatefulSet
-kubectl apply -f 03-node_terra2_statefulset.yaml
+kubectl apply -f 03-statefulset.yaml
 
 
 # Step 5 — Create Services
-kubectl apply -f 04-node_terra2_service.yaml
+kubectl apply -f 04-service.yaml
 ```
 
 
@@ -363,15 +423,35 @@ Returns the `uluna` total supply. Proves the ABCI application is genuinely
 queryable — state is readable, not just blocks arriving.
 
 
-### Step 7 — Historical queries (proves the archive data is intact)
+### Step 7 — Historical depth: what this node CAN and CANNOT answer
+
+> ⚠️ **Do not use `/block?height=1` as an acceptance test on this node — it will
+> fail, and that failure is correct.** An earlier revision of this document
+> listed it as the archive test. That was wrong for this deployment.
+
+This node was seeded from Polkachu's snapshot, which is pruned
+(`custom/100/10`). Blocks below the snapshot height were never on this disk.
+`pruning = "nothing"` only guarantees nothing is discarded **from the restore
+point forward**.
+
 ```bash
-# Terra 2.0 launched at height 1. An archive node MUST answer height=1:
+# Find the real floor - the oldest height this node actually holds:
+kubectl exec -n terra2 node-terra2-0 -c terra -- sh -c "wget -qO- http://localhost:26657/status | sed -n 's/.*\"earliest_block_height\": *\"\([0-9]*\)\".*/earliest=\1/p'"
+
+# A height ABOVE the floor must answer (substitute a height from the line above):
+kubectl exec -n terra2 node-terra2-0 -c terra -- sh -c "wget -qO- 'http://localhost:26657/block?height=22660000' | head -c 200"
+
+# A height BELOW the floor must be refused - this is expected, not a fault:
 kubectl exec -n terra2 node-terra2-0 -c terra -- sh -c "wget -qO- 'http://localhost:26657/block?height=1' | head -c 300"
 ```
-This is the archive-node acceptance test. A pruned node would return
-`requested block height … is not available`. An archive node must return the
-block header.
 
+The second command returns a block header. The third returns
+`height 1 is not available, lowest height is <floor>`. **Both outcomes are
+passes.**
+
+If you genuinely need history below the floor, a pruned snapshot cannot give
+it to you — you need an archive snapshot or a full replay from genesis, and a
+far larger PVC. That is a different deployment, not a config change.
 
 ### Step 8 — From outside the cluster, through the Internal LB
 ```bash
@@ -395,7 +475,7 @@ grpcurl -plaintext <ILB-IP>:9090 cosmos.base.tendermint.v1beta1.Service/GetLates
 | 4 | height delta over 60s | `> 12` |
 | 5 | `catching_up` | `false` once caught up |
 | 6 | `/cosmos/bank/v1beta1/supply` | returns `uluna` |
-| 7 | `/block?height=1` | returns the genesis block (ARCHIVE test) |
+| 7 | `/block?height=<above floor>` | returns a block header; heights BELOW `earliest_block_height` are correctly refused |
 | 8 | logs | no `wrong Block.Header.AppHash`, `CONSENSUS FAILURE`, or `panic` |
 
 
@@ -407,6 +487,40 @@ Empty output is the pass.
 
 ---
 
+
+## 4c. Sync Proof
+
+Evidence that this node reached the network tip. Capture the screenshot from:
+
+```powershell
+kubectl exec node-terra2-0 -n terra2 -c terra -- wget -qO- localhost:26657/status | ConvertFrom-Json | % { $_.result.sync_info }
+```
+
+showing `latest_block_height` and `catching_up: False`, alongside the live
+network height from `https://terrasco.pe/` or:
+
+```powershell
+curl.exe -s https://terra-rpc.polkachu.com/abci_info
+```
+
+Save the image as `screenshots/terra2-latest-height.png`:
+
+![Terra 2 latest block height](./screenshots/terra2-latest-height.png)
+
+| Field | Value |
+|---|---|
+| Date captured | `YYYY-MM-DD` |
+| Node height | |
+| Network height | |
+| `catching_up` | |
+| Gap (blocks) | |
+| `earliest_block_height` (pruning floor) | |
+| `terrad` version | `2.20.0` |
+
+> Record `earliest_block_height` too. It is the honest statement of this node's
+> historical depth, and the number anyone querying it needs to know.
+
+---
 
 ## 5. Auto-Disk Config (pvc-watcher)
 
@@ -458,11 +572,11 @@ Remove resources in reverse order to avoid dependency errors:
 
 
 ```bash
-kubectl delete -f 04-node_terra2_service.yaml
-kubectl delete -f 03-node_terra2_statefulset.yaml
-kubectl delete -f 02-node_terra2_pvc.yaml
-kubectl delete -f 01-node_terra2_storageclass.yaml
-kubectl delete -f 00-node_terra2_namespace.yaml
+kubectl delete -f 04-service.yaml
+kubectl delete -f 03-statefulset.yaml
+kubectl delete -f 02-pvc.yaml
+kubectl delete -f 01-storageclass.yaml
+kubectl delete -f 00-namespace.yaml
 ```
 
 
@@ -528,3 +642,41 @@ single step.
 
 
 
+
+
+6. **`kubectl apply` cannot roll an unready pod.** `podManagementPolicy:
+   OrderedReady` refuses to replace a pod that has never reached Ready, and a
+   node restoring a 30 GB snapshot is not Ready. The apply reports success and
+   changes nothing. During bring-up this produced 33 minutes of log-reading
+   against a pod running a spec several revisions old. Always follow an apply
+   with `kubectl delete pod node-terra2-0 -n terra2`, then verify with:
+   ```bash
+   kubectl get pod node-terra2-0 -n terra2 -o jsonpath="{.spec.initContainers[*].name}"
+   ```
+   If the container you just added is missing from that list, nothing you do
+   to the manifest matters yet.
+
+7. **Seeds alone will not sync this node.** CometBFT seed nodes answer one PEX
+   request and then **disconnect by design** (`p2p/pex/pex_reactor.go`). A node
+   configured with `seeds` but no reachable `persistent_peers` discovers
+   addresses and then sits at `n_peers: 0`. This is why `configure` writes 22
+   verified `persistent_peers` and not just the 6 seeds — and why peer
+   reachability is re-tested whenever the manifest is regenerated. Peer IPs
+   churn; a stalled node with `n_peers: 0` almost always means a dead list.
+
+8. **`df` reporting `overlay` means the PVC is not mounted.** `restore-snapshot`
+   aborts if `/app` is not on a persistent volume. Without that guard an
+   extraction "succeeds" — printing `extract verified` and `DONE` — while
+   writing 22 GB into the container's throwaway filesystem, leaving the PVC
+   empty. Verify with:
+   ```bash
+   kubectl exec node-terra2-0 -n terra2 -c terra -- df -h /app
+   ```
+   A real Azure disk shows as `/dev/nvme…` or `/dev/sd…`, never `overlay`.
+
+9. **No CPU limit, on purpose.** A CPU limit is enforced by CFS throttling,
+   which stalls block execution in fixed 100 ms windows — during catch-up the
+   node falls further behind the harder it is throttled. The CPU *request*
+   still guarantees a share. Memory is capped at `8Gi`, which is a ceiling and
+   not a reservation; Terra 2 executes CosmWasm at tip and `4Gi` risked an OOM
+   mid-replay. Do not "tidy this up" by adding a CPU limit back.
