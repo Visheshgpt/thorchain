@@ -1,36 +1,58 @@
 apiVersion: storage.k8s.io/v1       # Stable API version for StorageClass resources
 kind: StorageClass
 metadata:
-  name: node-terra2-storage         # StorageClass name — referenced by PVC in 02-node_terra2_pvc.yaml
+  name: node-terra2-storage         # StorageClass name — referenced by PVC in 02-pvc.yaml
   labels:
     blockchain: terra2              # Identifies the blockchain this StorageClass belongs to
     node: node_terra2               # Node identifier for label selectors
     managed-by: manifest-generator  # Tracks origin of this resource
 provisioner: disk.csi.azure.com     # Azure Disk CSI driver — verified provisioner for AKS
 # ---------------------------------------------------------------------------
-# reclaimPolicy: Delete — TEMPORARY DEVIATION FROM THE NORMAL "Retain" RULE.
+# reclaimPolicy: Retain — restored 2026-09-03, now that the node is synced.
 #
-# This node is still in active bootstrap/debugging (repeated wipe-and-retry
-# cycles while fixing the snapshot-restore pipeline). Every PVC created here
-# holds data that is 100% reproducible from a public Polkachu snapshot — it
-# is NOT irreplaceable, so Retain's safety guarantee is not needed yet and
-# was actively counterproductive: 3 PVs were already stuck "Released" with
-# orphaned (still-billed) Azure Disks that required manual patching to
-# reclaim, because Retain never asks the CSI driver to delete the disk.
+# During bootstrap this was temporarily Delete. Repeated wipe-and-retry cycles
+# while fixing the snapshot-restore pipeline had left 3 PVs stuck "Released"
+# with orphaned (still-billed) Azure Disks, because Retain never asks the CSI
+# driver to delete the disk. That trade-off is no longer worth taking: the
+# volume now holds a synced chain store, and an accidental `kubectl delete
+# pvc` must not be able to destroy it.
 #
-# *** REVERT THIS TO Retain ONCE THE NODE IS SYNCED AND STABLE IN PRODUCTION ***
-# StorageClass reclaimPolicy is IMMUTABLE once created — to go back to
-# Retain, delete this StorageClass and recreate it with reclaimPolicy:
-# Retain (existing PVs are unaffected by this; only NEW PVCs pick up the
-# StorageClass's current policy). Once reverted, an accidental
-# `kubectl delete pvc` will no longer be able to wipe live archive data.
+# ---- IMMUTABLE: `kubectl apply` on this file is NOT enough -----------------
+# StorageClass reclaimPolicy is immutable. Applying this over an existing
+# StorageClass created as Delete is REJECTED by the API server. The
+# StorageClass must be deleted and recreated:
+#
+#   kubectl delete storageclass node-terra2-storage
+#   kubectl apply -f 01-storageclass.yaml
+#
+# Deleting a StorageClass does NOT affect PVCs/PVs already bound through it.
+# Binding is already complete; the name is only a record on the PVC. (Do not
+# do this while a PVC is still Pending — WaitForFirstConsumer provisioning
+# would then fail with "storageclass not found".)
+#
+# ---- This setting only applies to NEW volumes ------------------------------
+# An existing PV keeps the reclaim policy it was born with. To convert the
+# LIVE PV holding the synced chain data, patch the PV directly —
+# PV.spec.persistentVolumeReclaimPolicy IS mutable:
+#
+#   kubectl patch pv <pv-name> --type=merge --patch-file retain.json
+#   # retain.json: {"spec":{"persistentVolumeReclaimPolicy":"Retain"}}
+#
+# ---- CONSEQUENCE of Retain -------------------------------------------------
+# Deleting the PVC now leaves the PV "Released" and the Azure Disk STILL
+# BILLING. Reclaiming it later is a deliberate two-step job:
+#
+#   kubectl get pv <pv-name> -o jsonpath="{.spec.csi.volumeHandle}"   # disk id
+#   kubectl delete pv <pv-name>
+#   az disk delete --ids <disk-id>
 # ---------------------------------------------------------------------------
-reclaimPolicy: Delete
+reclaimPolicy: Retain
 volumeBindingMode: WaitForFirstConsumer  # Provision disk in same AZ as the scheduled pod
 allowVolumeExpansion: true          # Required for pvc-watcher auto-expansion to work
 parameters:
   skuName: StandardSSD_LRS          # Azure Disk SKU — Standard SSD (cluster default)
-                                    # NOTE: Terra 2.0 is an ARCHIVE node (PROFILE=archive, PRUNING_STRATEGY=nothing).
-                                    # If sync IO becomes a bottleneck once disk grows past ~1 TB, consider migrating
-                                    # to Premium_LRS via a new StorageClass + PVC clone. StandardSSD_LRS is adequate
-                                    # for initial bring-up and matches all other nodes in this cluster.
+                                    # NOTE: this node keeps all blocks from the snapshot height forward
+                                    # (pruning = "nothing"), so the disk grows continuously.
+                                    # If sync IO becomes a bottleneck once the disk passes ~1 TB, consider
+                                    # migrating to Premium_LRS via a new StorageClass + PVC clone.
+                                    # StandardSSD_LRS matches all other nodes in this cluster.
