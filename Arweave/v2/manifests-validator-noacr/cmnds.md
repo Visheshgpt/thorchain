@@ -1,10 +1,11 @@
 # Arweave Validator on AKS — working configuration
 
-**Status:** running. Joined mainnet at height 1,983,235. Pod `2/2 Ready`, 0 restarts.
+**Status:** running, no workarounds. The firewall team opened outbound TCP 1984,
+so the nginx proxy has been removed and the node uses standard peer hostnames.
 
 ```
-network : arweave.N.1     height : 1983235     peers : 4
-release : 89 (2.9.5.1)    blocks : 271         memory: ~10.5Gi, CPU 86m
+network : arweave.N.1     release : 89 (2.9.5.1)
+memory  : ~7.5Gi steady   peak    : ~15.5Gi during first join
 ```
 
 ---
@@ -21,7 +22,7 @@ Same node type as the team's bare-metal Docker node in
 
 **No ACR required.** An init container downloads the official release tarball,
 verifies its SHA256, and extracts it to the PVC. Both images are public
-(`alpine:3.19`, `ubuntu:22.04`, plus `nginx:1.27-alpine` for the proxy).
+(`alpine:3.19`, `ubuntu:22.04`).
 
 ---
 
@@ -32,9 +33,6 @@ Pod: arweave-node-0
 ├── init: install-arweave (alpine:3.19)
 │     downloads + sha256-verifies + extracts Arweave 2.9.5.1 to the PVC
 │     stages a CA bundle (ubuntu:22.04 ships none)
-│
-├── peer-proxy (nginx:1.27-alpine)          <- egress workaround, see below
-│     127.0.0.1:9001-9004  ->  four Arweave peers, by HOSTNAME
 │
 └── arweave-node (ubuntu:22.04, no packages installed)
       /opt/arweave/current/bin/arweave foreground config_file ...
@@ -91,7 +89,8 @@ wget --header Host:vin-1...arweave.xyz  (same IP)        -> HTTP 200
 then dials the addresses. Every request carries `Host: <ip>`, matches no FQDN
 rule, and is denied. Its HTTP client offers no Host override.
 
-Worked around with the nginx sidecar (see Known limitations).
+**RESOLVED.** The firewall team opened outbound TCP 1984. The nginx proxy that
+worked around this has been removed; the config uses real hostnames again.
 
 ### 4. Erlang allocator tuning — self-inflicted
 
@@ -142,8 +141,8 @@ kubectl apply -f 04-service.yaml
 kubectl get pod -n arweave -w
 ```
 
-`Pending` -> `Init:0/1` -> `Running 1/2` -> `2/2`. First join takes ~5 min
-(download + wallet tree). Ctrl+C at `2/2`.
+`Pending` -> `Init:0/1` -> `Running 0/1` -> `1/1`. First join takes ~5 min
+(download + wallet tree). Ctrl+C at `1/1`.
 
 ### After ANY change to 03-statefulset.yaml
 
@@ -181,7 +180,7 @@ curl.exe -s http://localhost:1984/info | ConvertFrom-Json | Format-List
 |---|---|
 | `height` | **the current block number** — the chain tip this node has |
 | `blocks` | how many block HEADERS this node has stored |
-| `peers` | connected peers (expect 4 — see Known limitations) |
+| `peers` | connected peers (dozens once healthy) |
 | `current` | hash of the head block |
 
 Just the block number:
@@ -229,30 +228,26 @@ kubectl get pod arweave-node-0 -n arweave -o wide
 
 ---
 
-## Known limitations
+## Resolved: egress
 
-**`peers: 4`.** A healthy Arweave node normally sees dozens to hundreds. This
-one is capped at the four proxied peers, because everything Arweave discovers
-at runtime is a raw IP and is still blocked by the FQDN egress filter. The node
-is correct and functional, but its view of the network is narrow.
+The firewall team opened outbound TCP 1984. Verified from a pod against IPs
+that were never in the original request, so the rule is broad rather than a
+handful of allow-listed addresses:
 
-**The nginx proxy is a workaround, not a fix.** The permanent fix is a network
-rule permitting outbound TCP 1984 **by IP**:
+```
+148.113.226.53   OK      15.235.228.134  OK
+208.69.78.61     OK      167.17.70.47    OK
+207.254.22.95    OK  (vdf-server-3)
+38.22.0.55       OK  (vdf-server-4)
+```
 
-> Outbound egress from AKS `cuscoiniadevaks` is filtered by FQDN (Azure
-> Firewall application rules or an HTTP proxy). The Arweave node connects to
-> peers **by IP address**, so those connections are denied with an HTTP 503 and
-> never leave the network. Verified from a pod: the same IP and port succeeds
-> when a matching hostname is supplied in the Host header, and fails without
-> it. Please add a **network rule** (IP/port based) permitting outbound TCP
-> 1984 to any destination. An application/FQDN rule cannot work, because
-> Arweave peers are discovered dynamically as IP addresses.
+The nginx `peer-proxy` sidecar, its `nginx.conf` ConfigMap key, and the
+`proxy-tmp` volume are all gone. `peers` and `vdf_server_trusted_peers` now use
+real hostnames.
 
-Once that lands: put the real hostnames back in `config.json` `peers`, delete
-the `peer-proxy` container, its `nginx.conf` ConfigMap key, and the
-`proxy-tmp` volume.
-
----
+**If peer connectivity ever breaks again**, re-run the three-test check in
+`../FIREWALL-TESTS.md` before assuming it is an Arweave problem — that
+distinguishes a network block from a node fault in about a minute.
 
 ## Teardown
 

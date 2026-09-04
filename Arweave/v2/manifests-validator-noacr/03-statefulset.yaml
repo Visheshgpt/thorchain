@@ -192,16 +192,18 @@ data:
   config.json: |
     {
       "peers": [
-        "127.0.0.1:9001",
-        "127.0.0.1:9002",
-        "127.0.0.1:9003",
-        "127.0.0.1:9004",
-        "127.0.0.1:9005",
-        "127.0.0.1:9006"
+        "dal-1.east.us.north-america.arweave.xyz",
+        "den-1.west.us.north-america.arweave.xyz",
+        "vin-1.east.us.north-america.arweave.xyz",
+        "pho-1.east.us.north-america.arweave.xyz",
+        "bhs-1.ca.north-america.arweave.xyz",
+        "van-1.ca.north-america.arweave.xyz",
+        "north-america.peers.arweave.xyz",
+        "peers.arweave.xyz"
       ],
       "data_dir": "/data",
       "log_dir": "/var/log/arweave",
-      "vdf_server_trusted_peers": ["127.0.0.1:9010", "127.0.0.1:9011"],
+      "vdf_server_trusted_peers": ["vdf-server-3.arweave.xyz", "vdf-server-4.arweave.xyz"],
       "sync_jobs": 20,
       "max_disk_pool_buffer_mb": 2000,
       "port": 1984,
@@ -297,157 +299,6 @@ data:
 
     ## Sets dirty IO scheduler wakeup threshold.
     +swtdio very_low
-  nginx.conf: |
-    # Host-rewriting proxy. See the block above config.json for why.
-    #
-    # Arweave connects to 127.0.0.1:900X (same pod = same network
-    # namespace, so no firewall involved). This proxy then makes the
-    # REAL request using the peer's HOSTNAME, which is what the egress
-    # filter requires.
-    worker_processes 1;
-    error_log /dev/stderr warn;
-    pid /tmp/nginx.pid;
-
-    events { worker_connections 512; }
-
-    http {
-      access_log off;
-      # All temp paths under /tmp so nginx runs as an unprivileged UID
-      # on a read-only root filesystem.
-      client_body_temp_path /tmp/nginx-client;
-      proxy_temp_path       /tmp/nginx-proxy;
-      fastcgi_temp_path     /tmp/nginx-fastcgi;
-      uwsgi_temp_path       /tmp/nginx-uwsgi;
-      scgi_temp_path        /tmp/nginx-scgi;
-
-      proxy_http_version 1.1;
-      # Arweave's own probe timeout is 2s, so fail faster than that
-      # and let it move to the next peer rather than stall.
-      proxy_connect_timeout 3s;
-      proxy_send_timeout    30s;
-      proxy_read_timeout    30s;
-      proxy_buffering off;
-
-      # Pass Arweave's peer headers straight through.
-      proxy_pass_request_headers on;
-
-      server {
-        listen 127.0.0.1:9001;
-        location / {
-          proxy_pass http://vin-1.east.us.north-america.arweave.xyz:1984;
-          proxy_set_header Host vin-1.east.us.north-america.arweave.xyz;
-        }
-      }
-      server {
-        listen 127.0.0.1:9002;
-        location / {
-          proxy_pass http://bhs-1.ca.north-america.arweave.xyz:1984;
-          proxy_set_header Host bhs-1.ca.north-america.arweave.xyz;
-        }
-      }
-      server {
-        listen 127.0.0.1:9003;
-        location / {
-          proxy_pass http://dal-1.east.us.north-america.arweave.xyz:1984;
-          proxy_set_header Host dal-1.east.us.north-america.arweave.xyz;
-        }
-      }
-      server {
-        listen 127.0.0.1:9004;
-        location / {
-          proxy_pass http://den-1.west.us.north-america.arweave.xyz:1984;
-          proxy_set_header Host den-1.west.us.north-america.arweave.xyz;
-        }
-      }
-      server {
-        listen 127.0.0.1:9005;
-        location / {
-          proxy_pass http://pho-1.east.us.north-america.arweave.xyz:1984;
-          proxy_set_header Host pho-1.east.us.north-america.arweave.xyz;
-        }
-      }
-      server {
-        listen 127.0.0.1:9006;
-        location / {
-          proxy_pass http://van-1.ca.north-america.arweave.xyz:1984;
-          proxy_set_header Host van-1.ca.north-america.arweave.xyz;
-        }
-      }
-
-      # ---- VDF SERVERS. Without these the chain height FREEZES. ----
-      # Arweave 2.6+ cannot validate a new block without VDF (nonce
-      # limiter) output. ar_config.erl:
-      #     compute_own_vdf() ->
-      #       case nonce_limiter_server_trusted_peers of
-      #         [] -> compute locally (unless disabled);
-      #         _  -> DO NOT compute locally, unless compute_own_vdf
-      #               is in `enable`
-      # So a NON-EMPTY vdf_server_trusted_peers list makes the node
-      # refuse to compute VDF itself and wait on the server.
-      #
-      # The original config pointed straight at
-      # vdf-server-3.arweave.xyz, which Arweave resolves to an IP --
-      # blocked by the FQDN egress filter exactly like the peers were.
-      # Result: the node joined, backfilled headers happily (no VDF
-      # needed for that), and never advanced past its join height.
-      # Symptom was a frozen `height` with a healthy, climbing `blocks`.
-      #
-      # Proxying them keeps VDF offloaded (it is single-threaded SHA256
-      # and expensive to self-compute) and reuses the mechanism already
-      # proven for peers.
-      server {
-        listen 127.0.0.1:9010;
-        location / {
-          proxy_pass http://vdf-server-3.arweave.xyz:1984;
-          proxy_set_header Host vdf-server-3.arweave.xyz;
-        }
-      }
-      server {
-        listen 127.0.0.1:9011;
-        location / {
-          proxy_pass http://vdf-server-4.arweave.xyz:1984;
-          proxy_set_header Host vdf-server-4.arweave.xyz;
-        }
-      }
-    }
-
-# ############################################################
-# ##  NETWORK: NOT BLOCKED. Verified from inside the cluster ##
-# ############################################################
-#
-#   wget -T 10 http://peers.arweave.xyz:1984/info
-#     -> {"network":"arweave.N.1","height":1982583,"peers":498,...}
-#
-# Outbound TCP 1984 WORKS. An earlier test with a 5-second timeout
-# returned "download timed out" and was misread as a firewall block;
-# a 10-second timeout succeeds. The connection is SLOW to establish,
-# not refused.
-#
-# That distinction matters, because Arweave's HTTP client uses a
-# 2-SECOND connect timeout (visible in the crash log:
-# `connect_timeout => 2000`). If peer connections need longer than
-# that to establish from this cluster, every peer is marked
-# "not available" even though the route is fine.
-#
-# So there are two candidate root causes, and the ORDER of the log
-# decides between them:
-#
-#   A) Slow connects -> peer probes exceed the 2s timeout -> the
-#      error path runs constantly -> the process owning the
-#      prometheus ETS tables dies -> every later metric call gets
-#      {badarg,[{ets,lookup,[prometheus_counter_table,...]}] ->
-#      ar_http dies -> gun_conns_sup dies -> CrashLoopBackOff.
-#
-#   B) The prometheus bug fires FIRST and kills ar_http (the HTTP
-#      CLIENT). With ar_http down, every peer request fails, so
-#      "Peer X is not available" is a SYMPTOM, not the cause. The
-#      `{noproc,{gen_server,call,[gun_conns_sup,...]}}` errors point
-#      this way -- that supervisor is already gone by then.
-#
-# `kubectl logs --tail=50` cannot distinguish these: it shows only
-# the end. Capture the FIRST 60 lines of a fresh start instead --
-# whichever error appears first is the cause.
-# ############################################################
 
 
 ---
@@ -728,56 +579,6 @@ spec:
               subPath: app
 
       containers:
-        # ── Host-rewriting egress proxy ──────────────────────────
-        # THE WORKAROUND for this cluster's FQDN-filtered egress.
-        #
-        # Proven from a pod in this namespace, same IP and port:
-        #   wget http://40.160.31.17:1984/info               -> 503 in 0.02s
-        #   wget --header Host:vin-1...arweave.xyz
-        #        http://40.160.31.17:1984/info               -> 200 OK
-        # The same bare IP answers 200 in 0.64s from outside this
-        # network, and 0.02s is far too fast to be a real round trip,
-        # so that 503 is synthesised locally by the egress filter.
-        #
-        # Arweave resolves peer hostnames to IPs ONCE at startup and
-        # then dials the addresses directly, so every request carries
-        # `Host: <ip>`, matches no FQDN rule, and is denied. Its HTTP
-        # client offers no way to override that header.
-        #
-        # So: Arweave talks to 127.0.0.1:900X instead. Containers in a
-        # pod share a network namespace, so that traffic never touches
-        # the firewall. nginx then makes the real request using the
-        # peer's HOSTNAME, which the filter permits.
-        #
-        # THIS IS A WORKAROUND, NOT A FIX. It gets the node joined and
-        # following the chain through four proxied peers. Peers that
-        # Arweave DISCOVERS at runtime are still plain IPs and will
-        # still be refused, so peering stays degraded. The real fix is
-        # a network rule permitting outbound TCP 1984 by IP — see the
-        # top of cmnds.md.
-        - name: peer-proxy
-          image: nginx:1.27-alpine
-          imagePullPolicy: IfNotPresent
-          # Bypass the image's entrypoint scripts: they try to write to
-          # /var/cache/nginx and /etc/nginx/conf.d, which fails for a
-          # non-root UID on a read-only rootfs. Running nginx directly
-          # with our own config avoids all of it.
-          command: ["nginx", "-c", "/etc/nginx/nginx.conf", "-g", "daemon off;"]
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: ["ALL"] }
-            readOnlyRootFilesystem: true
-          resources:
-            requests: { cpu: "50m", memory: "64Mi" }
-            limits:   { memory: "256Mi" }
-          volumeMounts:
-            - name: config
-              mountPath: /etc/nginx/nginx.conf
-              subPath: nginx.conf
-              readOnly: true
-            - name: proxy-tmp
-              mountPath: /tmp
-
         - name: arweave-node
           image: ubuntu:22.04
           imagePullPolicy: IfNotPresent
@@ -1010,10 +811,6 @@ spec:
           emptyDir: { sizeLimit: 512Mi }
         - name: tmp
           emptyDir: { sizeLimit: 256Mi }
-        # nginx writes its pid and temp buffers here so the proxy can
-        # run non-root with a read-only root filesystem.
-        - name: proxy-tmp
-          emptyDir: { sizeLimit: 64Mi }
         # The team's docker run uses --shm-size=4g; Kubernetes (like
         # Docker) defaults /dev/shm to 64 MB. medium: Memory is a
         # tmpfs and is CHARGED AGAINST the 4Gi limit above, so 256Mi
