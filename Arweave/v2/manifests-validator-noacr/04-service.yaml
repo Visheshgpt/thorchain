@@ -93,13 +93,18 @@ metadata:
     blockchain: arweave-node
     service-type: clusterip
 spec:
-  type: ClusterIP
+  # NodePort so the node is testable from the jumpbox without port-forward.
+  # nodePort is PINNED so a Service recreate cannot reassign it.
+  # In-cluster consumers should ignore this and use the DNS name:
+  #   http://arweave-node-api.arweave.svc.cluster.local:1984
+  type: NodePort
   selector:
     app: arweave-node
   ports:
     - name: http-p2p
       port: 1984
       targetPort: 1984
+      nodePort: 31984
       protocol: TCP
 
 
